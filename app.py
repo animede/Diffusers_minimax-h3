@@ -83,6 +83,7 @@ def _run_generation(
     seed: Optional[int],
     image: Optional[Image.Image],
     last_image: Optional[Image.Image],
+    upscale: int = 0,
 ) -> dict:
     global _current_progress
 
@@ -116,10 +117,13 @@ def _run_generation(
             image=image,
             last_image=last_image,
             progress=progress,
+            upscale=upscale,
         )
         result["job_id"] = job_id
         result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
         return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         logger.exception("generation failed")
         progress.update(phase="error", error=str(e))
@@ -135,6 +139,7 @@ def api_t2va(
     seconds: float = Form(5.0),
     num_inference_steps: int = Form(30),
     seed: Optional[int] = Form(None),
+    upscale: int = Form(0),
 ):
     result = _run_generation(
         prompt=prompt,
@@ -144,6 +149,7 @@ def api_t2va(
         seed=seed,
         image=None,
         last_image=None,
+        upscale=upscale,
     )
     return JSONResponse(result)
 

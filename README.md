@@ -143,16 +143,34 @@ transformerブロックの残差変化が小さいとき、残りの計算をス
   `cache_context("h3")` で包む(リセット漏れは前リクエストの残差による誤スキップを招く)。
   同一seed連続2本のmp4バイト完全一致でリセットの正しさを検証済み。
 
-sm_120 (Blackwell) のパッチ化conv3d病的低速(diffusers-server CLAUDE.md 46番)は
-**発症しない**(全ステップ均一に約5.4s、GPU 100%張り付きの健全なcompute-bound)。
+## 2段生成による2xアップスケール (`/api/t2va` の `upscale=1`、既定OFF)
 
-音声: 32kHz ステレオ生成 → AAC で mux。プローブ実測 rms=0.10(犬・鳥・風の環境音)。
-静かなシーン指定では rms~0.006 程度になるが非無音。
+ComfyUIコミュニティの MiniMaxH3_LatentUpscaler と同系の hires-fix。低解像度(768²)で
+前半をデノイズ → **x0推定値**の映像latentだけを bilinear で空間2x → フレッシュノイズを
+`scheduler.scale_noise()` で再注入 → 残りの低σステップを1536²で仕上げ → デコード。
+`H3_HIRES_DENOISE`(既定0.35)がパス2の担当デノイズ強度。UIはT2VAタブのチェックボックス。
 
-transformers は **venv 内に 5.14.1** を上書きインストールしてある(comfy-env の 5.1.0
-には `Qwen3VLProcessor.create_mm_token_type_ids` が無く PR #14355 のエンコーダが
-動かないため。comfy-env 自体は無変更)。
+実測(768²→1536²・5秒・30steps・seed=12345、fbc+bnb-4bit):
 
+| | 合計 | デノイズ | デコード | ピークVRAM | 出力 |
+|---|---|---|---|---|---|
+| upscale=0 | 181s | 125s | 6.5s | 92.1GB | 768² |
+| upscale=1 | 645s | 533s (パス1 78s + パス2 455s) | 24.7s | 88.0GB | 1536² |
+
+- 構図・被写体は upscale=0 と一致し、毛並み・芝などの実ディテールが乗る。背景の
+  細部(フェンス等)はパス2の再デノイズで軽微にドリフトする(hires-fixの性質)。
+- 音声: latentテンソル自体はアップスケール処理で無変更だが、映像と音声は1つの
+  パックドシーケンスで自己注意を共有するため、パス2以降の音声出力は upscale=0 と
+  bit一致しない(相関0.89、非無音・品質同等。アーキテクチャ上の制約で仕様)。
+- VRAM: パス2はシーケンス長~4倍のため、upscale=1 のリクエストではエンコード直後に
+  TE-nf4 を解放してからデノイズする(次リクエストのエンコード時に遅延再ロード)。
+- **実装の要点(実機でバグを踏んで確定)**: 補間対象は**ノイズ付きlatentではなくx0推定値**
+  であること(ノイズ付きを補間すると市松状ノイズが増幅されて全面ノイズ化する。ComfyUI
+  参考実装も denoised_output を使っている)。解像度変更時は `build_packed_sequence()` で
+  position_ids/token_tags/各indicesを再構築し、`row_timestep_plan` も残ステップ分を
+  作り直す。ModularPipeline の `_execution_device` はコンポーネント登録順の先頭モジュール
+  で決まるため、TE解放後は `components.transformer.device` を明示的に使う
+  (diffusers-server CLAUDE.md 23番・47番と同型の罠)。
 ## 起動
 
 ```bash

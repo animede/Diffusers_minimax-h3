@@ -263,6 +263,13 @@
         </div>
       </div>
 
+      <div class="row" id="upscale-row">
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="upscale" style="width:auto;">
+          2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ・約3.6倍時間)
+        </label>
+      </div>
+
       <button type="submit" class="generate" id="generate-btn">生成</button>
       <div class="hint">蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。</div>
     </form>
@@ -418,6 +425,8 @@ form.addEventListener('submit', async (ev) => {
   fd.append('seconds', secondsEl.value);
   fd.append('num_inference_steps', stepsEl.value);
   if (seedEl.value) fd.append('seed', seedEl.value);
+  const upscaleEl = document.getElementById('upscale');
+  if (mode === 't2va' && upscaleEl && upscaleEl.checked) fd.append('upscale', '1');
 
   let url = '/api/t2va';
   if (mode === 'fl2va') {

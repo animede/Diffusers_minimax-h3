@@ -111,6 +111,20 @@ if H3_CACHE not in ("none", "fbc"):
     raise ValueError(f"H3_CACHE must be 'none' or 'fbc', got {H3_CACHE!r}")
 H3_CACHE_THRESHOLD = float(os.environ.get("H3_CACHE_THRESHOLD", "0.05"))
 
+# Two-pass hires-fix (see generate(..., upscale=1)): fraction of the *sigma schedule*
+# (not step count) that pass 2 (high-res) is responsible for finishing. E.g. 0.35 with
+# num_inference_steps=30 means pass 1 runs steps 0..18 (round(29*0.65)=19 of the 29 model
+# evaluations -- MiniMaxH3Scheduler.set_timesteps() drives num_inference_steps - 1 model
+# calls, see scheduling_minimax_h3.py) at the requested resolution. The video latent's x0
+# estimate (not the noisy x_t -- see _upscale_block_state_2x's docstring for why: an
+# earlier version upscaled x_t directly and reliably produced checkerboard-corrupted
+# output) is then spatially upscaled 2x and re-noised with fresh noise at pass 2's
+# starting sigma, and pass 2 runs the remaining steps at 2x resolution, continuing that
+# freshly-noised trajectory. The scheduler's internal `_step_index` is not reset between
+# passes (no new `set_timesteps()` call), so `step()`'s x_t/x0 blend uses the correct
+# sigma/sigma_next pair for step N1 onward automatically.
+H3_HIRES_DENOISE = float(os.environ.get("H3_HIRES_DENOISE", "0.35"))
+
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
 MIN_SECONDS = 5.0
 MAX_SECONDS = 15.0
@@ -189,6 +203,17 @@ def ram_gb() -> dict:
         "swap_used_gb": round(swap_total - swap_free, 2),
         "swap_total_gb": round(swap_total, 1),
     }
+
+
+class _NullContext:
+    """A no-op context manager, used where FBC's `cache_context` is conditionally absent
+    (H3_CACHE == "none") but the calling code wants one `with` statement either way."""
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc_info):
+        return False
 
 
 @dataclass
@@ -442,26 +467,43 @@ class MiniMaxH3Runner:
         self._text_encoder_loaded = True
         logger.info("text_encoder loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
 
-    def _free_text_encoder(self):
+    def _free_text_encoder(self, force: bool = False):
+        """Free the resident text_encoder.
+
+        `force=False` (default): in `bnb-4bit` mode this is a no-op (TE-nf4 is normally
+        kept permanently resident -- see `_load_text_encoder` docstring); in `none` mode
+        it always frees (TE/transformer already cycle every request there).
+
+        `force=True`: used only by the hires-fix upscale path (`generate(..., upscale=1)`)
+        to actually drop the nf4 TE (~21GB) after prompt encoding, buying headroom for
+        pass 2's much larger attention activations at 2x spatial resolution (sequence
+        length is 4x -> full self-attention cost is ~16x). bnb 4bit modules cannot be
+        `.to()`-moved between devices (CLAUDE.md-style constraint carried over from
+        diffusers-server, see module docstring point 33/47 lineage: only "drop in place,
+        reload from disk/page-cache later" is available for a quantized module, never a
+        host-RAM staging trip) -- `del` + a later `_load_text_encoder()` call (which
+        re-quantizes from the safetensors shards straight to CUDA) is the only option,
+        exactly like the transformer drop/reload the decode window already does in this
+        mode.
+        """
         if not self._text_encoder_loaded:
             return
-        if TE_QUANT == "bnb-4bit":
+        if TE_QUANT == "bnb-4bit" and not force:
             # Permanently resident in this mode -- never freed mid-run (see
             # _load_text_encoder docstring). Guard so a stray call is a harmless no-op
             # rather than silently dropping the model.
             logger.debug("bnb-4bit text_encoder is permanently resident; ignoring free request")
             return
         # Drop the CUDA model directly: releasing the last reference frees the VRAM in
-        # place. Do NOT stage through .to("cpu") first -- the text_encoder is ~66GB
-        # (the checkpoint is bf16-native, not fp32), and a host-RAM transit would both
-        # waste time and evict the page-cached model shards that make the next
-        # per-request reload fast.
+        # place. Do NOT stage through .to("cpu") first -- the text_encoder is ~21-66GB
+        # depending on quantization, and a host-RAM transit would both waste time and
+        # evict the page-cached model shards that make the next per-request reload fast.
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
         self._text_encoder_loaded = False
         gc.collect()
         torch.cuda.empty_cache()
-        logger.info("text_encoder freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
+        logger.info("text_encoder freed (force=%s). gpu=%s ram=%s", force, gpu_mem_gb(), ram_gb())
 
     def preload_all(self):
         """Load the steady-state residents once at startup.
@@ -493,6 +535,193 @@ class MiniMaxH3Runner:
         }
 
     # ------------------------------------------------------------------
+    # Hires-fix (two-pass upscale) helpers
+    # ------------------------------------------------------------------
+    def _upscale_block_state_2x(self, components, block_state, state, pass1_steps: int, last_step_info: dict):
+        """Spatially upscale the video latent of `block_state` 2x between pass 1 and pass 2
+        of hires-fix, and rebuild the packed-sequence layout (row_timestep_plan, position_ids,
+        token_tags, video/audio/text_indices) for the new resolution's *remaining* timesteps.
+
+        IMPORTANT (found during this task's own verification, not assumed from the reference
+        up front): this upscales the pass-1 **x0 estimate** (the model's denoised prediction),
+        not the noisy `x_t` sample directly, then re-noises the upscaled x0 at the pass-2
+        starting sigma with fresh noise. The first implementation bilinear-interpolated
+        `block_state.latents` (the noisy `x_t`) directly, matching a naive reading of "spatial
+        2x upscale of the video latent between passes" -- this reliably produced a checkerboard/
+        moire-corrupted decode (reproduced and isolated with `scripts/debug_vae_direct.py`:
+        the corruption persists even with `vae.disable_tiling()`, so it is not a VAE tiling-seam
+        artifact, and it is present in a *direct* decode of the interpolated latent with zero
+        pass-2 steps run, so it is not something pass 2 could ever "clean up" -- if anything pass
+        2 amplifies it into total noise because the model is being asked to denoise a `x_t` whose
+        noise component has been low-pass-filtered by the bilinear resize, which is off-distribution
+        for what the model expects a genuine forward-process sample to look like at that sigma).
+        Re-reading the ComfyUI reference's own description in light of this (`utils.py`, fetched
+        during this task): its pass 1 is read from `SamplerCustomAdvanced`'s `denoised_output`
+        (already the x0 estimate, not the noisy latent) and its upscale node explicitly re-noises
+        via `model_sampling.noise_scaling(sigma_start, fresh_noise, upscaled_latent)` afterward --
+        i.e. the reference *never* interpolates a noisy sample either. This implementation follows
+        that shape once translated to this scheduler's own `scale_noise(sample, timestep, noise)`
+        API (`x_t = t*x0 + (1-t)*noise`, this repo's rectified-flow convention, see
+        scheduling_minimax_h3.py): x0 is reconstructed here from the last pass-1 step's
+        `(sample, model_output, t)` via the same formula `MiniMaxH3Scheduler.step()` uses
+        internally (`denoised = sample + (1-t)*model_output`) since the block wrapper discards
+        it, that x0 is what gets bilinear-interpolated, and the result is re-noised with **fresh**
+        noise at pass 2's first timestep before pass 2's loop begins.
+
+        Only the *video* rows have spatial extent (`(t, h, w)` -> `F.interpolate`); the audio
+        rows are channel-major and carry no height/width coordinate at all (see
+        `build_packed_sequence` in packing.py -- their rotary position only has a time axis
+        and a fixed left/right width-grid endpoint pin), so they are left completely
+        untouched here, matching the reference ComfyUI node's audio pass-through
+        (`audio_denoise=0` behaviour) -- this task's design choice per the brief.
+
+        This function assumes `num_condition_video_rows == 0` / `num_condition_audio_rows
+        == 0` (t2va only, no keyframe conditioning rows) -- enforced by the `ValueError`
+        `generate()` raises for fl2va + upscale before this is ever reached.
+        """
+        from diffusers.modular_pipelines.minimax_h3.packing import (
+            build_packed_sequence,
+            build_row_timesteps,
+            patchify_video_latents,
+            unpatchify_video_tokens,
+            MINIMAX_H3_KEYFRAME_NOISE_AUG,
+        )
+        # NOTE: deliberately NOT using `components._execution_device` here (unlike the
+        # rest of this file's calls into the modular blocks). By the time this runs, TE
+        # has already been force-freed (see `generate()`'s H3_HIRES_DENOISE comment) and
+        # `vae` is parked on CPU (bnb-4bit mode, outside its decode-phase window) --
+        # `_execution_device` would resolve to `vae`'s CPU location the same way it did
+        # for the layout_step bug this task found and fixed earlier in `generate()`. The
+        # transformer is the one component guaranteed to be GPU-resident throughout the
+        # whole denoise loop, so its device is used directly instead.
+        device = components.transformer.device
+
+        num_latent_frames = state.get("num_latent_frames")
+        latent_height = state.get("latent_height")
+        latent_width = state.get("latent_width")
+        num_audio_latents = state.get("num_audio_latents")
+        patch_size = components.patch_size
+        vae_latent_channels = components.vae_latent_channels
+
+        # 1. Reconstruct the x0 (denoised) estimate from the last pass-1 step, using the same
+        # formula `MiniMaxH3Scheduler.step()` uses internally (see scheduling_minimax_h3.py):
+        # `denoised = sample + (1 - t) * model_output`, i.e. `sample + sigma_from_timestep *
+        # model_output`. `last_step_info["sample"]` is the *pre-step* video sample (x_t at the
+        # last pass-1 timestep) and `last_step_info["noise_pred"]` is the velocity the model
+        # predicted for it; both captured by `run_steps(..., capture_last=True)` in generate()
+        # before the scheduler folded them into the next (already-stepped) `x_t`.
+        last_sample = last_step_info["sample"]
+        last_noise_pred = last_step_info["noise_pred"]
+        last_t = last_step_info["t"]
+        sigma_from_timestep = 1.0 - last_t
+        x0_rows = last_sample.float() + sigma_from_timestep * last_noise_pred.float()
+
+        # 2. Unpack the x0 rows into a 5D latent tensor.
+        video_latent = unpatchify_video_tokens(
+            x0_rows, num_latent_frames, latent_height, latent_width, vae_latent_channels, patch_size
+        )
+
+        # 3. F.interpolate the spatial (H, W) axes only -- temporal axis untouched. bilinear
+        # (not nearest, not trilinear over T) per the task brief; align_corners=False is
+        # torch's numerically-recommended default for this kind of resize (avoids the corner-
+        # alignment bias nearest/bilinear-align_corners=True introduces). This is safe to do
+        # on the x0 estimate (smooth, image-like content) in a way it was not on the noisy
+        # `x_t` (see the docstring above).
+        b, c, t_dim, h_dim, w_dim = video_latent.shape
+        video_latent_2d = video_latent.permute(0, 2, 1, 3, 4).reshape(b * t_dim, c, h_dim, w_dim)
+        video_latent_2d = torch.nn.functional.interpolate(
+            video_latent_2d.float(), scale_factor=2, mode="bilinear", align_corners=False
+        )
+        new_h, new_w = video_latent_2d.shape[-2:]
+        x0_upscaled = video_latent_2d.reshape(b, t_dim, c, new_h, new_w).permute(0, 2, 1, 3, 4)
+
+        # 4. Re-patchify the upscaled x0 back into rows, draw fresh noise at the new (larger)
+        # row count, and re-noise via the scheduler's own forward process
+        # (`x_t = t*x0 + (1-t)*noise`, this repo's rectified-flow convention) at pass 2's
+        # first timestep -- restoring proper `x_t` noise statistics for the model to continue
+        # denoising from, instead of handing it a low-pass-filtered `x_t` it never would have
+        # produced itself (root cause of the checkerboard corruption, see docstring).
+        x0_upscaled_rows = patchify_video_latents(x0_upscaled.to(x0_rows.dtype), patch_size).to(device)
+        pass2_start_t = float(state.get("timesteps")[pass1_steps])
+        # `randn_tensor` (not raw torch.randn) so a CPU generator (the request's own,
+        # `torch.Generator(device="cpu")` in generate()) works the same way it does for
+        # every other noise draw in this pipeline (prepare_latents, keyframe_condition_noise
+        # both use it for exactly this reason -- CUDA generators are not what the request
+        # seed is defined against). Reuses the same generator object pass 1's/the initial
+        # draw's noise came from, so this draw is deterministic per-request-seed but is a
+        # *new, independent* sample from it (not a reuse of any earlier noise tensor).
+        from diffusers.utils.torch_utils import randn_tensor
+
+        fresh_noise = randn_tensor(
+            x0_upscaled_rows.shape, generator=state.get("generator"), device=device, dtype=x0_upscaled_rows.dtype
+        )
+        block_state.latents = components.scheduler.scale_noise(x0_upscaled_rows, pass2_start_t, fresh_noise)
+
+        # 5. Rebuild the packed layout at the new latent geometry (position_ids/token_tags/
+        # indices all key off latent_height/latent_width -- see build_packed_sequence).
+        # text_token_tags/num_audio_latents are unchanged (audio + text are untouched by the
+        # spatial upscale), only the video row count and its rotary grid change. Calls
+        # `build_packed_sequence` directly (the same function `MiniMaxH3PrepareLayoutStep.
+        # __call__` calls internally) instead of going through the block, so `device` can
+        # be passed explicitly instead of resolved via `components._execution_device`
+        # (unsafe here -- see the NOTE at the top of this function).
+        new_layout = build_packed_sequence(
+            state.get("text_token_tags"),
+            num_latent_frames,
+            new_h,
+            new_w,
+            num_audio_latents,
+            patch_size,
+            (),  # keyframe_anchors: t2va only, enforced by the caller.
+        )
+
+        block_state.token_tags = new_layout.token_tags.to(device)
+        block_state.position_ids = new_layout.position_ids.to(device)
+        block_state.video_indices = new_layout.video_indices.to(device)
+        block_state.audio_indices = new_layout.audio_indices.to(device)
+        block_state.text_indices = new_layout.text_indices.to(device)
+        # t2va only (enforced by the caller): no conditioning rows, so both stay 0.
+        block_state.num_condition_video_rows = 0
+        block_state.num_condition_audio_rows = 0
+
+        # 6. Rebuild row_timestep_plan against the new (larger) sequence_length -- the old
+        # plan was sized for the pass-1 sequence_length and would misindex if reused.
+        # video_timesteps/audio_timesteps themselves are resolution-independent (the sigma
+        # schedule does not depend on latent geometry), only their *row broadcast* does.
+        #
+        # `_predict_velocity` (denoise.py) indexes `block_state.row_timestep_plan[i]` with
+        # the *absolute* step index (0..num_inference_steps-1), not a pass-relative one --
+        # `run_steps()` in generate() keeps calling the loop blocks with the original `i`
+        # across the pass-1/pass-2 splice. So this replaces the plan entries from `pass1_steps`
+        # onward (pass 2's own steps) with plans built against `new_layout`, while the
+        # earlier entries (never read again -- pass 2 only iterates i >= pass1_steps) are
+        # left as-is, just to keep the list the same full length the denoiser indexes into.
+        video_timesteps = state.get("timesteps")
+        audio_timesteps = block_state.audio_timesteps
+        old_plan = block_state.row_timestep_plan
+        new_plan = list(old_plan)
+        for i in range(pass1_steps, len(video_timesteps)):
+            new_plan[i] = tuple(
+                tensor.to(device)
+                for tensor in build_row_timesteps(
+                    new_layout,
+                    float(video_timesteps[i]),
+                    float(audio_timesteps[i]),
+                    max(float(video_timesteps[i]), MINIMAX_H3_KEYFRAME_NOISE_AUG),
+                    1.0,
+                )
+            )
+        block_state.row_timestep_plan = new_plan
+
+        # Update state's own latent_height/latent_width/layout too, in case anything reads
+        # them again downstream (decode step reads latent_height/latent_width off `state`,
+        # not `block_state` -- see the caller in generate()).
+        state.set("latent_height", new_h)
+        state.set("latent_width", new_w)
+        state.set("layout", new_layout)
+        return block_state
+
+    # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
     def generate(
@@ -506,9 +735,18 @@ class MiniMaxH3Runner:
         image: Image.Image | None = None,
         last_image: Image.Image | None = None,
         progress: ProgressState | None = None,
+        upscale: int = 0,
     ) -> dict:
         """
         Runs T2VA (image=None, last_image=None) or FL2VA (either/both given).
+
+        `upscale=1` enables two-pass hires-fix: pass 1 denoises `round(num_inference_steps
+        * (1 - H3_HIRES_DENOISE))` steps at the requested (height, width), the video latent's
+        x0 estimate is then spatially upscaled 2x with `F.interpolate` and re-noised (audio
+        latent is left untouched -- it has no spatial axes, see `_upscale_block_state_2x`
+        docstring), and pass 2 continues the same sigma trajectory for the remaining steps
+        at 2x resolution. The returned `height`/`width` reflect the actual (2x) output
+        resolution in that case.
 
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats.
         """
@@ -525,12 +763,26 @@ class MiniMaxH3Runner:
             MiniMaxH3AudioDecodeStep,
             MiniMaxH3VideoDecodeStep,
         )
-        from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3DenoiseStep
+        from diffusers.modular_pipelines.minimax_h3.denoise import (
+            MiniMaxH3DenoiseStep,
+            MiniMaxH3LoopDenoiser,
+            MiniMaxH3LoopSchedulerStep,
+        )
         from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3TextEncoderStep
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
         num_frames = seconds_to_num_frames(seconds)
+        do_upscale = bool(upscale)
+        if do_upscale and (image is not None or last_image is not None):
+            # Scope of this task's hires-fix is t2va only. fl2va's keyframe conditioning
+            # rows are prepared once (at the requested resolution) before the loop and are
+            # never denoised, only re-anchored into the packed sequence every step -- a
+            # spatial upscale mid-loop would need those condition latents upscaled too and
+            # their (fixed) rotary anchor position recomputed against the new geometry,
+            # which is unverified territory this task did not have time to check against
+            # the reference. Fail loudly rather than silently mis-render.
+            raise ValueError("upscale=1 (hires-fix) is only supported for t2va requests, not fl2va.")
 
         with self._load_lock:
             # `none` mode: VAEs (permanent residents) + text encoder. _load_text_encoder
@@ -593,6 +845,30 @@ class MiniMaxH3Runner:
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
 
+        # upscale (hires-fix) requests: force-free the TE-nf4 even in bnb-4bit mode.
+        # Pass 2 runs full self-attention over a ~4x longer packed sequence (2x spatial ->
+        # 4x video rows), i.e. ~16x the attention activation cost of pass 1 -- bnb-4bit's
+        # normal 87.7GB steady state (transformer 66.3GB + TE-nf4 21.0GB) only leaves
+        # ~4-8GB of headroom (measured 91.7GB peak at 768x768, see README), nowhere near
+        # enough for that. Freeing TE-nf4 here (and reloading it after decode, in the
+        # decode section below) is the same one-way "short window" pattern the transformer
+        # already uses around the decode step in this mode -- not a standing swap.
+        #
+        # IMPORTANT: this free is deliberately deferred until *after* layout_step/
+        # latents_step/timesteps_step below, not done here alongside the transformer load.
+        # `MiniMaxH3ModularPipeline._execution_device` (used by all three of those blocks)
+        # resolves to the device of the *first* `nn.Module` in `self.components` insertion
+        # order (`text_encoder, tokenizer, processor, vae, scheduler, audio_scheduler,
+        # transformer, ...`) that is actually still set. Freeing text_encoder here would
+        # make `vae` (parked on CPU in bnb-4bit mode outside its active phase) the new
+        # first hit, silently resolving `_execution_device` to `cpu` and producing a
+        # cuda/cpu device-mismatch inside the transformer's rope() -- reproduced and
+        # confirmed by traceback during this task's own verification run. Freeing TE only
+        # once those position_ids/layout tensors already exist on the correct device (set
+        # once, from the layout step, and never touched again) sidesteps the whole
+        # resolution question for the rest of the request.
+        force_free_te = do_upscale and TE_QUANT == "bnb-4bit"
+
         if TE_QUANT == "bnb-4bit" and is_fl2va:
             # bnb-4bit + fl2va only: transformer(66.3) + TE-nf4(21.0) + vae pair(11.0)
             # already sums to ~98.3GB before any activation buffer, over this card's
@@ -600,23 +876,27 @@ class MiniMaxH3Runner:
             # section below and the module docstring) -- so the keyframe VAE-encode step
             # (which needs `vae` on GPU, already brought in above) has to run *before*
             # the transformer is loaded, not after. TE stays resident throughout (it is
-            # not involved in this step).
+            # not involved in this step); fl2va + upscale is rejected earlier in this
+            # function, so force_free_te is always False on this branch.
             keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
             _, state = keyframe_step(pipe, state)
             self._vae_to_cpu()
             with self._load_lock:
-                self._free_text_encoder()  # no-op in this mode; kept for symmetry
                 self._ensure_transformer(progress)
         else:
             # `none` mode: TE's job is done for this request -- free it and bring in the
             # transformer (which stays resident until the next request's encode phase
             # kicks it out again).
-            # `bnb-4bit` + t2va: TE is permanently resident (free is a no-op) and the
-            # transformer is normally already resident too -- except right after a
-            # previous request's decode phase dropped it (see the decode section below),
-            # in which case this is the reload that restores it before denoise. No vae
-            # conflict here since t2va's vae never went to GPU in the first place.
+            # `bnb-4bit` + t2va: TE is normally permanently resident and the transformer
+            # is normally already resident too -- except right after a previous request's
+            # decode phase dropped it (see the decode section below), in which case this
+            # is the reload that restores it before denoise. No vae conflict here since
+            # t2va's vae never went to GPU in the first place.
             with self._load_lock:
+                # `none` mode always frees here (force is irrelevant -- _free_text_encoder
+                # frees unconditionally when TE_QUANT != "bnb-4bit"); `bnb-4bit` mode's
+                # force-free (force_free_te) is deferred past layout/latents/timesteps
+                # below, see the comment above, so this call is a no-op for it here.
                 self._free_text_encoder()
                 self._ensure_transformer(progress)
 
@@ -637,48 +917,173 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="denoising", step=0, total_steps=num_inference_steps, message="デノイズ中...")
         t_denoise = time.time()
-        denoise_step = MiniMaxH3DenoiseStep()
-        orig_loop_step = denoise_step.loop_step
         step_times = []
         cache_skips = [0]
+        pass1_time = None
+        interpolate_time = None
+        pass2_time = None
+        # Canonical (post-setup) resolution -- MiniMaxH3SetupStep resolves `None` and
+        # snaps to the canvas rules, so this is not necessarily identical to the raw
+        # `height`/`width` args.
+        out_height, out_width = state.get("height"), state.get("width")
 
-        def timed_loop_step(components, bstate, i, t):
-            ts = time.time()
-            result = orig_loop_step(components, bstate, i=i, t=t)
-            step_times.append(time.time() - ts)
-            if H3_CACHE == "fbc":
-                cache_skips[0] += self._fbc_last_step_was_skip()
-            if progress:
-                progress.update(step=i + 1, message=f"デノイズ中 {i + 1}/{num_inference_steps}")
-            return result
-
-        denoise_step.loop_step = timed_loop_step
-        if H3_CACHE == "fbc":
-            # Per-request reset: `FirstBlockCache`'s hooks are stateful (cached head-block
-            # residual/output + tail-block residuals persist on the transformer submodules
-            # between calls, see FBCSharedBlockState in first_block_cache.py). Without this
-            # reset, the *first* denoise step of this request would see the *previous*
-            # request's leftover `head_block_residual` from its own final step and could
-            # incorrectly decide to skip computation on step 0 (which should always compute,
-            # since there is no prior-step residual within this request to compare against).
-            # `_reset_stateful_cache()` -> `HookRegistry.reset_stateful_hooks()` ->
-            # `FBCHeadBlockHook.reset_state()` -> `StateManager.reset()`, which empties the
-            # per-context state cache entirely (a fresh `FBCSharedBlockState()` is created on
-            # the next `get_state()`), not just the partial fields `FBCSharedBlockState.reset()`
-            # touches -- so this clears `head_block_output`/`head_block_residual` too, not only
-            # `tail_block_residuals`/`should_compute`.
+        def _fbc_reset_and_context():
+            # Same reasoning as the single-pass path below: per-request/per-pass reset is
+            # required so a stale residual from a previous call (previous request, or
+            # pass 1 of *this* request) cannot make step 0 of the new call wrongly skip.
             self._pipe.transformer._reset_stateful_cache()
-            # `cache_context(...)` is required, not optional: `StateManager.get_state()` raises
-            # `ValueError("No context is set...")` if no context has been entered, so the very
-            # first transformer forward of this request would crash without it. H3 is
-            # guidance-distilled (no CFG, no cond/uncond branches -- confirmed in
-            # modular_pipelines/minimax_h3/denoise.py and encoders.py docstrings), so unlike
-            # Wan/Flux's per-branch "cond"/"uncond" contexts there is only one branch here; a
-            # single fixed context name for the whole request's denoise loop is correct.
-            with self._pipe.transformer.cache_context("h3"):
+            return self._pipe.transformer.cache_context("h3")
+
+        if not do_upscale:
+            denoise_step = MiniMaxH3DenoiseStep()
+            orig_loop_step = denoise_step.loop_step
+
+            def timed_loop_step(components, bstate, i, t):
+                ts = time.time()
+                result = orig_loop_step(components, bstate, i=i, t=t)
+                step_times.append(time.time() - ts)
+                if H3_CACHE == "fbc":
+                    cache_skips[0] += self._fbc_last_step_was_skip()
+                if progress:
+                    progress.update(step=i + 1, message=f"デノイズ中 {i + 1}/{num_inference_steps}")
+                return result
+
+            denoise_step.loop_step = timed_loop_step
+            if H3_CACHE == "fbc":
+                # Per-request reset: `FirstBlockCache`'s hooks are stateful (cached head-block
+                # residual/output + tail-block residuals persist on the transformer submodules
+                # between calls, see FBCSharedBlockState in first_block_cache.py). Without this
+                # reset, the *first* denoise step of this request would see the *previous*
+                # request's leftover `head_block_residual` from its own final step and could
+                # incorrectly decide to skip computation on step 0 (which should always compute,
+                # since there is no prior-step residual within this request to compare against).
+                # `_reset_stateful_cache()` -> `HookRegistry.reset_stateful_hooks()` ->
+                # `FBCHeadBlockHook.reset_state()` -> `StateManager.reset()`, which empties the
+                # per-context state cache entirely (a fresh `FBCSharedBlockState()` is created on
+                # the next `get_state()`), not just the partial fields `FBCSharedBlockState.reset()`
+                # touches -- so this clears `head_block_output`/`head_block_residual` too, not only
+                # `tail_block_residuals`/`should_compute`.
+                self._pipe.transformer._reset_stateful_cache()
+                # `cache_context(...)` is required, not optional: `StateManager.get_state()` raises
+                # `ValueError("No context is set...")` if no context has been entered, so the very
+                # first transformer forward of this request would crash without it. H3 is
+                # guidance-distilled (no CFG, no cond/uncond branches -- confirmed in
+                # modular_pipelines/minimax_h3/denoise.py and encoders.py docstrings), so unlike
+                # Wan/Flux's per-branch "cond"/"uncond" contexts there is only one branch here; a
+                # single fixed context name for the whole request's denoise loop is correct.
+                with self._pipe.transformer.cache_context("h3"):
+                    _, state = denoise_step(pipe, state)
+            else:
                 _, state = denoise_step(pipe, state)
         else:
-            _, state = denoise_step(pipe, state)
+            # --- two-pass hires-fix ---
+            # This bypasses `MiniMaxH3DenoiseStep.__call__` (which owns the whole
+            # `for i, t in enumerate(timesteps)` loop internally) and instead drives the
+            # per-step sub-blocks (`MiniMaxH3LoopDenoiser`, `MiniMaxH3LoopSchedulerStep`)
+            # directly through one shared `BlockState`, so a resolution change (new
+            # layout/position_ids/row_timestep_plan) can be spliced in mid-loop while the
+            # scheduler's internal `_step_index` keeps incrementing across the splice --
+            # see the module-level H3_HIRES_DENOISE docstring for why this needs no
+            # separate renoise/DisableNoise step, unlike the ComfyUI reference node this
+            # was modeled after (which has to cross a KSamplerAdvanced node boundary and
+            # therefore re-injects noise at the pass-2 starting sigma instead).
+            denoiser_block = MiniMaxH3LoopDenoiser()
+            scheduler_block = MiniMaxH3LoopSchedulerStep()
+            denoise_wrapper = MiniMaxH3DenoiseStep()  # only used for get/set_block_state plumbing
+            block_state = denoise_wrapper.get_block_state(state)
+
+            if force_free_te:
+                # Safe to free now: layout_step/latents_step/timesteps_step (which all
+                # depend on `components._execution_device` resolving correctly, see the
+                # long comment above) have already run and their outputs are already
+                # materialized as tensors on `state`/`block_state`. Nothing from here to
+                # the end of the denoise loop touches `components._execution_device`
+                # again except the transformer's own forward (which resolves its device
+                # from its own parameters, not from pipe-level component scanning).
+                with self._load_lock:
+                    self._free_text_encoder(force=True)
+
+            timesteps = state.get("timesteps")
+            # `MiniMaxH3Scheduler.set_timesteps()` builds a sigma grid of
+            # `num_inference_steps` points *including* the terminal 0, then exposes
+            # `self.timesteps = 1 - sigmas[:-1]` -- i.e. `len(timesteps) ==
+            # num_inference_steps - 1` model evaluations, one fewer than the requested
+            # step count (confirmed against scheduling_minimax_h3.py). The single-pass
+            # path never has to know this (it just does `for i, t in
+            # enumerate(block_state.timesteps)`), but this loop's bounds are computed
+            # from `num_inference_steps` directly, so it must use `len(timesteps)`, not
+            # `num_inference_steps`, or the last step indexes past the end (reproduced:
+            # "IndexError: index 29 is out of bounds for dimension 0 with size 29" when
+            # this used the raw request value of 30 as the pass-2 end bound).
+            actual_steps = len(timesteps)
+            n1 = max(1, min(actual_steps - 1, round(actual_steps * (1.0 - H3_HIRES_DENOISE))))
+            logger.info(
+                "hires-fix: %d model evaluations, pass1=%d steps @ %dx%d, pass2=%d steps @ %dx%d "
+                "(H3_HIRES_DENOISE=%s)",
+                actual_steps, n1, out_width, out_height, actual_steps - n1, out_width * 2, out_height * 2,
+                H3_HIRES_DENOISE,
+            )
+
+            # Populated by run_steps() with the *last* step's pre-step video sample and
+            # predicted velocity, so the caller can reconstruct an x0 estimate for the
+            # hires splice (see the long comment above _upscale_block_state_2x's call
+            # site below for why this is needed instead of upscaling the noisy x_t
+            # directly).
+            last_step_info = {}
+
+            def run_steps(bstate, i_start, i_end, phase_label, capture_last=False):
+                # `MiniMaxH3LoopDenoiser`/`MiniMaxH3LoopSchedulerStep.__call__` both mutate
+                # and return the *same* `BlockState` object (see `BlockState.__setitem__` /
+                # the plain `setattr` pattern every block writes its outputs through) -- so
+                # reassigning `bstate` here every iteration is just documenting that fact,
+                # not actually swapping to a different object.
+                #
+                # `num_condition_video_rows` is always 0 here (t2va only, enforced earlier
+                # in generate()), so `bstate.latents`/`bstate.noise_pred[0]` are entirely
+                # generated video rows with no conditioning-row prefix to skip.
+                fbc_cm = _fbc_reset_and_context() if H3_CACHE == "fbc" else None
+                cm = fbc_cm if fbc_cm is not None else _NullContext()
+                with cm:
+                    for i in range(i_start, i_end):
+                        t = timesteps[i]
+                        ts = time.time()
+                        pre_step_video_sample = bstate.latents.clone() if (capture_last and i == i_end - 1) else None
+                        _, bstate = denoiser_block(pipe, bstate, i=i, t=t)
+                        if capture_last and i == i_end - 1:
+                            last_step_info["sample"] = pre_step_video_sample
+                            last_step_info["noise_pred"] = bstate.noise_pred[0].clone()
+                            last_step_info["t"] = float(t)
+                        _, bstate = scheduler_block(pipe, bstate, i=i, t=t)
+                        step_times.append(time.time() - ts)
+                        if H3_CACHE == "fbc":
+                            cache_skips[0] += self._fbc_last_step_was_skip()
+                        if progress:
+                            progress.update(
+                                step=i + 1,
+                                message=f"デノイズ中 {phase_label} {i + 1}/{actual_steps}",
+                            )
+                return bstate
+
+            t_pass1 = time.time()
+            block_state = run_steps(block_state, 0, n1, "pass1", capture_last=True)
+            pass1_time = time.time() - t_pass1
+
+            # --- spatial 2x upscale of the video latent between passes ---
+            if progress:
+                progress.update(message="潜在空間を2xアップスケール中...")
+            t_interp = time.time()
+            block_state = self._upscale_block_state_2x(
+                components=pipe, block_state=block_state, state=state, pass1_steps=n1,
+                last_step_info=last_step_info,
+            )
+            interpolate_time = time.time() - t_interp
+            out_height, out_width = out_height * 2, out_width * 2
+
+            t_pass2 = time.time()
+            block_state = run_steps(block_state, n1, actual_steps, "pass2")
+            pass2_time = time.time() - t_pass2
+
+            denoise_wrapper.set_block_state(state, block_state)
         denoise_time = time.time() - t_denoise
 
         # --- decode ---
@@ -737,6 +1142,14 @@ class MiniMaxH3Runner:
         if TE_QUANT == "bnb-4bit":
             with self._load_lock:
                 self._ensure_transformer(progress)
+                if force_free_te:
+                    # Restore the bnb-4bit steady state (transformer + TE-nf4 both
+                    # resident) for the *next* request -- this request force-freed TE-nf4
+                    # after encoding to make room for pass 2's activations (see above).
+                    # Reloaded after the transformer so the transformer's own reload above
+                    # (which needs headroom too, right after decode's own VAE trip) is not
+                    # competing with a simultaneous TE reload for VRAM.
+                    self._load_text_encoder(progress)
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
@@ -747,8 +1160,8 @@ class MiniMaxH3Runner:
 
         result = {
             "prompt": prompt,
-            "height": height,
-            "width": width,
+            "height": out_height,
+            "width": out_width,
             "num_frames_requested_seconds": seconds,
             "num_frames": actual_num_frames,
             "duration_s": actual_num_frames / FPS,
@@ -769,6 +1182,13 @@ class MiniMaxH3Runner:
             "te_quant": TE_QUANT,
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
+            "upscale": int(do_upscale),
+            "hires_denoise": H3_HIRES_DENOISE if do_upscale else None,
+            "pass1_steps": n1 if do_upscale else None,
+            "pass2_steps": (actual_steps - n1) if do_upscale else None,
+            "pass1_time_s": round(pass1_time, 2) if pass1_time is not None else None,
+            "interpolate_time_s": round(interpolate_time, 3) if interpolate_time is not None else None,
+            "pass2_time_s": round(pass2_time, 2) if pass2_time is not None else None,
             # Number of denoise steps where FBC skipped the tail blocks (cache hit).
             # Always 0 in `none` mode (the counter never increments there).
             "cache_skipped_steps": cache_skips[0] if H3_CACHE == "fbc" else None,
