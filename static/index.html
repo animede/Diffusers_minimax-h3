@@ -149,6 +149,46 @@
     border-top: 1px solid var(--border);
     line-height: 1.6;
   }
+  .llm-row { display: flex; gap: 6px; margin-top: 8px; }
+  .llm-row select { flex: 1.4; }
+  button.llm-btn {
+    flex: 1;
+    padding: 7px 10px;
+    background: #0d0f14;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button.llm-btn:hover:not(:disabled) { background: #17233f; }
+  button.llm-btn:disabled { border-color: var(--border); color: var(--muted); cursor: wait; }
+  details.guide { margin-top: 10px; font-size: 12px; }
+  details.guide summary { cursor: pointer; color: var(--muted); }
+  .guide-body {
+    margin-top: 8px;
+    padding: 10px;
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted);
+    line-height: 1.8;
+  }
+  .guide-body code { background: #171a21; padding: 1px 5px; border-radius: 4px; color: var(--text); }
+  details.used-prompt { margin-top: 10px; font-size: 12px; }
+  details.used-prompt summary { cursor: pointer; color: var(--muted); }
+  .used-prompt-body {
+    margin-top: 6px;
+    padding: 10px;
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    white-space: pre-wrap;
+    font-size: 12px;
+    line-height: 1.7;
+  }
 </style>
 </head>
 <body>
@@ -165,6 +205,29 @@
     <form id="gen-form">
       <label>プロンプト</label>
       <textarea id="prompt" placeholder="例: 夕日の中、ゴールデンレトリバーの子犬が芝生を駆け抜けボールを追いかける。カメラは低い位置から追従。風で葉が揺れ、鳥のさえずり、子犬の楽しそうな鳴き声。"></textarea>
+
+      <div class="llm-row">
+        <select id="enhance-mode" title="強化モード">
+          <option value="storyboard">ストーリーボード(カット割り)</option>
+          <option value="brief">ブリーフ詳細化(単一ショット)</option>
+          <option value="translate">英訳のみ</option>
+        </select>
+        <button type="button" class="llm-btn" id="enhance-btn">LLM強化</button>
+        <button type="button" class="llm-btn" id="undo-btn" style="display:none;">元に戻す</button>
+      </div>
+      <div class="hint">LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。</div>
+
+      <details class="guide">
+        <summary>プロンプトガイド(手書き用チートシート)</summary>
+        <div class="guide-body">
+          <b>公式ブリーフ構造(再生順):</b> シーン → 被写体 → アクション → カメラ → 音の意図 → 終わり方。上限7,000字。日本語OK。<br>
+          <b>マルチショット(実機検証済み):</b> <code>CUT 1 [0-5秒]: …</code> <code>CUT 2 [5-10秒]: ハードカットで…</code> の
+          タイムコードブロックで1クリップ内にカットを実行できる。カット位置の精度は±1秒程度。<br>
+          <b>カメラ:</b> ショットサイズ(ロング/ミディアム/クローズアップ)+ 焦点距離(35/50/65/100mm)+
+          カメラワーク(固定/パン/プッシュイン/トラッキング)。<br>
+          <b>音:</b> 環境音・効果音・セリフの意図をショット単位で書く(動画と同時生成されるため映像と同格に扱う)。
+        </div>
+      </details>
 
       <div id="fl2va-fields" style="display:none;">
         <label>先頭フレーム画像 (image, 任意)</label>
@@ -245,6 +308,46 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     mode = btn.dataset.mode;
     fl2vaFields.style.display = (mode === 'fl2va') ? 'block' : 'none';
   });
+});
+
+// --- LLMプロンプト強化 ---
+const enhanceModeEl = document.getElementById('enhance-mode');
+const enhanceBtn = document.getElementById('enhance-btn');
+const undoBtn = document.getElementById('undo-btn');
+let promptBackup = null;
+
+enhanceBtn.addEventListener('click', async () => {
+  const text = promptEl.value.trim();
+  if (!text) { setStatus('先にプロンプトを入力してください', true); return; }
+  enhanceBtn.disabled = true;
+  enhanceBtn.textContent = '強化中...';
+  try {
+    const fd = new FormData();
+    fd.append('text', text);
+    fd.append('mode', enhanceModeEl.value);
+    fd.append('seconds', secondsEl.value || '10');
+    const res = await fetch('/api/prompt/enhance', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+    promptBackup = text;
+    promptEl.value = data.result;
+    undoBtn.style.display = '';
+    setStatus(`LLM強化完了 (${data.mode}, ${data.elapsed_s.toFixed(1)}s) — 内容を確認・編集してから生成してください`);
+  } catch (e) {
+    setStatus('LLM強化エラー: ' + e.message, true);
+  } finally {
+    enhanceBtn.disabled = false;
+    enhanceBtn.textContent = 'LLM強化';
+  }
+});
+
+undoBtn.addEventListener('click', () => {
+  if (promptBackup !== null) {
+    promptEl.value = promptBackup;
+    promptBackup = null;
+    undoBtn.style.display = 'none';
+    setStatus('強化前のプロンプトに戻しました');
+  }
 });
 
 let polling = null;
@@ -353,7 +456,13 @@ function renderResult(data) {
       <div><b>合計時間:</b> ${data.total_elapsed_s}s / <b>ピークVRAM:</b> ${data.peak_vram_gb}GB</div>
       <div><b>音声:</b> rms=${data.audio_rms.toFixed(5)} peak=${data.audio_peak.toFixed(4)} @ ${data.audio_sampling_rate}Hz</div>
     </div>
+    <details class="used-prompt">
+      <summary>使用したプロンプト全文(比較評価用)</summary>
+      <div class="used-prompt-body"></div>
+    </details>
   `;
+  // プロンプトはテキストとして安全に挿入(HTMLエスケープ回避)
+  resultArea.querySelector('.used-prompt-body').textContent = data.prompt || promptEl.value;
 }
 </script>
 </body>

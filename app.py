@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
+from core.llm import LLMConnectionError, VALID_MODES, enhance_prompt, get_llm_url
 from core.runner import MAX_SECONDS, MIN_SECONDS, MiniMaxH3Runner, ProgressState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -173,6 +174,31 @@ def api_fl2va(
         last_image=pil_last_image,
     )
     return JSONResponse(result)
+
+
+@app.post("/api/prompt/enhance")
+def api_prompt_enhance(
+    text: str = Form(...),
+    mode: str = Form("storyboard"),
+    seconds: float = Form(10.0),
+):
+    """ローカルLLM(H3_LLM_URL)でプロンプトをH3向けに整形する。
+
+    GPU生成ロックとは無関係(生成中でも呼べる)。mode: brief(公式ブリーフ詳細化)/
+    storyboard(マルチショットのCUTタイムコード形式、seconds に整合)/ translate(英訳のみ)。
+    """
+    if not text or not text.strip():
+        raise HTTPException(400, "text is required")
+    if mode not in VALID_MODES:
+        raise HTTPException(400, f"mode は {VALID_MODES} のいずれかです: {mode!r}")
+    t0 = time.time()
+    try:
+        result = enhance_prompt(text.strip(), mode, seconds=seconds)
+    except LLMConnectionError as e:
+        raise HTTPException(502, f"LLMサーバに接続できません(H3_LLM_URL={get_llm_url()}): {e}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"result": result, "mode": mode, "elapsed_s": time.time() - t0}
 
 
 @app.on_event("startup")
