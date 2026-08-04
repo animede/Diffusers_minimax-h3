@@ -4,18 +4,23 @@ MiniMax-H3 T2VA/FL2VA runner.
 Loading strategy (see dev_notes/handoff-minimax-h3.md and diffusers-server CLAUDE.md
 #33/#46/#47 for the constraints this follows):
 
-- This box has 96GB VRAM but only ~94GB host RAM. The four big components add up to
-  ~110GB (text_encoder bf16 ~33GB, transformer bf16 ~66GB, vae+audio_vae fp32 ~11GB),
-  which does not fit in host RAM at once. `ComponentsManager.enable_auto_cpu_offload()`
-  keeps every component CPU-resident as its steady state (accelerate hooks only move the
-  *active* one to GPU), so it would try to hold all ~110GB in RAM simultaneously -- not
-  safe here.
-- Instead: transformer + vae + audio_vae stay resident on GPU permanently after the
-  first load (66 + 11 = 77GB, comfortably under 96GB). Only the text_encoder
-  (~33GB bf16) is loaded for the prompt-encoding phase and then moved back to CPU / freed
-  before the denoise loop starts. This is a single one-way trip per generation, not a
-  standing swap -- the "short window" pattern CLAUDE.md sanctions, not the banned
-  "swap the whole big module every step" pattern.
+- This box has 96GB VRAM but only ~94GB host RAM. The big components add up to ~144GB
+  (text_encoder bf16-native ~66.7GB -- measured on GPU, the checkpoint shards are
+  already bf16 -- transformer bf16 ~66.3GB, vae+audio_vae fp32 ~11GB), which fits in
+  neither VRAM nor host RAM at once. `ComponentsManager.enable_auto_cpu_offload()`
+  keeps every component CPU-resident as its steady state (accelerate hooks only move
+  the *active* one to GPU), so it would try to hold all ~144GB in RAM simultaneously --
+  not possible here.
+- Instead the two 66GB models cycle through GPU per request, with the small fp32 VAEs
+  (~11GB) permanently resident:
+    encode phase : [vae 11GB + text_encoder 66GB]   (transformer dropped if resident)
+    denoise/decode: [vae 11GB + transformer 66GB]   (TE dropped right after encoding)
+  Each drop frees the CUDA model in place (no .to("cpu") staging -- that would take
+  ~30s, evict page cache and push the box into swap, observed on the first probe run).
+  Reloads are served from disk/page cache at ~16-40s per model, i.e. ~1 load/free cycle
+  per generation for each big model -- the "short window" pattern CLAUDE.md sanctions,
+  not the banned "swap the whole module every step" pattern. The steady state between
+  requests keeps transformer + VAEs resident (77GB).
 - video VAE decode runs under a float16 autocast internally (diffusers' own
   MiniMaxH3VideoDecodeStep) even though its weights are float32. audio_vae must stay
   float32 end-to-end: casting it to bf16 is a known upstream bug that makes generated
@@ -153,40 +158,64 @@ class MiniMaxH3Runner:
         logger.info("pipe shell built: blocks=%s components=%s",
                      self._pipe._blocks.__class__.__name__, self._pipe.component_names)
 
-    def _ensure_transformer_and_vae(self, progress: ProgressState | None = None):
-        """Load transformer + vae + audio_vae to GPU once; they then stay resident."""
+    def _ensure_vaes(self, progress: ProgressState | None = None):
+        """vae + audio_vae (~11GB fp32) are small enough to stay resident permanently."""
         self._ensure_pipe_shell()
-        if self._transformer_loaded and self._vae_loaded:
+        if self._vae_loaded:
             return
         if progress:
-            progress.update(phase="loading_transformer", message="transformer/vae をロード中...")
-        t0 = time.time()
-        if not self._transformer_loaded:
-            self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
-            self._pipe.transformer.to(DEVICE)
-            self._transformer_loaded = True
-            logger.info("transformer loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
-        if not self._vae_loaded:
-            t1 = time.time()
-            # video VAE must stay fp32 (decode step applies its own fp16 autocast);
-            # audio VAE must stay fp32 end-to-end (bf16 causes ~20dB volume loss, see
-            # module docstring / handoff doc).
-            self._pipe.load_components(names=["vae", "audio_vae"], dtype=torch.float32)
-            self._pipe.vae.to(DEVICE)
-            self._pipe.audio_vae.to(DEVICE)
-            self._pipe.load_components(names=["scheduler", "audio_scheduler"])
-            self._vae_loaded = True
-            logger.info("vae/audio_vae loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t1, gpu_mem_gb(), ram_gb())
+            progress.update(phase="loading_vae", message="vae/audio_vae をロード中...")
+        t1 = time.time()
+        # video VAE must stay fp32 (decode step applies its own fp16 autocast);
+        # audio VAE must stay fp32 end-to-end (bf16 causes ~20dB volume loss, see
+        # module docstring / handoff doc).
+        self._pipe.load_components(names=["vae", "audio_vae"], dtype=torch.float32)
+        self._pipe.vae.to(DEVICE)
+        self._pipe.audio_vae.to(DEVICE)
+        self._pipe.load_components(names=["scheduler", "audio_scheduler"])
+        self._vae_loaded = True
+        logger.info("vae/audio_vae loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t1, gpu_mem_gb(), ram_gb())
 
         from diffusers.video_processor import VideoProcessor
 
         if getattr(self._pipe, "video_processor", None) is None:
             self._pipe.video_processor = VideoProcessor(vae_scale_factor=16, do_normalize=False)
 
+    def _ensure_transformer(self, progress: ProgressState | None = None):
+        """Load the 66GB bf16 transformer to GPU. Frees the text_encoder first if resident."""
+        self._ensure_pipe_shell()
+        if self._transformer_loaded:
+            return
+        # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM.
+        self._free_text_encoder()
+        if progress:
+            progress.update(phase="loading_transformer", message="transformer をロード中...")
+        t0 = time.time()
+        self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
+        self._pipe.transformer.to(DEVICE)
+        self._transformer_loaded = True
+        logger.info("transformer loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
+
+    def _free_transformer(self):
+        if not self._transformer_loaded:
+            return
+        # Drop in place, no CPU staging (same reasoning as _free_text_encoder).
+        del self._pipe.transformer
+        self._pipe.transformer = None
+        self._transformer_loaded = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("transformer freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
+
     def _load_text_encoder(self, progress: ProgressState | None = None):
+        """Load the ~66GB bf16-native TE to GPU. Frees the transformer first if resident."""
         self._ensure_pipe_shell()
         if self._text_encoder_loaded:
             return
+        # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM: measured 66.73GB
+        # for the TE alone (the checkpoint shards are bf16-native, not fp32). The two
+        # big models therefore cycle: TE on GPU only during prompt encoding.
+        self._free_transformer()
         if progress:
             progress.update(phase="loading_text_encoder", message="text_encoder (Qwen3-VL-32B) をロード中...")
         t0 = time.time()
@@ -198,7 +227,11 @@ class MiniMaxH3Runner:
     def _free_text_encoder(self):
         if not self._text_encoder_loaded:
             return
-        self._pipe.text_encoder.to("cpu")
+        # Drop the CUDA model directly: releasing the last reference frees the VRAM in
+        # place. Do NOT stage through .to("cpu") first -- the text_encoder is ~66GB
+        # (the checkpoint is bf16-native, not fp32), and a host-RAM transit would both
+        # waste time and evict the page-cached model shards that make the next
+        # per-request reload fast.
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
         self._text_encoder_loaded = False
@@ -207,11 +240,14 @@ class MiniMaxH3Runner:
         logger.info("text_encoder freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
 
     def preload_all(self):
-        """Load everything once at startup so the first UI request doesn't pay the load cost."""
+        """Load the steady-state residents (transformer + VAEs) once at startup.
+
+        The text_encoder is NOT preloaded: it cycles per request (it cannot coexist
+        with the transformer in 96GB VRAM), so preloading it would only be churn.
+        """
         with self._load_lock:
-            self._ensure_transformer_and_vae()
-            self._load_text_encoder()
-            self._free_text_encoder()
+            self._ensure_vaes()
+            self._ensure_transformer()
 
     def status(self) -> dict:
         return {
@@ -264,8 +300,16 @@ class MiniMaxH3Runner:
         num_frames = seconds_to_num_frames(seconds)
 
         with self._load_lock:
-            self._ensure_transformer_and_vae(progress)
+            # Big-model cycle, phase 1: VAEs (permanent residents) + text encoder.
+            # _load_text_encoder frees the transformer internally if it is resident
+            # (TE 66GB + transformer 66GB cannot coexist in 96GB VRAM).
+            self._ensure_vaes(progress)
             self._load_text_encoder(progress)
+
+        # Reset peak stats after loading so the reported peak reflects this
+        # generation's encode+denoise+decode, not the (much larger, one-time) model
+        # loading peak from a cold start.
+        torch.cuda.reset_peak_memory_stats()
 
         pipe = self._pipe
 
@@ -288,21 +332,31 @@ class MiniMaxH3Runner:
         # --- setup (canvas / frame count / keyframe prep) ---
         setup_step = MiniMaxH3SetupStep()
         _, state = setup_step(pipe, state)
-        block_state = setup_step.get_block_state(state)
+        # The setup step's *outputs* (num_frames after alignment, prepared keyframes,
+        # latent geometry) live in the PipelineState -- get_block_state only maps
+        # declared inputs, so read outputs via state.get().
+        actual_num_frames = state.get("num_frames")
+        keyframes = state.get("keyframes")
 
         # --- text encode (still has text_encoder on GPU at this point) ---
         if progress:
             progress.update(phase="encoding", message="プロンプトをエンコード中...")
-        prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
-            pipe, prompt, block_state.keyframes or None, device=DEVICE, dtype=torch.bfloat16
-        )
+        # encode_prompt is a bare staticmethod; the @torch.no_grad() lives on the block
+        # __call__ we bypass. Without no_grad the autograd graph pins ~50GB of TE
+        # weights on GPU past the free below (observed on the first probe run).
+        with torch.no_grad():
+            prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
+                pipe, prompt, keyframes or None, device=DEVICE, dtype=torch.bfloat16
+            )
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
 
-        # text_encoder's job is done for this request -- free it before the transformer
-        # denoise loop so we never need bf16 TE (33GB) + bf16 transformer (66GB) +
-        # fp32 VAEs (11GB) resident together (110GB > 96GB VRAM).
-        self._free_text_encoder()
+        # Big-model cycle, phase 2: TE's job is done for this request -- free it and
+        # bring in the transformer (which stays resident until the next request's
+        # encode phase kicks it out again).
+        with self._load_lock:
+            self._free_text_encoder()
+            self._ensure_transformer(progress)
 
         # --- keyframe VAE conditioning (fl2va only; needs `vae`, already resident) ---
         keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
@@ -378,8 +432,8 @@ class MiniMaxH3Runner:
             "height": height,
             "width": width,
             "num_frames_requested_seconds": seconds,
-            "num_frames": block_state.num_frames,
-            "duration_s": block_state.num_frames / FPS,
+            "num_frames": actual_num_frames,
+            "duration_s": actual_num_frames / FPS,
             "num_inference_steps": num_inference_steps,
             "seed": seed,
             "denoise_time_s": round(denoise_time, 2),

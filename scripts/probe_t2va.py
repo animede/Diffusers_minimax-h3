@@ -109,15 +109,24 @@ SEED = 12345
 
 from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3TextEncoderStep  # noqa: E402
 
-prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
-    pipe, PROMPT, images=None, device=DEVICE, dtype=torch.bfloat16
-)
+# IMPORTANT: encode_prompt is a bare staticmethod -- the @torch.no_grad() lives on the
+# block's __call__, which we bypass here. Without no_grad, the forward's autograd graph
+# saves ~50 layers' worth of GPU weight tensors for backward (~50GB stayed pinned after
+# deleting the module -- observed on the first probe run). Same bug class as
+# diffusers-server CLAUDE.md #39 (IA2V probe's missing no_grad).
+with torch.no_grad():
+    prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
+        pipe, PROMPT, images=None, device=DEVICE, dtype=torch.bfloat16
+    )
 log(f"prompt encoded: prompt_embeds={tuple(prompt_embeds.shape)} "
     f"text_token_tags={tuple(text_token_tags.shape)}. gpu={gpu_mem()}")
 
-log("moving text_encoder to cpu ...")
-pipe.text_encoder.to("cpu")
+log("freeing text_encoder (drop CUDA model in place, no CPU staging) ...")
+# No .to("cpu") first: the TE is ~66GB bf16-native (not the ~33GB an fp32 checkpoint
+# would suggest); staging it through host RAM takes ~30s, evicts page cache and, with
+# only ~94GB RAM, pushed the box into swap on the first probe run.
 del pipe.text_encoder
+pipe.text_encoder = None
 gc.collect()
 torch.cuda.empty_cache()
 torch.cuda.reset_peak_memory_stats()
@@ -163,11 +172,13 @@ state.set("audio_condition_latents", None)
 
 setup_step = MiniMaxH3SetupStep()
 _, state = setup_step(pipe, state)
-block_state = setup_step.get_block_state(state)
-log(f"setup done: height={block_state.height} width={block_state.width} "
-    f"num_frames={block_state.num_frames} num_latent_frames={block_state.num_latent_frames} "
-    f"latent_hw=({block_state.latent_height},{block_state.latent_width}) "
-    f"num_audio_latents={block_state.num_audio_latents}")
+# The setup step's *outputs* live in the PipelineState (set_block_state writes them via
+# state.set); get_block_state only maps declared *inputs*, so read outputs off `state`.
+actual_num_frames = state.get("num_frames")
+log(f"setup done: height={state.get('height')} width={state.get('width')} "
+    f"num_frames={actual_num_frames} num_latent_frames={state.get('num_latent_frames')} "
+    f"latent_hw=({state.get('latent_height')},{state.get('latent_width')}) "
+    f"num_audio_latents={state.get('num_audio_latents')}")
 
 # inject the prompt_embeds/text_token_tags we computed in phase 1
 state.set("prompt_embeds", prompt_embeds)
@@ -209,17 +220,13 @@ denoise_time = time.time() - t_denoise
 log(f"denoise loop done in {denoise_time:.1f}s "
     f"(avg {sum(step_times) / len(step_times):.2f}s/step). gpu={gpu_mem()} ram={ram_mem()}")
 
-log("moving transformer to cpu ...")
-pipe.transformer.to("cpu")
-del pipe.transformer
-gc.collect()
-torch.cuda.empty_cache()
-torch.cuda.reset_peak_memory_stats()
-log(f"transformer freed. gpu={gpu_mem()} ram={ram_mem()}")
+# Keep the transformer resident on GPU: 66GB (transformer) + ~11GB (VAEs) = 77GB fits
+# in 96GB VRAM, and this matches the app's steady-state design (transformer + VAEs
+# permanent, only the text_encoder cycles).
 
 # ---------------------------------------------------------------------------
 # Phase 3: VAEs -- load fp32 (mandatory, see handoff doc: bf16 audio VAE loses
-# ~20dB), decode video + audio, free.
+# ~20dB), decode video + audio.
 # ---------------------------------------------------------------------------
 log("loading vae + audio_vae to cuda (fp32) ...")
 t_load = time.time()
@@ -321,7 +328,7 @@ report = {
     "height": HEIGHT,
     "width": WIDTH,
     "num_frames_requested": NUM_FRAMES,
-    "num_frames_actual": block_state.num_frames,
+    "num_frames_actual": actual_num_frames,
     "num_inference_steps": NUM_INFERENCE_STEPS,
     "seed": SEED,
     "denoise_time_s": denoise_time,
