@@ -46,28 +46,67 @@ venv/bin/python scripts/download_t2va.py
 内部で `allow_patterns` を使い、必要なサブフォルダのみを取得する。ダウンロード中は
 `logs/du_monitor.log` でキャッシュサイズを監視できる(170GB超で警告)。
 
-## VRAM/RAM 設計 (重要)
+## VRAM/RAM 設計 (重要、実測に基づく)
 
-このマシンは VRAM 96GB に対し RAM は 94GB しかない。4つの大きいコンポーネントを
-足すと約110GB (text_encoder bf16 ~33GB + transformer bf16 ~66GB + vae/audio_vae fp32
-~11GB) になり、**同時にRAMへ載らない**。そのため diffusers の
+このマシンは VRAM 96GB に対し RAM は 94GB。**text_encoder は bf16ネイティブ配布で
+実測66.73GB**(fp32配布を仮定した「bf16化で半分の33GB」という当初推定は誤りだった)。
+transformer bf16 66.3GB / vae+audio_vae fp32 計11GB と合わせると約144GBになり、
+**VRAMにもRAMにも同時に載らない**。diffusers の
 `ComponentsManager.enable_auto_cpu_offload()`(全コンポーネントを定常的にRAM常駐させ、
-アクティブな1つだけをGPUへ出す方式)は採用していない。
+アクティブな1つだけをGPUへ出す方式)は RAM 94GB では成立しないため採用していない。
 
-代わりに `core/runner.py` は以下の設計を取る:
+代わりに `core/runner.py` は **2つの66GBモデルをリクエストごとにGPU上で入れ替える**:
 
-- `transformer` + `vae` + `audio_vae` は初回ロード後、**常時GPU常駐**のままにする
-  (66+11=77GB、96GB VRAM に十分収まる)。
-- `text_encoder`(bf16 ~33GB)だけは生成のたびに GPU へロードし、プロンプトエンコード
-  完了後すぐ CPU へ退避 + 明示的に解放する(**単発の片道スワップ**であり、
-  diffusers-server の CLAUDE.md が禁止する「巨大モジュールの毎ステップ往復」パターン
-  ではない)。
+- `vae` + `audio_vae`(fp32 計11GB)は常時GPU常駐。
+- エンコード段階: [VAE 11GB + text_encoder 66GB](transformerが常駐していれば先に解放)
+- デノイズ/デコード段階: [VAE 11GB + transformer 66GB](エンコード直後にTEを解放)
+- 解放は **CUDAモデルの参照を直接落とす**(`.to("cpu")` でRAMへ退避しない。66GBの
+  RAM経由はスワップ突入の実測原因になった)。リロードはページキャッシュ/ディスクから
+  11〜40秒/モデル。リクエスト間の定常状態は transformer+VAE 常駐(77.5GB)。
+
+**実測のオーバーヘッド**: 1リクエストあたり TEロード ~37s + transformerリロード ~26s。
+短縮したい場合の改善候補は TE の bnb-4bit 化(~17GB になれば transformer と同時常駐
+可能になり入れ替え自体が不要になる。handoff 参照、未実装)。
+
+**2つの実装上の罠(実機で踏んで修正済み)**:
+1. `MiniMaxH3TextEncoderStep.encode_prompt` は素の staticmethod で、`@torch.no_grad()`
+   はブロックの `__call__` 側にしか付いていない。直接呼ぶ場合は必ず `torch.no_grad()`
+   で包むこと。忘れると autograd グラフが TE の重み約50GB分をGPU上にピン留めし、
+   モデルを解放してもVRAMが返ってこない(diffusers-server CLAUDE.md 39番と同型)。
+2. ブロックの出力(`num_frames`・`keyframes`・latent形状等)は `PipelineState` に入る。
+   `get_block_state()` は宣言された入力しかマップしないので、出力は `state.get(名前)`
+   で読むこと。
 
 video VAE の decode は diffusers 側の `MiniMaxH3VideoDecodeStep` が内部で
 `torch.autocast(dtype=torch.float16)` を使うため、重み自体は fp32 のままでよい。
 **audio VAE は fp32 のまま一切キャストしないこと**(bf16化すると生成音声の音量が
 約20dB小さくなる既知の問題があるため、`runner.py` は `vae`/`audio_vae` のロードに
 明示的に `dtype=torch.float32` を渡している)。
+
+## 実測値 (RTX PRO 6000 Blackwell 96GB, 768×768, 124フレーム=5.17秒, 30steps)
+
+| 項目 | 実測 |
+|---|---|
+| DLサイズ(T2VA必要分のみ) | 135GiB (HFキャッシュ実測) |
+| text_encoder ロード | 37.6s (コールド) / 15.9s (ページキャッシュ温) |
+| transformer ロード | 37.7s (コールド) / 10〜26s (温) |
+| vae+audio_vae ロード | 10.0s |
+| プロンプトエンコード | 0.7s |
+| デノイズ (30steps) | 157〜159s (約5.4s/step, GPU 100%/600W) |
+| VAEデコード (video+audio) | 6.5〜9s |
+| ピークVRAM (生成中) | 83.4GB (デコード時。デノイズ中は70.4GB) |
+| リクエスト合計 (サーバAPI経由、ロード込み) | 245s |
+| RAM | 使用~6.5GBで安定、スワップ増ゼロ |
+
+sm_120 (Blackwell) のパッチ化conv3d病的低速(diffusers-server CLAUDE.md 46番)は
+**発症しない**(全ステップ均一に約5.4s、GPU 100%張り付きの健全なcompute-bound)。
+
+音声: 32kHz ステレオ生成 → AAC で mux。プローブ実測 rms=0.10(犬・鳥・風の環境音)。
+静かなシーン指定では rms~0.006 程度になるが非無音。
+
+transformers は **venv 内に 5.14.1** を上書きインストールしてある(comfy-env の 5.1.0
+には `Qwen3VLProcessor.create_mm_token_type_ids` が無く PR #14355 のエンコーダが
+動かないため。comfy-env 自体は無変更)。
 
 ## 起動
 

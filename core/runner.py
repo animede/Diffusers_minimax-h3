@@ -284,9 +284,9 @@ class MiniMaxH3Runner:
             MiniMaxH3PrepareLayoutStep,
             MiniMaxH3SetTimestepsStep,
         )
-        from diffusers.modular_pipelines.minimax_h3.before_encoder import (
+        from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3SetupStep
+        from diffusers.modular_pipelines.minimax_h3.modular_blocks_minimax_h3 import (
             MiniMaxH3AutoKeyframeVaeEncoderStep,
-            MiniMaxH3SetupStep,
         )
         from diffusers.modular_pipelines.minimax_h3.decoders import (
             MiniMaxH3AudioDecodeStep,
@@ -423,7 +423,8 @@ class MiniMaxH3Runner:
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
-        job_stub = f"t2va_{int(t_start)}"
+        mode = "fl2va" if (image is not None or last_image is not None) else "t2va"
+        job_stub = f"{mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
         _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
 
@@ -447,7 +448,7 @@ class MiniMaxH3Runner:
             "mp4_path": str(mp4_path),
             "mp4_filename": mp4_path.name,
             "total_elapsed_s": round(time.time() - t_start, 2),
-            "mode": "fl2va" if (image is not None or last_image is not None) else "t2va",
+            "mode": mode,
         }
         if progress:
             progress.update(phase="done", message="完了", result_path=str(mp4_path))
