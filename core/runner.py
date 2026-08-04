@@ -11,8 +11,11 @@ Loading strategy (see dev_notes/handoff-minimax-h3.md and diffusers-server CLAUD
   keeps every component CPU-resident as its steady state (accelerate hooks only move
   the *active* one to GPU), so it would try to hold all ~144GB in RAM simultaneously --
   not possible here.
-- Instead the two 66GB models cycle through GPU per request, with the small fp32 VAEs
-  (~11GB) permanently resident:
+
+There are two loading strategies, selected by the `H3_TE_QUANT` env var:
+
+`H3_TE_QUANT=none`: the two 66GB models cycle through GPU per request, with
+  the small fp32 VAEs (~11GB) permanently resident:
     encode phase : [vae 11GB + text_encoder 66GB]   (transformer dropped if resident)
     denoise/decode: [vae 11GB + transformer 66GB]   (TE dropped right after encoding)
   Each drop frees the CUDA model in place (no .to("cpu") staging -- that would take
@@ -20,11 +23,51 @@ Loading strategy (see dev_notes/handoff-minimax-h3.md and diffusers-server CLAUD
   Reloads are served from disk/page cache at ~16-40s per model, i.e. ~1 load/free cycle
   per generation for each big model -- the "short window" pattern CLAUDE.md sanctions,
   not the banned "swap the whole module every step" pattern. The steady state between
-  requests keeps transformer + VAEs resident (77GB).
+  requests keeps transformer + VAEs resident (77GB). Overhead: ~37s TE reload +
+  ~26s transformer reload per request.
+
+`H3_TE_QUANT=bnb-4bit` (default; A/B verified 2026-08-04 -- same-seed frames and audio
+  show no visible/audible degradation vs bf16 TE, and requests drop 245s -> 185s):
+  the text_encoder is quantized to NF4 (bitsandbytes,
+  compute_dtype=bf16) at startup and stays GPU-resident permanently -- bnb 4bit models
+  cannot be moved between devices, so "load once, keep forever" is the only option for
+  them anyway. Measured size: ~21.0GB (not the ~18GB originally estimated). The
+  transformer (66.3GB) also stays resident between requests: no more per-request TE<->
+  transformer swap. That leaves transformer+TE-nf4 = ~87.5GB resident during encode/
+  denoise, which does not leave enough headroom for vae+audio_vae(11GB, permanently
+  resident in the `none` path) plus activation buffers within this card's ~95.6GB. So
+  in this mode the VAEs are NOT permanently resident: they live on CPU by default and
+  are moved to GPU only for their active phase (keyframe encode / video+audio decode),
+  then moved back to CPU right after.
+  A second, sharper constraint was found by measurement, not by the original estimate:
+  transformer(66.3) + TE-nf4(21.0) + vae pair(11.0) = ~98.5GB *before* any decode
+  activation buffer is even counted -- already over the card's ~95.6GB. Keeping all
+  three resident through decode OOM'd in practice ("Tried to allocate 30.00 MiB" with
+  the allocator already pinned at 93.7GB). Since the transformer is not touched by
+  either decode step (MiniMaxH3VideoDecodeStep / MiniMaxH3AudioDecodeStep only use
+  vae/audio_vae/video_processor), it is dropped for the ~9s decode window and reloaded
+  right after, restoring the transformer+TE-nf4 steady state before the next request.
+  None of this is the banned "swap a 60GB+ module every step" pattern (CLAUDE.md #33):
+  every move is a single one-way trip bounded to one specific phase (keyframe encode,
+  decode, or the reload right after), the same "short window, small object" shape the
+  `none` path already uses for its own TE/transformer cycle -- just sliced along a
+  different phase boundary (decode instead of encode) and applied to the VAEs plus,
+  when decode is the phase in question, the transformer too.
+  Overhead avoided: no more per-request TE reload (was ~37s) and no more per-request
+  transformer reload *around encode* (was ~26s). Overhead added: ~1 VAE round trip
+  in/out of GPU per request (small, fp32, ~11GB, PCIe-bound, no disk I/O) plus one
+  transformer drop+reload around the decode window specifically (~10-26s, page-cache
+  warm) -- still net faster per request since the TE load is fully eliminated and it
+  replaces what used to be *two* full big-model reloads with one.
+
 - video VAE decode runs under a float16 autocast internally (diffusers' own
   MiniMaxH3VideoDecodeStep) even though its weights are float32. audio_vae must stay
   float32 end-to-end: casting it to bf16 is a known upstream bug that makes generated
   audio ~20dB too quiet, so we never touch its dtype after loading fp32.
+- The video VAE ships with spatial tiling enabled by default (`use_tiling=True`,
+  256px tiles, verified in autoencoder_kl_minimax_h3.py) and runner.py never disables
+  it, so tiled decode is already active in both modes -- there is no extra "enable
+  tiling" step needed for decode-peak reduction here.
 """
 from __future__ import annotations
 
@@ -32,6 +75,7 @@ import gc
 import io
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -46,6 +90,14 @@ logger = logging.getLogger("minimax_h3.runner")
 
 MODEL_ID = "MiniMaxAI/MiniMax-H3"
 DEVICE = torch.device("cuda:0")
+CPU = torch.device("cpu")
+
+# "none" (default) = current per-request TE<->transformer GPU swap.
+# "bnb-4bit" = TE quantized NF4, TE+transformer both resident permanently, VAEs cycle
+# through GPU per-phase instead. See module docstring above.
+TE_QUANT = os.environ.get("H3_TE_QUANT", "bnb-4bit").strip().lower()
+if TE_QUANT not in ("none", "bnb-4bit"):
+    raise ValueError(f"H3_TE_QUANT must be 'none' or 'bnb-4bit', got {TE_QUANT!r}")
 
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
 MIN_SECONDS = 5.0
@@ -143,6 +195,9 @@ class MiniMaxH3Runner:
         self._transformer_loaded = False
         self._vae_loaded = False
         self._text_encoder_loaded = False
+        # bnb-4bit mode only: whether the (permanently-loaded-in-RAM-terms, but
+        # phase-cycled-on-GPU) VAEs are currently placed on GPU or parked on CPU.
+        self._vae_on_gpu = False
         self._load_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -153,13 +208,16 @@ class MiniMaxH3Runner:
             return
         from diffusers import ModularPipeline
 
-        logger.info("building ModularPipeline shell from %s", MODEL_ID)
+        logger.info("building ModularPipeline shell from %s (H3_TE_QUANT=%s)", MODEL_ID, TE_QUANT)
         self._pipe = ModularPipeline.from_pretrained(MODEL_ID)
         logger.info("pipe shell built: blocks=%s components=%s",
                      self._pipe._blocks.__class__.__name__, self._pipe.component_names)
 
     def _ensure_vaes(self, progress: ProgressState | None = None):
-        """vae + audio_vae (~11GB fp32) are small enough to stay resident permanently."""
+        """Load vae + audio_vae (~11GB fp32) component weights (host RAM/disk -> not GPU yet
+        in bnb-4bit mode). In `none` mode these are placed on GPU immediately and stay there
+        permanently, matching the original behaviour.
+        """
         self._ensure_pipe_shell()
         if self._vae_loaded:
             return
@@ -170,24 +228,67 @@ class MiniMaxH3Runner:
         # audio VAE must stay fp32 end-to-end (bf16 causes ~20dB volume loss, see
         # module docstring / handoff doc).
         self._pipe.load_components(names=["vae", "audio_vae"], dtype=torch.float32)
-        self._pipe.vae.to(DEVICE)
-        self._pipe.audio_vae.to(DEVICE)
+        if TE_QUANT == "bnb-4bit":
+            # Parked on CPU by default in this mode -- moved to GPU only for the phase
+            # that needs them (keyframe encode / decode). See module docstring.
+            self._pipe.vae.to(CPU)
+            self._pipe.audio_vae.to(CPU)
+            self._vae_on_gpu = False
+        else:
+            self._pipe.vae.to(DEVICE)
+            self._pipe.audio_vae.to(DEVICE)
+            self._vae_on_gpu = True
         self._pipe.load_components(names=["scheduler", "audio_scheduler"])
         self._vae_loaded = True
-        logger.info("vae/audio_vae loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t1, gpu_mem_gb(), ram_gb())
+        logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
+                     "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
 
         from diffusers.video_processor import VideoProcessor
 
         if getattr(self._pipe, "video_processor", None) is None:
             self._pipe.video_processor = VideoProcessor(vae_scale_factor=16, do_normalize=False)
 
+    def _vae_to_gpu(self):
+        """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
+        phase. A single short one-way trip, not a standing swap -- see module docstring.
+        """
+        if TE_QUANT != "bnb-4bit" or self._vae_on_gpu:
+            return
+        t0 = time.time()
+        self._pipe.vae.to(DEVICE)
+        self._pipe.audio_vae.to(DEVICE)
+        self._vae_on_gpu = True
+        logger.info("vae/audio_vae -> GPU in %.2fs. gpu=%s", time.time() - t0, gpu_mem_gb())
+
+    def _vae_to_cpu(self):
+        """bnb-4bit mode only: move the VAEs back off GPU once their phase is done, to make
+        room for the permanently-resident transformer + TE-nf4 during denoise.
+        """
+        if TE_QUANT != "bnb-4bit" or not self._vae_on_gpu:
+            return
+        t0 = time.time()
+        self._pipe.vae.to(CPU)
+        self._pipe.audio_vae.to(CPU)
+        self._vae_on_gpu = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("vae/audio_vae -> CPU in %.2fs. gpu=%s", time.time() - t0, gpu_mem_gb())
+
     def _ensure_transformer(self, progress: ProgressState | None = None):
-        """Load the 66GB bf16 transformer to GPU. Frees the text_encoder first if resident."""
+        """Load the 66GB bf16 transformer to GPU.
+
+        `none` mode: frees the text_encoder first if resident (they cannot coexist).
+        `bnb-4bit` mode: TE-nf4 is permanently resident, nothing to free here. Called at
+        startup, and again after every request's decode phase (which drops the
+        transformer for its ~9s window -- see the decode section of `generate()`) to
+        restore the transformer+TE-nf4 steady state between requests.
+        """
         self._ensure_pipe_shell()
         if self._transformer_loaded:
             return
-        # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM.
-        self._free_text_encoder()
+        if TE_QUANT != "bnb-4bit":
+            # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM.
+            self._free_text_encoder()
         if progress:
             progress.update(phase="loading_transformer", message="transformer をロード中...")
         t0 = time.time()
@@ -208,9 +309,42 @@ class MiniMaxH3Runner:
         logger.info("transformer freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
 
     def _load_text_encoder(self, progress: ProgressState | None = None):
-        """Load the ~66GB bf16-native TE to GPU. Frees the transformer first if resident."""
+        """Load the text_encoder to GPU.
+
+        `none` mode: ~66GB bf16-native TE, loaded/freed per request, frees the
+        transformer first (they cannot coexist).
+        `bnb-4bit` mode: ~18GB NF4-quantized TE, loaded once at startup and kept
+        resident forever (bnb 4bit models cannot be moved between devices, so
+        `device_map="cuda"` places it directly and there is nothing to cycle).
+        """
         self._ensure_pipe_shell()
         if self._text_encoder_loaded:
+            return
+        if TE_QUANT == "bnb-4bit":
+            if progress:
+                progress.update(phase="loading_text_encoder", message="text_encoder (Qwen3-VL-32B, NF4) をロード中...")
+            t0 = time.time()
+            from transformers import BitsAndBytesConfig
+
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            # Per-component kwargs: `load_components` broadcasts a plain (non-dict) kwarg
+            # value to every named component, but tokenizer/processor do not accept
+            # `quantization_config` or `device_map`. Use the dict form (component name ->
+            # value) so only `text_encoder` gets them.
+            self._pipe.load_components(
+                names=["text_encoder", "tokenizer", "processor"],
+                dtype=torch.bfloat16,
+                quantization_config={"text_encoder": quant_config},
+                device_map={"text_encoder": "cuda"},
+            )
+            self._text_encoder_loaded = True
+            logger.info(
+                "text_encoder (NF4) loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb()
+            )
             return
         # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM: measured 66.73GB
         # for the TE alone (the checkpoint shards are bf16-native, not fp32). The two
@@ -227,6 +361,12 @@ class MiniMaxH3Runner:
     def _free_text_encoder(self):
         if not self._text_encoder_loaded:
             return
+        if TE_QUANT == "bnb-4bit":
+            # Permanently resident in this mode -- never freed mid-run (see
+            # _load_text_encoder docstring). Guard so a stray call is a harmless no-op
+            # rather than silently dropping the model.
+            logger.debug("bnb-4bit text_encoder is permanently resident; ignoring free request")
+            return
         # Drop the CUDA model directly: releasing the last reference frees the VRAM in
         # place. Do NOT stage through .to("cpu") first -- the text_encoder is ~66GB
         # (the checkpoint is bf16-native, not fp32), and a host-RAM transit would both
@@ -240,21 +380,28 @@ class MiniMaxH3Runner:
         logger.info("text_encoder freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
 
     def preload_all(self):
-        """Load the steady-state residents (transformer + VAEs) once at startup.
+        """Load the steady-state residents once at startup.
 
-        The text_encoder is NOT preloaded: it cycles per request (it cannot coexist
-        with the transformer in 96GB VRAM), so preloading it would only be churn.
+        `none` mode: transformer + VAEs (the text_encoder cycles per request, so
+        preloading it would only be churn).
+        `bnb-4bit` mode: transformer + text_encoder(NF4) + VAEs are ALL loaded here --
+        the VAEs' weights are loaded now (onto CPU, see _ensure_vaes) and the TE is
+        loaded straight to GPU permanently, since nothing cycles anymore in this mode.
         """
         with self._load_lock:
             self._ensure_vaes()
             self._ensure_transformer()
+            if TE_QUANT == "bnb-4bit":
+                self._load_text_encoder()
 
     def status(self) -> dict:
         return {
             "pipe_built": self._pipe is not None,
             "transformer_loaded": self._transformer_loaded,
             "vae_loaded": self._vae_loaded,
+            "vae_on_gpu": self._vae_on_gpu,
             "text_encoder_loaded": self._text_encoder_loaded,
+            "te_quant": TE_QUANT,
             "gpu": gpu_mem_gb(),
             "ram": ram_gb(),
         }
@@ -300,9 +447,12 @@ class MiniMaxH3Runner:
         num_frames = seconds_to_num_frames(seconds)
 
         with self._load_lock:
-            # Big-model cycle, phase 1: VAEs (permanent residents) + text encoder.
-            # _load_text_encoder frees the transformer internally if it is resident
-            # (TE 66GB + transformer 66GB cannot coexist in 96GB VRAM).
+            # `none` mode: VAEs (permanent residents) + text encoder. _load_text_encoder
+            # frees the transformer internally if it is resident (TE 66GB + transformer
+            # 66GB cannot coexist in 96GB VRAM).
+            # `bnb-4bit` mode: everything is already resident from preload_all() except
+            # the VAEs, which are parked on CPU -- nothing to do here, they get moved to
+            # GPU right before the phase that needs them, below.
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
 
@@ -329,6 +479,12 @@ class MiniMaxH3Runner:
         state.set("condition_latents", None)
         state.set("audio_condition_latents", None)
 
+        is_fl2va = image is not None or last_image is not None
+        if is_fl2va:
+            # fl2va's keyframe VAE-encode step needs `vae` on GPU; bring it in now (no-op
+            # in `none` mode, where it is already permanently resident).
+            self._vae_to_gpu()
+
         # --- setup (canvas / frame count / keyframe prep) ---
         setup_step = MiniMaxH3SetupStep()
         _, state = setup_step(pipe, state)
@@ -351,16 +507,37 @@ class MiniMaxH3Runner:
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
 
-        # Big-model cycle, phase 2: TE's job is done for this request -- free it and
-        # bring in the transformer (which stays resident until the next request's
-        # encode phase kicks it out again).
-        with self._load_lock:
-            self._free_text_encoder()
-            self._ensure_transformer(progress)
+        if TE_QUANT == "bnb-4bit" and is_fl2va:
+            # bnb-4bit + fl2va only: transformer(66.3) + TE-nf4(21.0) + vae pair(11.0)
+            # already sums to ~98.3GB before any activation buffer, over this card's
+            # ~95.6GB (the same three-way conflict measured for decode, see the decode
+            # section below and the module docstring) -- so the keyframe VAE-encode step
+            # (which needs `vae` on GPU, already brought in above) has to run *before*
+            # the transformer is loaded, not after. TE stays resident throughout (it is
+            # not involved in this step).
+            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
+            _, state = keyframe_step(pipe, state)
+            self._vae_to_cpu()
+            with self._load_lock:
+                self._free_text_encoder()  # no-op in this mode; kept for symmetry
+                self._ensure_transformer(progress)
+        else:
+            # `none` mode: TE's job is done for this request -- free it and bring in the
+            # transformer (which stays resident until the next request's encode phase
+            # kicks it out again).
+            # `bnb-4bit` + t2va: TE is permanently resident (free is a no-op) and the
+            # transformer is normally already resident too -- except right after a
+            # previous request's decode phase dropped it (see the decode section below),
+            # in which case this is the reload that restores it before denoise. No vae
+            # conflict here since t2va's vae never went to GPU in the first place.
+            with self._load_lock:
+                self._free_text_encoder()
+                self._ensure_transformer(progress)
 
-        # --- keyframe VAE conditioning (fl2va only; needs `vae`, already resident) ---
-        keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
-        _, state = keyframe_step(pipe, state)
+            # --- keyframe VAE conditioning (fl2va + `none` mode only; vae already
+            # permanently resident in `none` mode) ---
+            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
+            _, state = keyframe_step(pipe, state)
 
         # --- layout / latents / timesteps ---
         layout_step = MiniMaxH3PrepareLayoutStep()
@@ -393,6 +570,22 @@ class MiniMaxH3Runner:
         # --- decode ---
         if progress:
             progress.update(phase="decoding", message="動画/音声をデコード中...")
+        # bnb-4bit mode: transformer(66.3GB) + TE-nf4(~21GB) + vae pair(11GB) = ~98.5GB
+        # already exceeds this card's ~95.6GB before any decode activation buffers are
+        # even counted (measured: an attempt to keep all three resident OOM'd during
+        # decode, "Tried to allocate 30.00 MiB" with the allocator already at 93.7GB).
+        # The transformer is not used by either decode step (MiniMaxH3VideoDecodeStep /
+        # MiniMaxH3AudioDecodeStep only touch vae/audio_vae/video_processor), so it is
+        # the thing that gives here: drop it for this short (~9s) window, then reload it
+        # right after so the steady state between requests is unchanged. This is the
+        # same bounded "short window" pattern as the `none` mode's per-request TE/
+        # transformer cycle, just applied to the transformer around decode instead of
+        # around encode. `none` mode does not need this at all -- its vae is already
+        # permanently resident and its transformer/TE never coexist in the first place,
+        # so dropping the transformer here would only add pointless reload churn.
+        if TE_QUANT == "bnb-4bit":
+            self._free_transformer()
+        self._vae_to_gpu()
         t_decode = time.time()
         video_decode_step = MiniMaxH3VideoDecodeStep()
         _, state = video_decode_step(pipe, state)
@@ -420,6 +613,16 @@ class MiniMaxH3Runner:
         del video_tensor, videos, audio
         gc.collect()
         torch.cuda.empty_cache()
+
+        # bnb-4bit mode: decode is done and frames/audio are already off-GPU (numpy
+        # above) -- park the VAEs back on CPU, then reload the transformer that was
+        # dropped for the decode window, restoring the transformer+TE-nf4 steady state
+        # this mode keeps between requests. No-op in `none` mode (nothing was dropped
+        # for decode in that mode).
+        self._vae_to_cpu()
+        if TE_QUANT == "bnb-4bit":
+            with self._load_lock:
+                self._ensure_transformer(progress)
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
@@ -449,6 +652,7 @@ class MiniMaxH3Runner:
             "mp4_filename": mp4_path.name,
             "total_elapsed_s": round(time.time() - t_start, 2),
             "mode": mode,
+            "te_quant": TE_QUANT,
         }
         if progress:
             progress.update(phase="done", message="完了", result_path=str(mp4_path))

@@ -385,8 +385,9 @@ async function refreshServerStatus() {
     const data = await res.json();
     const r = data.runner;
     serverStatusEl.innerHTML =
-      `busy: ${data.busy} | transformer: ${r.transformer_loaded} | vae: ${r.vae_loaded} | ` +
-      `text_encoder: ${r.text_encoder_loaded}<br>` +
+      `te_quant: ${r.te_quant} | busy: ${data.busy} | transformer: ${r.transformer_loaded} | vae: ${r.vae_loaded}` +
+      (r.te_quant === 'bnb-4bit' ? ` (on_gpu: ${r.vae_on_gpu})` : ``) +
+      ` | text_encoder: ${r.text_encoder_loaded}<br>` +
       `GPU alloc: ${r.gpu.allocated_gb ?? '-'}GB / peak: ${r.gpu.peak_gb ?? '-'}GB | ` +
       `RAM avail: ${r.ram.avail_gb}GB / swap used: ${r.ram.swap_used_gb}GB`;
   } catch (e) {

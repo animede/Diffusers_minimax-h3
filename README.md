@@ -55,7 +55,31 @@ transformer bf16 66.3GB / vae+audio_vae fp32 計11GB と合わせると約144GB�
 `ComponentsManager.enable_auto_cpu_offload()`(全コンポーネントを定常的にRAM常駐させ、
 アクティブな1つだけをGPUへ出す方式)は RAM 94GB では成立しないため採用していない。
 
-代わりに `core/runner.py` は **2つの66GBモデルをリクエストごとにGPU上で入れ替える**:
+TEのロード方式は環境変数 `H3_TE_QUANT` で選択する(既定 `bnb-4bit`、2026-08-04 に
+A/B検証して既定化)。
+
+### `H3_TE_QUANT=bnb-4bit` (既定)
+
+text_encoder を起動時に NF4(bitsandbytes、compute_dtype=bf16)へ量子化して
+**GPU常駐のまま維持する**(bnb 4bitモデルはデバイス間移動不可のため常駐一択)。
+実測サイズ **21.0GB**(当初推定の~17-18GBより大きい)。transformer(66.3GB)も常駐し、
+リクエストごとの TE⇔transformer 入れ替えが消滅する。
+
+- 定常常駐: transformer + TE-nf4 = **~87.5GB**。これに VAE 11GB を足すと~98.5GBで
+  96GBを超えるため、**このモードでは VAE ペアは常駐しない**(CPUに置き、キーフレーム
+  エンコード/デコードの当該フェーズだけGPUへ往復する。fp32 11GBのPCIe往復のみで
+  ディスクI/Oなし)。
+- デコード窓(~9s)だけは transformer を解放してから実行し、直後にリロードする
+  (transformer+TE+VAE+デコードバッファは物理的に収まらないため。実測でOOM確認済み)。
+  毎stepのスワップではなく単発の片道×2なので、diffusers-server CLAUDE.md 33番の
+  禁止パターンには当たらない。
+- **品質A/B(同一seed 12345)**: フレーム比較で構図・被写体・シャープさは同等
+  (条件付け数値の変化による木立の配置等の微差のみ)、音声も rms 0.0080→0.0061 と
+  同水準で -20dB 型の崩壊なし。**劣化なしと判定して既定化した**。
+
+### `H3_TE_QUANT=none` (bf16 TE、旧方式)
+
+**2つの66GBモデルをリクエストごとにGPU上で入れ替える**:
 
 - `vae` + `audio_vae`(fp32 計11GB)は常時GPU常駐。
 - エンコード段階: [VAE 11GB + text_encoder 66GB](transformerが常駐していれば先に解放)
@@ -65,8 +89,8 @@ transformer bf16 66.3GB / vae+audio_vae fp32 計11GB と合わせると約144GB�
   11〜40秒/モデル。リクエスト間の定常状態は transformer+VAE 常駐(77.5GB)。
 
 **実測のオーバーヘッド**: 1リクエストあたり TEロード ~37s + transformerリロード ~26s。
-短縮したい場合の改善候補は TE の bnb-4bit 化(~17GB になれば transformer と同時常駐
-可能になり入れ替え自体が不要になる。handoff 参照、未実装)。
+この入れ替えコストを解消したのが上記の `bnb-4bit`(既定)で、リクエスト合計は
+245s → **185s** に短縮された(デノイズ157sは共通のモデル律速で不変)。
 
 **2つの実装上の罠(実機で踏んで修正済み)**:
 1. `MiniMaxH3TextEncoderStep.encode_prompt` は素の staticmethod で、`@torch.no_grad()`
@@ -94,9 +118,12 @@ video VAE の decode は diffusers 側の `MiniMaxH3VideoDecodeStep` が内部�
 | プロンプトエンコード | 0.7s |
 | デノイズ (30steps) | 157〜159s (約5.4s/step, GPU 100%/600W) |
 | VAEデコード (video+audio) | 6.5〜9s |
-| ピークVRAM (生成中) | 83.4GB (デコード時。デノイズ中は70.4GB) |
-| リクエスト合計 (サーバAPI経由、ロード込み) | 245s |
+| ピークVRAM (生成中) | none: 83.4GB (デコード時。デノイズ中70.4GB) / bnb-4bit: 91.7GB |
+| リクエスト合計 (サーバAPI経由、ロード込み) | none: 245s / **bnb-4bit(既定): 185s** |
 | RAM | 使用~6.5GBで安定、スワップ増ゼロ |
+
+bnb-4bit のピーク91.7GBは96GBカードに収まるが余裕は約4GB。ヘッドルームを優先したい
+場合は `H3_TE_QUANT=none` で旧方式(ピーク83.4GB、+60s/リクエスト)に戻せる。
 
 sm_120 (Blackwell) のパッチ化conv3d病的低速(diffusers-server CLAUDE.md 46番)は
 **発症しない**(全ステップ均一に約5.4s、GPU 100%張り付きの健全なcompute-bound)。
@@ -114,7 +141,8 @@ transformers は **venv 内に 5.14.1** を上書きインストールしてあ�
 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
-起動時に transformer/vae/audio_vae をプリロードする(text_encoderは各リクエストの
+起動時に transformer と TE(既定では NF4量子化してGPU常駐)をプリロードする
+(`H3_TE_QUANT=none` の場合は旧方式: transformer/VAEを常駐させ、TEは各リクエストの
 たびにロード/解放)。ブラウザで `http://<host>:8611/` を開く。
 
 ## 回帰確認プローブ (UIより先に動作確認する場合)
