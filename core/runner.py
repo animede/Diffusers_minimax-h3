@@ -86,6 +86,12 @@ import numpy as np
 import torch
 from PIL import Image
 
+# Re-exported so callers (app.py) can do `from core.runner import MiniMaxH3Reference`
+# without reaching into diffusers' modular_pipelines package themselves. Cheap import
+# (no model loading, just dataclass/PyAV/numpy/torch glue) -- safe at module level,
+# unlike the actual big-model loading calls in this file, which all stay lazy/on-demand.
+from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
+
 logger = logging.getLogger("minimax_h3.runner")
 
 MODEL_ID = "MiniMaxAI/MiniMax-H3"
@@ -272,6 +278,31 @@ class MiniMaxH3Runner:
         self._vae_on_gpu = False
         self._load_lock = threading.Lock()
 
+        # --- ref2va (omni-reference) additions ---
+        # A second ModularPipeline shell, built from MiniMaxH3Ref2VABlocks (the only way
+        # to get a pipe whose `_component_specs` know about `transformer_ref` -- the
+        # default `ModularPipeline.from_pretrained(MODEL_ID)` shell above is built from
+        # MiniMaxH3Blocks (t2va/fl2va) and its spec table has no `transformer_ref` entry
+        # at all, confirmed by probe: `pipe.load_components(names=["transformer_ref"])`
+        # on the t2va shell logs "Unknown components will be ignored: {'transformer_ref'}"
+        # and leaves `pipe.transformer_ref` unset. `transformer`/`transformer_ref` are
+        # each ~66.3GB bf16 and cannot coexist in this card's ~96GB (same constraint as
+        # TE vs transformer above), so only one of `self._pipe.transformer` /
+        # `self._pipe_ref.transformer_ref` is ever GPU-resident at a time -- tracked by
+        # `self._active_variant`. Every other component (text_encoder, tokenizer,
+        # processor, vae, audio_vae, scheduler, audio_scheduler, video_processor) is
+        # loaded once on `self._pipe` and shared onto `self._pipe_ref` by plain attribute
+        # assignment (`ModularPipeline.components` is just `{name: getattr(self, name)
+        # for name in self._component_specs if hasattr(self, name)}` -- confirmed by
+        # reading modular_pipeline.py -- so this is not a hack, it is the documented shape
+        # of that dict) -- avoids a second ~66GB TE / ~11GB VAE load.
+        self._pipe_ref = None
+        self._transformer_ref_loaded = False
+        # "t2va" | "ref2va" | None (nothing loaded yet). Only one of `transformer` /
+        # `transformer_ref` may be GPU-resident at a time; this is the single source of
+        # truth callers check before a cross-variant swap.
+        self._active_variant: str | None = None
+
     # ------------------------------------------------------------------
     # Component lifecycle
     # ------------------------------------------------------------------
@@ -284,6 +315,39 @@ class MiniMaxH3Runner:
         self._pipe = ModularPipeline.from_pretrained(MODEL_ID)
         logger.info("pipe shell built: blocks=%s components=%s",
                      self._pipe._blocks.__class__.__name__, self._pipe.component_names)
+
+    def _ensure_pipe_ref_shell(self):
+        """Build the second ModularPipeline shell (MiniMaxH3Ref2VABlocks), whose spec table
+        knows about `transformer_ref`. See the `_pipe_ref` field comment in `__init__` for
+        why a second shell is required at all (the t2va shell's spec table has no
+        `transformer_ref` entry). Idempotent, and does not load any component weights.
+        """
+        self._ensure_pipe_shell()
+        if self._pipe_ref is not None:
+            return
+        from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Ref2VABlocks
+
+        logger.info("building ref2va ModularPipeline shell from %s", MODEL_ID)
+        self._pipe_ref = MiniMaxH3Ref2VABlocks().init_pipeline(MODEL_ID)
+        logger.info("ref2va pipe shell built: blocks=%s components=%s",
+                     self._pipe_ref._blocks.__class__.__name__, self._pipe_ref.component_names)
+
+    def _sync_shared_components_to_ref(self):
+        """Mirror every component the two shells have in common (everything except
+        `transformer` / `transformer_ref` themselves) from `self._pipe` onto
+        `self._pipe_ref`, by plain attribute assignment -- confirmed safe by reading
+        `ModularPipeline.components`'s implementation (see `_pipe_ref` field comment).
+        Called before any ref2va block runs, so text_encoder/vae/audio_vae/schedulers are
+        loaded exactly once regardless of which variant a request asks for. Safe to call
+        repeatedly (e.g. once per generate() call): each assignment just re-points the
+        same already-loaded module, it never re-loads or copies weights.
+        """
+        self._ensure_pipe_ref_shell()
+        for name in ("text_encoder", "tokenizer", "processor", "vae", "audio_vae",
+                     "scheduler", "audio_scheduler", "video_processor"):
+            component = getattr(self._pipe, name, None)
+            if component is not None:
+                setattr(self._pipe_ref, name, component)
 
     def _ensure_vaes(self, progress: ProgressState | None = None):
         """Load vae + audio_vae (~11GB fp32) component weights (host RAM/disk -> not GPU yet
@@ -367,6 +431,7 @@ class MiniMaxH3Runner:
         self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
         self._pipe.transformer.to(DEVICE)
         self._transformer_loaded = True
+        self._active_variant = "t2va"
         if H3_CACHE == "fbc":
             self._enable_fbc()
         logger.info("transformer loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
@@ -416,6 +481,131 @@ class MiniMaxH3Runner:
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("transformer freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
+
+    # ------------------------------------------------------------------
+    # ref2va transformer_ref lifecycle (mirrors transformer's, above)
+    # ------------------------------------------------------------------
+    def _ensure_transformer_ref(self, progress: ProgressState | None = None):
+        """Load the 66GB bf16 transformer_ref to GPU, onto the ref2va pipe shell.
+
+        `transformer` and `transformer_ref` are each ~66.3GB bf16 and cannot coexist in
+        this card's ~96GB (same one-big-model-at-a-time constraint the t2va/fl2va path
+        already enforces between TE and transformer, in `none` mode). Callers must go
+        through `_switch_to_variant("ref2va")` rather than calling this directly, so the
+        t2va transformer is freed first when it is the one resident -- this method itself
+        only handles the transformer_ref side of that swap.
+        """
+        self._ensure_pipe_ref_shell()
+        if self._transformer_ref_loaded:
+            return
+        if progress:
+            progress.update(phase="loading_transformer", message="transformer_ref (ref2va) をロード中...")
+        t0 = time.time()
+        self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16)
+        self._pipe_ref.transformer_ref.to(DEVICE)
+        self._transformer_ref_loaded = True
+        self._active_variant = "ref2va"
+        if H3_CACHE == "fbc":
+            self._enable_fbc_ref()
+        logger.info("transformer_ref loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
+
+    def _enable_fbc_ref(self):
+        """Attach FirstBlockCache hooks to the (freshly loaded) transformer_ref.
+
+        `transformer_ref` is the very same `MiniMaxH3Transformer3DModel` class as
+        `transformer` (confirmed: `transformer/config.json` and
+        `transformer_ref/config.json` are byte-identical in the downloaded snapshot), so
+        the block-class registration `_register_minimax_h3_block_for_fbc()` performs is
+        shared -- no separate registration needed, just a separate `enable_cache()` call
+        against this transformer instance's own submodules.
+        """
+        from diffusers.hooks import FirstBlockCacheConfig
+
+        _register_minimax_h3_block_for_fbc()
+        self._pipe_ref.transformer_ref.enable_cache(FirstBlockCacheConfig(threshold=H3_CACHE_THRESHOLD))
+        logger.info("FirstBlockCache enabled on transformer_ref (threshold=%s)", H3_CACHE_THRESHOLD)
+
+    def _fbc_last_step_was_skip_ref(self) -> int:
+        """Same as `_fbc_last_step_was_skip`, against `transformer_ref`'s own hook state."""
+        try:
+            from diffusers.hooks.first_block_cache import _FBC_LEADER_BLOCK_HOOK
+
+            head_block = self._pipe_ref.transformer_ref.transformer_blocks[0]
+            hook = head_block._diffusers_hook.get_hook(_FBC_LEADER_BLOCK_HOOK)
+            shared_state = hook.state_manager.get_state()
+            return 0 if shared_state.should_compute else 1
+        except Exception:
+            return 0
+
+    def _free_transformer_ref(self):
+        if not self._transformer_ref_loaded:
+            return
+        # Drop in place, no CPU staging -- same reasoning as _free_transformer /
+        # _free_text_encoder (CLAUDE.md #33: no whole-module CPU-staging trips for
+        # 60GB+ modules on this box).
+        del self._pipe_ref.transformer_ref
+        self._pipe_ref.transformer_ref = None
+        self._transformer_ref_loaded = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("transformer_ref freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
+
+    def _free_other_variant_transformer(self, variant: str):
+        """Free the *other* variant's big transformer (if resident) so this request's own
+        variant has room to load its own -- without loading anything itself.
+
+        `transformer`/`transformer_ref` are each ~66.3GB and never coexist in this card's
+        ~96GB. This is split out from actually loading `variant`'s own transformer (see
+        `_switch_to_variant`'s docstring for why) so a caller can free the other side
+        early -- before a vae-heavy encode step that itself needs headroom -- and defer
+        its own ~66.3GB load until after that step, mirroring the ordering `generate()`
+        already uses for the fl2va keyframe-encode-then-transformer-load sequence.
+        Idempotent: a no-op when the other variant's transformer was not resident.
+        """
+        if variant not in ("t2va", "ref2va"):
+            raise ValueError(f"variant must be 't2va' or 'ref2va', got {variant!r}")
+        if variant == "ref2va":
+            self._free_transformer()
+        else:
+            self._free_transformer_ref()
+
+    def _switch_to_variant(self, variant: str, progress: ProgressState | None = None):
+        """Ensure the requested variant's big transformer is the one GPU-resident *right
+        now*, freeing the other one first if it is currently loaded.
+
+        `variant`: "t2va" (serves t2va/fl2va requests, `self._pipe.transformer`) or
+        "ref2va" (serves ref2va requests, `self._pipe_ref.transformer_ref`).
+        `_active_variant` is only ever updated here or inside `_ensure_transformer`/
+        `_ensure_transformer_ref` themselves, so it always reflects which one is actually
+        GPU-resident.
+
+        CAUTION: this loads `variant`'s transformer immediately -- correct for
+        `generate()`'s t2va path (whose text encoding happens with the TE resident and
+        does not additionally need the transformer's own vae, so there is no headroom
+        conflict to defer around), but **not** used for ref2va's entry any more: ref2va's
+        reference-encoder step needs `vae`/`audio_vae` on GPU before `transformer_ref` is
+        loaded (transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) already exceeds this
+        card's ~95.6GB -- the identical three-way conflict `generate()`'s own fl2va/decode
+        comments document). `generate_ref2va()` instead calls
+        `_free_other_variant_transformer("ref2va")` early (frees `transformer` only, if
+        resident) and `_ensure_transformer_ref()` later, after the reference encoder step
+        and (in bnb-4bit mode) after `_vae_to_cpu()` -- the same split
+        `_free_other_variant_transformer`/`_ensure_transformer_ref` this method is built
+        from, just not fused into one call for that path. Kept for `generate()`'s t2va
+        entry point, where the fused "free other + load mine now" shape is safe.
+        """
+        if variant not in ("t2va", "ref2va"):
+            raise ValueError(f"variant must be 't2va' or 'ref2va', got {variant!r}")
+        if self._active_variant == variant:
+            return
+        t0 = time.time()
+        self._free_other_variant_transformer(variant)
+        if variant == "ref2va":
+            self._ensure_transformer_ref(progress)
+        else:
+            self._ensure_transformer(progress)
+        logger.info("switched active variant -> %s in %.1fs. gpu=%s ram=%s",
+                     variant, time.time() - t0, gpu_mem_gb(), ram_gb())
 
     def _load_text_encoder(self, progress: ProgressState | None = None):
         """Load the text_encoder to GPU.
@@ -498,8 +688,23 @@ class MiniMaxH3Runner:
         # place. Do NOT stage through .to("cpu") first -- the text_encoder is ~21-66GB
         # depending on quantization, and a host-RAM transit would both waste time and
         # evict the page-cached model shards that make the next per-request reload fast.
+        #
+        # BUG FOUND DURING THIS TASK'S OWN VERIFICATION: `self._pipe_ref.text_encoder`
+        # (set by `_sync_shared_components_to_ref` via plain attribute assignment, so it
+        # is the *same* module object as `self._pipe.text_encoder`, not a copy) also has
+        # to be cleared here, or it keeps the refcount above zero and `del
+        # self._pipe.text_encoder` frees nothing -- reproduced on this task's own second
+        # ref2va attempt: `_free_text_encoder(force=True)` logged as having run, but
+        # `gpu.allocated_gb` did not drop (stayed at ~87.5GB, TE-nf4's ~21GB never
+        # released), and the very next denoise step OOM'd identically to the un-freed
+        # case. Only `text_encoder` needs this (the only shared component this class ever
+        # `del`s outright -- vae/audio_vae are `.to()`-moved, never deleted, and
+        # transformer/transformer_ref are never shared between the two shells).
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
+        if self._pipe_ref is not None and getattr(self._pipe_ref, "text_encoder", None) is not None:
+            del self._pipe_ref.text_encoder
+            self._pipe_ref.text_encoder = None
         self._text_encoder_loaded = False
         gc.collect()
         torch.cuda.empty_cache()
@@ -524,6 +729,9 @@ class MiniMaxH3Runner:
         return {
             "pipe_built": self._pipe is not None,
             "transformer_loaded": self._transformer_loaded,
+            "pipe_ref_built": self._pipe_ref is not None,
+            "transformer_ref_loaded": self._transformer_ref_loaded,
+            "active_variant": self._active_variant,
             "vae_loaded": self._vae_loaded,
             "vae_on_gpu": self._vae_on_gpu,
             "text_encoder_loaded": self._text_encoder_loaded,
@@ -785,6 +993,16 @@ class MiniMaxH3Runner:
             raise ValueError("upscale=1 (hires-fix) is only supported for t2va requests, not fl2va.")
 
         with self._load_lock:
+            # Ensure `transformer` (not `transformer_ref`) is the GPU-resident big model
+            # before anything else in this method touches it. A no-op when t2va is
+            # already the active variant (the common case -- most requests do not
+            # interleave with ref2va ones); when the previous request was a ref2va one,
+            # this frees the ~66.3GB transformer_ref first. Must run before
+            # `_load_text_encoder` below: in `none` mode that method's own
+            # `_free_transformer()` call only knows about `transformer`, not
+            # `transformer_ref`, so without this line a ref2va -> t2va switch in `none`
+            # mode would try to hold transformer_ref(66.3) + TE(66.7) at once and OOM.
+            self._switch_to_variant("t2va", progress)
             # `none` mode: VAEs (permanent residents) + text encoder. _load_text_encoder
             # frees the transformer internally if it is resident (TE 66GB + transformer
             # 66GB cannot coexist in 96GB VRAM).
@@ -1196,6 +1414,338 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="done", message="完了", result_path=str(mp4_path))
         logger.info("generation done: %s", json.dumps({k: v for k, v in result.items() if k != "ram"}, ensure_ascii=False))
+        return result
+
+    # ------------------------------------------------------------------
+    # ref2va (omni-reference) generation
+    # ------------------------------------------------------------------
+    def generate_ref2va(
+        self,
+        prompt: str,
+        references: list,
+        height: int | None = None,
+        width: int | None = None,
+        seconds: float | None = None,
+        num_inference_steps: int = 30,
+        seed: int | None = None,
+        progress: ProgressState | None = None,
+    ) -> dict:
+        """
+        Runs ref2va: joint video+audio generation conditioned on an ordered list of
+        `MiniMaxH3Reference` images/videos/audio clips (up to 9/3/3, 12 total).
+
+        `seconds=None` is only valid when `references` carries exactly one audio-bearing
+        reference (a lone audio reference, or a video reference with a soundtrack) -- the
+        generated duration is then that reference's own, per
+        `MiniMaxH3Ref2VASetupStep.prepare_references`. `height`/`width` default to
+        MiniMax-H3's own 16:9 canvas when left out (references never bind the target
+        geometry -- each is prepared at its own resolution, see packing_ref2va.py's
+        module docstring).
+
+        Mirrors `generate()`'s structure closely (same FBC instrumentation, same
+        bnb-4bit-mode decode-window transformer drop/reload pattern), but against
+        `self._pipe_ref` / `transformer_ref` and the ref2va block set. Does not support
+        `upscale` (hires-fix) -- out of scope for this task, and `_upscale_block_state_2x`
+        assumes t2va's `num_condition_video_rows == 0`, which is never true here (a
+        reference always adds condition rows).
+
+        Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats, in the
+        same shape `generate()` returns (plus `references_summary`).
+        """
+        from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3PrepareLatentsStep,
+            MiniMaxH3Ref2VAPrepareLayoutStep,
+            MiniMaxH3SetTimestepsStep,
+        )
+        from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+        from diffusers.modular_pipelines.minimax_h3.decoders import (
+            MiniMaxH3AudioDecodeStep,
+            MiniMaxH3VideoDecodeStep,
+        )
+        from diffusers.modular_pipelines.minimax_h3.denoise import (
+            MiniMaxH3Ref2VADenoiseStep,
+            MiniMaxH3Ref2VALoopDenoiser,
+            MiniMaxH3LoopSchedulerStep,
+        )
+        from diffusers.modular_pipelines.minimax_h3.encoders import (
+            MiniMaxH3Ref2VAReferenceEncoderStep,
+            MiniMaxH3Ref2VATextEncoderStep,
+        )
+        from diffusers.modular_pipelines.minimax_h3.packing_ref2va import reference_kind
+        from diffusers.modular_pipelines.modular_pipeline import PipelineState
+
+        t_start = time.time()
+        if not references:
+            raise ValueError("ref2va needs at least one reference; use generate() for text-only requests.")
+        kinds = [reference_kind(index, entry) for index, entry in enumerate(references)]
+        if set(kinds) == {"audio"}:
+            raise ValueError(
+                "An audio reference has to be paired with at least one image or video reference and cannot be "
+                "used on its own."
+            )
+        num_frames = None if seconds is None else seconds_to_num_frames(seconds)
+
+        with self._load_lock:
+            # Free `transformer` (t2va's, if resident) now, but do NOT load
+            # `transformer_ref` yet -- unlike generate()'s t2va entry, ref2va's own
+            # reference-encoder step (below) needs `vae`/`audio_vae` on GPU *before*
+            # transformer_ref is loaded: transformer_ref(66.3) + TE-nf4(21.0) + vae
+            # pair(11.0) already exceeds this card's ~95.6GB (identical three-way
+            # conflict to fl2va's own keyframe-encode-vs-transformer-load ordering, see
+            # generate()'s comment on it -- reproduced here on the very first ref2va
+            # request tried during this task: transformer_ref loaded eagerly at this
+            # point OOM'd 8s into `vae._encode_clip()` with "Tried to allocate 98.00
+            # MiB" at 93GB already in use). `transformer_ref` is loaded further down,
+            # after the reference encoder step and (in bnb-4bit mode) after the vae
+            # pair is parked back on CPU -- the same ordering `generate()` uses for
+            # fl2va's keyframe step vs. transformer, just against the ref2va pair.
+            self._free_other_variant_transformer("ref2va")
+            # Also free transformer_ref itself unconditionally, even though this is the
+            # ref2va variant's *own* transformer: unlike the very first ref2va request
+            # (where it is never loaded yet), a *second* (or later) ref2va request in a
+            # row finds it already GPU-resident -- `_ensure_transformer_ref` at the end of
+            # the *previous* request's decode section restores the transformer_ref+TE-nf4
+            # steady state between requests, the same way `generate()`'s own `transformer`
+            # stays resident between t2va requests. Reproduced during this task's own
+            # verification: a second ref2va request's `_vae_to_gpu()` (below, via the
+            # reference encoder step) logged `allocated_gb: 98.81` (transformer_ref 66.3 +
+            # TE 21-ish + vae pair 11.0 all at once) and OOM'd on the first VAE conv. It is
+            # reloaded fresh, later, after the reference encoder step -- same as the first-
+            # request path. No-op (cheap) when it was not resident.
+            self._free_transformer_ref()
+            self._sync_shared_components_to_ref()
+            self._ensure_vaes(progress)
+            self._load_text_encoder(progress)
+
+        # Reset peak stats after loading so the reported peak reflects this generation's
+        # encode+denoise+decode, not the (much larger, one-time) model loading peak.
+        torch.cuda.reset_peak_memory_stats()
+
+        pipe = self._pipe_ref
+
+        state = PipelineState()
+        state.set("prompt", prompt)
+        state.set("references", references)
+        state.set("height", height)
+        state.set("width", width)
+        state.set("num_frames", num_frames)
+        state.set("generator", torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None)
+        state.set("num_inference_steps", num_inference_steps)
+        state.set("output_type", "pt")
+        state.set("attention_kwargs", None)
+        state.set("latents", None)
+        state.set("audio_latents", None)
+
+        # --- setup (canvas / frame count / reference prep) ---
+        # Reference images/videos/audio are decoded and resized here (each at its own
+        # resolution -- see packing_ref2va.py's module docstring), and the frame count is
+        # resolved from a lone audio-bearing reference when `num_frames` was left None.
+        setup_step = MiniMaxH3Ref2VASetupStep()
+        _, state = setup_step(pipe, state)
+        actual_num_frames = state.get("num_frames")
+
+        # --- text encode (references' vision blocks + prompt; still has TE on GPU) ---
+        if progress:
+            progress.update(phase="encoding", message="プロンプト+参照をエンコード中...")
+        with torch.no_grad():
+            prompt_embeds, text_token_tags = MiniMaxH3Ref2VATextEncoderStep.encode_prompt(
+                pipe, prompt, state.get("prepared_references"), device=DEVICE, dtype=torch.bfloat16
+            )
+        state.set("prompt_embeds", prompt_embeds)
+        state.set("text_token_tags", text_token_tags)
+
+        # --- reference VAE encoding (image/video refs through vae, soundtracks through
+        # audio_vae) -- this is ref2va's analogue of fl2va's keyframe step, and needs the
+        # same "vae on GPU before transformer_ref is loaded" ordering in bnb-4bit mode:
+        # transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) would be ~98.3GB resident
+        # at once otherwise, over this card's ~95.6GB (identical three-way conflict to
+        # fl2va's, see generate()'s own comment on this). transformer_ref was already
+        # unconditionally freed above (before `_sync_shared_components_to_ref`/
+        # `_ensure_vaes`/`_load_text_encoder`), including the "already resident from a
+        # previous ref2va request's steady state" case -- see that comment for the bug
+        # this closes. Nothing more to free here; just bring vae onto GPU.
+        self._vae_to_gpu()
+        if TE_QUANT == "bnb-4bit":
+            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
+            _, state = reference_encoder_step(pipe, state)
+            self._vae_to_cpu()
+            with self._load_lock:
+                self._ensure_transformer_ref(progress)
+        else:
+            # `none` mode: TE's job is done -- free it and bring in transformer_ref
+            # (vae is already permanently resident in this mode, so the reference
+            # encoder step can run either before or after; doing it here mirrors
+            # generate()'s own `none`-mode ordering for keyframes).
+            with self._load_lock:
+                self._free_text_encoder()
+                self._ensure_transformer_ref(progress)
+            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
+            _, state = reference_encoder_step(pipe, state)
+
+        # --- layout / latents / timesteps ---
+        layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+        _, state = layout_step(pipe, state)
+        latents_step = MiniMaxH3PrepareLatentsStep()
+        _, state = latents_step(pipe, state)
+        timesteps_step = MiniMaxH3SetTimestepsStep()
+        _, state = timesteps_step(pipe, state)
+
+        # bnb-4bit mode: force-free TE-nf4 (~21GB) before denoise, unconditionally (unlike
+        # generate()'s hires-fix-only `force_free_te` -- a reference always adds condition
+        # rows ahead of the generated ones, so ref2va's packed sequence is longer than
+        # plain t2va's even at the same target resolution/duration, and this task's own
+        # first real request reproduced the consequence: transformer_ref(66.3) + TE-
+        # nf4(21.0) = 87.5GB steady state left only ~8GB of headroom, and the very first
+        # denoise step OOM'd inside attention ("Tried to allocate 1.23 GiB" with 92.4GB
+        # already in use) with just one 2048px-short-edge image reference at 768x768/5s).
+        # Reloaded after decode, below -- same "restore the steady state for the next
+        # request" shape `generate()`'s own force_free_te reload uses.
+        #
+        # IMPORTANT (same reasoning as generate()'s force_free_te comment): this free is
+        # deliberately deferred until after layout_step/latents_step/timesteps_step above,
+        # not fused into the reference-encoder section further up. `_execution_device`
+        # resolves to the device of the *first* `nn.Module` still set on `self._pipe_ref`,
+        # in `MiniMaxH3Ref2VABlocks`' component order -- `text_encoder` first, then `vae`.
+        # Freeing text_encoder before those three steps run would make `vae` (parked on
+        # CPU in bnb-4bit mode outside its active phase, which ended when
+        # `_vae_to_cpu()` ran above) the new first hit, silently resolving
+        # `_execution_device` to `cpu` -- the identical device-mismatch trap generate()'s
+        # own comment documents finding for its layout_step. Freeing TE only once those
+        # position_ids/layout tensors already exist on the correct device (set once here,
+        # and never touched again for the rest of the request) sidesteps it entirely.
+        force_free_te = TE_QUANT == "bnb-4bit"
+        if force_free_te:
+            with self._load_lock:
+                self._free_text_encoder(force=True)
+
+        # --- denoise loop, instrumented for progress polling (mirrors generate()'s
+        # non-upscale path exactly, against transformer_ref instead of transformer) ---
+        if progress:
+            progress.update(phase="denoising", step=0, total_steps=num_inference_steps, message="デノイズ中...")
+        t_denoise = time.time()
+        step_times = []
+        cache_skips = [0]
+        out_height, out_width = state.get("height"), state.get("width")
+
+        def _fbc_reset_and_context():
+            self._pipe_ref.transformer_ref._reset_stateful_cache()
+            return self._pipe_ref.transformer_ref.cache_context("h3")
+
+        denoise_step = MiniMaxH3Ref2VADenoiseStep()
+        orig_loop_step = denoise_step.loop_step
+
+        def timed_loop_step(components, bstate, i, t):
+            ts = time.time()
+            result = orig_loop_step(components, bstate, i=i, t=t)
+            step_times.append(time.time() - ts)
+            if H3_CACHE == "fbc":
+                cache_skips[0] += self._fbc_last_step_was_skip_ref()
+            if progress:
+                progress.update(step=i + 1, message=f"デノイズ中 {i + 1}/{num_inference_steps}")
+            return result
+
+        denoise_step.loop_step = timed_loop_step
+        if H3_CACHE == "fbc":
+            # Per-request reset -- see generate()'s matching comment for why this is
+            # required (a stale head-block residual from a previous call could otherwise
+            # make step 0 wrongly skip).
+            self._pipe_ref.transformer_ref._reset_stateful_cache()
+            with self._pipe_ref.transformer_ref.cache_context("h3"):
+                _, state = denoise_step(pipe, state)
+        else:
+            _, state = denoise_step(pipe, state)
+        denoise_time = time.time() - t_denoise
+
+        # --- decode (shared MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep -- no
+        # ref2va-specific decode step exists; num_condition_video_rows/
+        # num_condition_audio_rows on `state`, set by the layout step above from
+        # build_ref2va_packed_sequence's reference row counts, is what makes these drop
+        # the reference rows and decode only the generated ones) ---
+        if progress:
+            progress.update(phase="decoding", message="動画/音声をデコード中...")
+        if TE_QUANT == "bnb-4bit":
+            self._free_transformer_ref()
+        self._vae_to_gpu()
+        t_decode = time.time()
+        video_decode_step = MiniMaxH3VideoDecodeStep()
+        _, state = video_decode_step(pipe, state)
+        audio_decode_step = MiniMaxH3AudioDecodeStep()
+        _, state = audio_decode_step(pipe, state)
+        decode_time = time.time() - t_decode
+
+        videos = state.get("videos")
+        audio = state.get("audio")
+        sampling_rate = state.get("sampling_rate")
+
+        video_tensor = videos[0] if isinstance(videos, list) else videos
+        if video_tensor.dim() == 5:
+            video_tensor = video_tensor[0]
+        frames_uint8 = (
+            (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+        )
+        audio_np = audio[0].float().cpu().numpy()
+        rms = float(np.sqrt(np.mean(audio_np**2)))
+        peak = float(np.max(np.abs(audio_np)))
+
+        peak_vram = torch.cuda.max_memory_allocated() / 1e9
+
+        del video_tensor, videos, audio
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        self._vae_to_cpu()
+        if TE_QUANT == "bnb-4bit":
+            with self._load_lock:
+                self._ensure_transformer_ref(progress)
+                if force_free_te:
+                    # Restore the bnb-4bit steady state (transformer_ref + TE-nf4 both
+                    # resident) for the *next* request -- this request force-freed TE-nf4
+                    # before denoise to make room for the reference-lengthened sequence's
+                    # attention activations (see above). Reloaded after transformer_ref so
+                    # the two big reloads are not competing for VRAM at the same time,
+                    # mirroring generate()'s own force_free_te reload ordering.
+                    self._load_text_encoder(progress)
+
+        if progress:
+            progress.update(phase="muxing", message="mp4へmux中...")
+        job_stub = f"ref2va_{int(t_start)}"
+        mp4_path = self.output_dir / f"{job_stub}.mp4"
+        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+
+        result = {
+            "prompt": prompt,
+            "height": out_height,
+            "width": out_width,
+            "num_frames_requested_seconds": seconds,
+            "num_frames": actual_num_frames,
+            "duration_s": actual_num_frames / FPS,
+            "num_inference_steps": num_inference_steps,
+            "seed": seed,
+            "denoise_time_s": round(denoise_time, 2),
+            "decode_time_s": round(decode_time, 2),
+            "avg_step_time_s": round(sum(step_times) / len(step_times), 3) if step_times else None,
+            "peak_vram_gb": round(peak_vram, 2),
+            "ram": ram_gb(),
+            "audio_rms": rms,
+            "audio_peak": peak,
+            "audio_sampling_rate": sampling_rate,
+            "mp4_path": str(mp4_path),
+            "mp4_filename": mp4_path.name,
+            "total_elapsed_s": round(time.time() - t_start, 2),
+            "mode": "ref2va",
+            "te_quant": TE_QUANT,
+            "cache_mode": H3_CACHE,
+            "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
+            "cache_skipped_steps": cache_skips[0] if H3_CACHE == "fbc" else None,
+            "references_summary": [
+                {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
+                for index, kind in enumerate(kinds)
+            ],
+        }
+        if progress:
+            progress.update(phase="done", message="完了", result_path=str(mp4_path))
+        logger.info("ref2va generation done: %s",
+                     json.dumps({k: v for k, v in result.items() if k != "ram"}, ensure_ascii=False))
         return result
 
 

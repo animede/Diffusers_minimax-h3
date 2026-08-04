@@ -171,6 +171,28 @@ ComfyUIコミュニティの MiniMaxH3_LatentUpscaler と同系の hires-fix。�
   作り直す。ModularPipeline の `_execution_device` はコンポーネント登録順の先頭モジュール
   で決まるため、TE解放後は `components.transformer.device` を明示的に使う
   (diffusers-server CLAUDE.md 23番・47番と同型の罠)。
+## Ref2VA (オムニ参照生成、`/api/ref2va`)
+
+順序付きの参照素材(**画像最大9・動画最大3・音声最大3、合計12**。音声単独は不可)から
+動画+音声を生成する。参照の順序はプロンプト内ラベル(`<Picture i>` 等)とrotary配置に
+対応するため意味を持つ。動画参照はサウンドトラックも条件付けに使われる。
+**参照が音声ちょうど1本のときは秒数省略可**(音声の長さが生成尺になる。APIでは
+`seconds=0`)。出力キャンバスは参照に縛られず、未指定なら16:9(1344×768)。
+
+- **専用チェックポイント `transformer_ref/`(61.7GB、クラス/configは`transformer`と同一で
+  重みのみ別)** を使う。t2va/fl2va用transformerとは同時常駐不可のため、runnerは
+  変種切替(アクティブな片方だけ常駐、解放→再ロード)で管理する(`/api/status` の
+  `active_variant`)。TE-nf4・VAE類・processorは両変種で共有。
+- VRAM対策(実機OOM 3件を踏んで確定): 参照VAEエンコード完了後に transformer_ref を
+  ロード(逆順は98.5GBでOOM)、デノイズ前にTE-nf4を強制解放(参照行でシーケンスが
+  伸びるため。hires-fixと同じパターン)。共有text_encoderの解放は両パイプライン
+  シェルの参照を両方消すこと(片方だけではrefcountが残りVRAMが返らない)。
+- 実測(768x768指定→1344×768出力・30steps・seed=12345): 画像1枚参照 523s/87.6GB、
+  画像+音声(尺は音声由来7.3s) 753s/88.1GB、画像2枚 635s/88.1GB。参照人物の同一性・
+  複数参照の合成(人物が参照シーンのカフェに座る)を目視確認済み。ref2va⇔t2vaの
+  往復切替も正常(切替込みt2va 188s)。
+- UIは「Ref2VA (参照→動画)」タブ(複数ファイル選択、選択順=参照順)。
+
 ## 起動
 
 ```bash

@@ -8,6 +8,7 @@ diffusers-server (port 8601) とは完全に独立したワークスペース。
 起動: venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 """
 import logging
+import tempfile
 import threading
 import time
 import uuid
@@ -20,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 from core.llm import LLMConnectionError, VALID_MODES, enhance_prompt, get_llm_url
-from core.runner import MAX_SECONDS, MIN_SECONDS, MiniMaxH3Runner, ProgressState
+from core.runner import MAX_SECONDS, MIN_SECONDS, MiniMaxH3Reference, MiniMaxH3Runner, ProgressState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("minimax_h3.app")
@@ -185,6 +186,128 @@ def api_fl2va(
         last_image=pil_last_image,
     )
     return JSONResponse(result)
+
+
+# Content-type / extension -> reference kind ("image" | "video" | "audio"). Video/audio
+# containers are decoded by PyAV inside MiniMaxH3Reference itself (it accepts a path and
+# decodes it when built, per packing_ref2va.py's module docstring) -- this app only needs
+# to classify the upload and hand it a path, never touching pixels/samples itself.
+_REF_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+_REF_VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
+_REF_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
+
+
+def _detect_reference_kind(upload: UploadFile) -> str:
+    content_type = (upload.content_type or "").lower()
+    if content_type.startswith("image/"):
+        return "image"
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("audio/"):
+        return "audio"
+    ext = Path(upload.filename or "").suffix.lower()
+    if ext in _REF_IMAGE_EXTS:
+        return "image"
+    if ext in _REF_VIDEO_EXTS:
+        return "video"
+    if ext in _REF_AUDIO_EXTS:
+        return "audio"
+    raise HTTPException(
+        400,
+        f"references の種別を判定できません(filename={upload.filename!r}, content_type={upload.content_type!r})。"
+        "画像/動画/音声いずれかの一般的な拡張子・content-typeにしてください。",
+    )
+
+
+@app.post("/api/ref2va")
+def api_ref2va(
+    prompt: str = Form(...),
+    references: list[UploadFile] = File(...),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    seconds: Optional[float] = Form(None),
+    num_inference_steps: int = Form(30),
+    seed: Optional[int] = Form(None),
+):
+    """ref2va: 画像最大9・動画最大3・音声最大3(計12参照)からの動画+音声生成。
+
+    references の送信順が参照順(プロンプト内ラベル・rotary配置に反映される)。種別は
+    content-type/拡張子から自動判定する。`seconds` を省略できるのは references に音声を
+    持つ参照(音声単体 or 音声付き動画)がちょうど1本のときのみ(その音声長が生成尺になる、
+    MiniMaxH3Ref2VASetupStep.prepare_references の仕様どおり) -- それ以外で省略すると
+    ValueError を 400 に変換して返す。
+    """
+    global _current_progress
+
+    if not prompt or not prompt.strip():
+        raise HTTPException(400, "prompt is required")
+    if not references:
+        raise HTTPException(400, "references is required (at least one image/video/audio file)")
+    if (height is None) != (width is None):
+        raise HTTPException(400, "height と width は両方指定するか、両方省略してください")
+    if seconds is not None and not (MIN_SECONDS <= seconds <= MAX_SECONDS):
+        raise HTTPException(400, f"seconds must be between {MIN_SECONDS} and {MAX_SECONDS}, got {seconds}")
+
+    # Each upload is spooled to a real temp file: MiniMaxH3Reference(image=path) /
+    # (video=path) / (audio=path) decodes a path itself (PyAV for video/audio, PIL for
+    # image), and this app never needs the pixels/samples directly. Cleaned up in
+    # `finally`, after generate_ref2va() has already decoded everything into in-memory
+    # MiniMaxH3Reference objects (construction happens before the try block below, so
+    # the temp files must outlive that construction).
+    tmp_paths: list[Path] = []
+    built_references = []
+    try:
+        for upload in references:
+            kind = _detect_reference_kind(upload)
+            suffix = Path(upload.filename or "").suffix or {"image": ".png", "video": ".mp4", "audio": ".wav"}[kind]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir="/tmp") as tmp:
+                tmp.write(upload.file.read())
+                tmp_path = Path(tmp.name)
+            tmp_paths.append(tmp_path)
+            try:
+                if kind == "image":
+                    built_references.append(MiniMaxH3Reference(image=str(tmp_path)))
+                elif kind == "video":
+                    built_references.append(MiniMaxH3Reference(video=str(tmp_path)))
+                else:
+                    built_references.append(MiniMaxH3Reference(audio=str(tmp_path)))
+            except Exception as e:
+                raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
+
+        acquired = _generation_lock.acquire(blocking=False)
+        if not acquired:
+            raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
+
+        job_id = uuid.uuid4().hex[:12]
+        progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
+        with _progress_guard:
+            _current_progress = progress
+
+        try:
+            result = runner.generate_ref2va(
+                prompt=prompt.strip(),
+                references=built_references,
+                height=height,
+                width=width,
+                seconds=seconds,
+                num_inference_steps=num_inference_steps,
+                seed=seed,
+                progress=progress,
+            )
+            result["job_id"] = job_id
+            result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
+            return JSONResponse(result)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            logger.exception("ref2va generation failed")
+            progress.update(phase="error", error=str(e))
+            raise HTTPException(500, f"ref2va generation failed: {e}")
+        finally:
+            _generation_lock.release()
+    finally:
+        for tmp_path in tmp_paths:
+            tmp_path.unlink(missing_ok=True)
 
 
 @app.post("/api/prompt/enhance")
