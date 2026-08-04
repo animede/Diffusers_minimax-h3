@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniMax-H3 検証アプリ</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e38;
+    --text: #e6e8ec;
+    --muted: #9aa2af;
+    --accent: #5b8cff;
+    --accent-hover: #4574f5;
+    --error: #ff6b6b;
+    --ok: #4cd97b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .layout {
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 14px; color: var(--text); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
+  label:first-child { margin-top: 0; }
+  input[type=text], input[type=number], textarea, select {
+    width: 100%;
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 8px 10px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  textarea { min-height: 90px; resize: vertical; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tab-btn {
+    flex: 1;
+    padding: 8px;
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .tab-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .file-drop {
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  button.generate {
+    width: 100%;
+    margin-top: 18px;
+    padding: 11px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.generate:hover { background: var(--accent-hover); }
+  button.generate:disabled { background: #3a3f4b; cursor: not-allowed; color: var(--muted); }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .status-box {
+    margin-top: 14px;
+    font-size: 12px;
+    color: var(--muted);
+    min-height: 20px;
+  }
+  .status-box.error { color: var(--error); }
+  .progress-bar-outer {
+    height: 6px;
+    background: #0d0f14;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+  .progress-bar-inner {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.3s ease;
+  }
+  video {
+    width: 100%;
+    border-radius: 8px;
+    background: #000;
+  }
+  .result-meta {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  .result-meta b { color: var(--text); }
+  .placeholder {
+    color: var(--muted);
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 260px;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+  }
+  a.dl-link {
+    display: inline-block;
+    margin-top: 10px;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 12px;
+  }
+  .server-status {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<h1>MiniMax-H3 検証アプリ</h1>
+<div class="subtitle">オムニモーダル動画+ステレオ音声生成 (33B, diffusers Modular Pipeline) — port 8611</div>
+
+<div class="layout">
+  <div class="panel">
+    <div class="tabs">
+      <button class="tab-btn active" data-mode="t2va">T2VA (テキスト→動画)</button>
+      <button class="tab-btn" data-mode="fl2va">FL2VA (フレーム指定)</button>
+    </div>
+
+    <form id="gen-form">
+      <label>プロンプト</label>
+      <textarea id="prompt" placeholder="例: 夕日の中、ゴールデンレトリバーの子犬が芝生を駆け抜けボールを追いかける。カメラは低い位置から追従。風で葉が揺れ、鳥のさえずり、子犬の楽しそうな鳴き声。"></textarea>
+
+      <div id="fl2va-fields" style="display:none;">
+        <label>先頭フレーム画像 (image, 任意)</label>
+        <input type="file" id="image-file" accept="image/*">
+        <label>末尾フレーム画像 (last_image, 任意)</label>
+        <input type="file" id="last-image-file" accept="image/*">
+        <div class="hint">どちらか一方でも可。両方指定すると先頭→末尾のフレーム間を生成。</div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>解像度</label>
+          <select id="resolution">
+            <option value="768x768">768×768 (正方形)</option>
+            <option value="768x1344">768×1344 (縦長)</option>
+            <option value="1344x768">1344×768 (横長)</option>
+          </select>
+        </div>
+        <div>
+          <label>秒数 (5〜15)</label>
+          <input type="number" id="seconds" value="5" min="5" max="15" step="0.5">
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>ステップ数</label>
+          <input type="number" id="steps" value="30" min="4" max="60">
+        </div>
+        <div>
+          <label>seed (空欄でランダム)</label>
+          <input type="number" id="seed" placeholder="12345">
+        </div>
+      </div>
+
+      <button type="submit" class="generate" id="generate-btn">生成</button>
+      <div class="hint">蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。</div>
+    </form>
+
+    <div class="status-box" id="status-box"></div>
+    <div class="progress-bar-outer" id="progress-outer" style="display:none;">
+      <div class="progress-bar-inner" id="progress-inner"></div>
+    </div>
+
+    <div class="server-status" id="server-status">サーバ状態を確認中...</div>
+  </div>
+
+  <div class="panel">
+    <h2>結果</h2>
+    <div id="result-area">
+      <div class="placeholder">まだ生成していません</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const form = document.getElementById('gen-form');
+const promptEl = document.getElementById('prompt');
+const resolutionEl = document.getElementById('resolution');
+const secondsEl = document.getElementById('seconds');
+const stepsEl = document.getElementById('steps');
+const seedEl = document.getElementById('seed');
+const imageFileEl = document.getElementById('image-file');
+const lastImageFileEl = document.getElementById('last-image-file');
+const generateBtn = document.getElementById('generate-btn');
+const statusBox = document.getElementById('status-box');
+const progressOuter = document.getElementById('progress-outer');
+const progressInner = document.getElementById('progress-inner');
+const resultArea = document.getElementById('result-area');
+const serverStatusEl = document.getElementById('server-status');
+const fl2vaFields = document.getElementById('fl2va-fields');
+
+let mode = 't2va';
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    mode = btn.dataset.mode;
+    fl2vaFields.style.display = (mode === 'fl2va') ? 'block' : 'none';
+  });
+});
+
+let polling = null;
+
+function setStatus(msg, isError) {
+  statusBox.textContent = msg;
+  statusBox.className = 'status-box' + (isError ? ' error' : '');
+}
+
+function startPolling() {
+  if (polling) clearInterval(polling);
+  polling = setInterval(async () => {
+    try {
+      const res = await fetch('/api/progress');
+      const data = await res.json();
+      if (data.phase && data.phase !== 'idle') {
+        progressOuter.style.display = 'block';
+        const pct = data.total_steps ? Math.round((data.step / data.total_steps) * 100) : 0;
+        progressInner.style.width = (data.total_steps ? pct : 100) + '%';
+        setStatus(`${data.message || data.phase} (${data.elapsed_s}s)`);
+      }
+      if (data.phase === 'done' || data.phase === 'error') {
+        clearInterval(polling);
+        polling = null;
+      }
+    } catch (e) {
+      // ignore transient poll errors
+    }
+  }, 1200);
+}
+
+async function refreshServerStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    const r = data.runner;
+    serverStatusEl.innerHTML =
+      `busy: ${data.busy} | transformer: ${r.transformer_loaded} | vae: ${r.vae_loaded} | ` +
+      `text_encoder: ${r.text_encoder_loaded}<br>` +
+      `GPU alloc: ${r.gpu.allocated_gb ?? '-'}GB / peak: ${r.gpu.peak_gb ?? '-'}GB | ` +
+      `RAM avail: ${r.ram.avail_gb}GB / swap used: ${r.ram.swap_used_gb}GB`;
+  } catch (e) {
+    serverStatusEl.textContent = 'サーバ状態の取得に失敗しました';
+  }
+}
+refreshServerStatus();
+setInterval(refreshServerStatus, 4000);
+
+form.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const prompt = promptEl.value.trim();
+  if (!prompt) {
+    setStatus('プロンプトを入力してください', true);
+    return;
+  }
+
+  generateBtn.disabled = true;
+  generateBtn.textContent = '生成中...';
+  progressOuter.style.display = 'block';
+  progressInner.style.width = '0%';
+  setStatus('リクエスト送信中...');
+  startPolling();
+
+  const fd = new FormData();
+  fd.append('prompt', prompt);
+  fd.append('resolution', resolutionEl.value);
+  fd.append('seconds', secondsEl.value);
+  fd.append('num_inference_steps', stepsEl.value);
+  if (seedEl.value) fd.append('seed', seedEl.value);
+
+  let url = '/api/t2va';
+  if (mode === 'fl2va') {
+    url = '/api/fl2va';
+    if (imageFileEl.files[0]) fd.append('image', imageFileEl.files[0]);
+    if (lastImageFileEl.files[0]) fd.append('last_image', lastImageFileEl.files[0]);
+  }
+
+  try {
+    const res = await fetch(url, { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || JSON.stringify(data));
+    }
+    setStatus('完了');
+    progressInner.style.width = '100%';
+    renderResult(data);
+  } catch (e) {
+    setStatus('エラー: ' + e.message, true);
+  } finally {
+    generateBtn.disabled = false;
+    generateBtn.textContent = '生成';
+    if (polling) { clearInterval(polling); polling = null; }
+    refreshServerStatus();
+  }
+});
+
+function renderResult(data) {
+  resultArea.innerHTML = `
+    <video controls autoplay loop src="${data.video_url}"></video>
+    <a class="dl-link" href="${data.video_url}" download>mp4をダウンロード</a>
+    <div class="result-meta">
+      <div><b>モード:</b> ${data.mode}</div>
+      <div><b>解像度:</b> ${data.width}×${data.height} / <b>長さ:</b> ${data.duration_s.toFixed(2)}s (${data.num_frames}フレーム)</div>
+      <div><b>ステップ:</b> ${data.num_inference_steps} / <b>seed:</b> ${data.seed ?? '(random)'}</div>
+      <div><b>デノイズ時間:</b> ${data.denoise_time_s}s (avg ${data.avg_step_time_s}s/step) / <b>デコード:</b> ${data.decode_time_s}s</div>
+      <div><b>合計時間:</b> ${data.total_elapsed_s}s / <b>ピークVRAM:</b> ${data.peak_vram_gb}GB</div>
+      <div><b>音声:</b> rms=${data.audio_rms.toFixed(5)} peak=${data.audio_peak.toFixed(4)} @ ${data.audio_sampling_rate}Hz</div>
+    </div>
+  `;
+}
+</script>
+</body>
+</html>
