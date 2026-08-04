@@ -49,7 +49,12 @@ RESOLUTION_PRESETS = {
 
 @app.get("/")
 def index():
-    return FileResponse(str(BASE_DIR / "static" / "index.html"))
+    # ブラウザが古いindex.htmlをキャッシュしてUI更新が見えなくなる問題の対策
+    # (diffusers-server の NoCacheStaticFiles と同趣旨。JS/CSSはこのファイルにインライン)
+    return FileResponse(
+        str(BASE_DIR / "static" / "index.html"),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/status")
