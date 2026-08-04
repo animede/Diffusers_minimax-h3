@@ -125,6 +125,24 @@ video VAE の decode は diffusers 側の `MiniMaxH3VideoDecodeStep` が内部�
 bnb-4bit のピーク91.7GBは96GBカードに収まるが余裕は約4GB。ヘッドルームを優先したい
 場合は `H3_TE_QUANT=none` で旧方式(ピーク83.4GB、+60s/リクエスト)に戻せる。
 
+## FirstBlockCache によるデノイズ高速化 (`H3_CACHE`、既定 `fbc`)
+
+ComfyUIコミュニティのEasyCache高速化に相当する、diffusers公式の step間キャッシュ
+(FirstBlockCache)を `H3_CACHE=fbc`(既定)で有効化している。ステップ間で最初の
+transformerブロックの残差変化が小さいとき、残りの計算をスキップする。
+
+- `H3_CACHE_THRESHOLD`(既定 0.05): 実測でデノイズ 157s→118s(-25%、30step中7スキップ)、
+  出力はキャッシュ無しと PSNR 31.8〜34.3dB・音声相関0.979 でほぼ同一(目視でも区別困難)。
+- threshold 0.1 は 1.92x(デノイズ81.5s、14スキップ)だが構図が目視で分かるレベルで
+  ドリフトするため既定にしていない(速度最優先の場合のみ)。
+- `H3_CACHE=none` でキャッシュ無しの従来挙動に完全に戻る(バイト一致を回帰確認済み)。
+- ピークVRAMは残差キャッシュ分 +0.7GB(91.4→92.1GB)。
+- 実装メモ: `MiniMaxH3TransformerBlock` はPRブランチの `TransformerBlockRegistry` に
+  未登録のため、runner側で `TransformerBlockMetadata` を登録してから `enable_cache()` を
+  呼ぶ(venvのdiffusers本体は無改変)。リクエストごとに `_reset_stateful_cache()` +
+  `cache_context("h3")` で包む(リセット漏れは前リクエストの残差による誤スキップを招く)。
+  同一seed連続2本のmp4バイト完全一致でリセットの正しさを検証済み。
+
 sm_120 (Blackwell) のパッチ化conv3d病的低速(diffusers-server CLAUDE.md 46番)は
 **発症しない**(全ステップ均一に約5.4s、GPU 100%張り付きの健全なcompute-bound)。
 

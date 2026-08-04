@@ -99,10 +99,57 @@ TE_QUANT = os.environ.get("H3_TE_QUANT", "bnb-4bit").strip().lower()
 if TE_QUANT not in ("none", "bnb-4bit"):
     raise ValueError(f"H3_TE_QUANT must be 'none' or 'bnb-4bit', got {TE_QUANT!r}")
 
+# "fbc" (default; A/B verified 2026-08-04: threshold 0.05 gives -25% denoise time with
+# near-identical output -- PSNR 31.8-34.3dB vs no-cache, audio corr 0.979, no visible drift.
+# threshold 0.1 reaches 1.92x but composition drifts visibly; not recommended as default).
+# "none" = no caching, byte-for-byte identical to pre-FBC behaviour (enable_cache
+# is never called). "fbc" = FirstBlockCache (see diffusers/hooks/first_block_cache.py):
+# skips the remaining transformer blocks on a denoise step when the first block's residual
+# is close enough to the previous step's, reusing the cached tail-block residual instead.
+H3_CACHE = os.environ.get("H3_CACHE", "fbc").strip().lower()
+if H3_CACHE not in ("none", "fbc"):
+    raise ValueError(f"H3_CACHE must be 'none' or 'fbc', got {H3_CACHE!r}")
+H3_CACHE_THRESHOLD = float(os.environ.get("H3_CACHE_THRESHOLD", "0.05"))
+
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
 MIN_SECONDS = 5.0
 MAX_SECONDS = 15.0
 FPS = 24
+
+
+def _register_minimax_h3_block_for_fbc() -> None:
+    """Register `MiniMaxH3TransformerBlock` with diffusers' `TransformerBlockRegistry`.
+
+    FirstBlockCache (diffusers/hooks/first_block_cache.py) looks up per-block-class metadata
+    (which forward arg/return slot is `hidden_states`) via `TransformerBlockRegistry.get()`.
+    This diffusers version (PR #14355 branch) registers metadata for Wan/Flux/LTX/etc. blocks
+    in `diffusers/hooks/_helpers.py::_register_transformer_blocks_metadata()` but does not yet
+    include `MiniMaxH3TransformerBlock` -- `TransformerBlockRegistry.get()` raises `ValueError`
+    for unregistered classes, so `transformer.enable_cache(FirstBlockCacheConfig(...))` would
+    crash on the very first denoise step without this.
+
+    `MiniMaxH3TransformerBlock.forward(hidden_states, temb, adaln_indices, rotary_emb,
+    attention_mask) -> hidden_states` (see transformer_minimax_h3.py) returns a single tensor,
+    not a tuple, and there is no encoder_hidden_states slot (H3 has no cross-attention -- text
+    tokens are just rows in the packed sequence) -- same shape as `BasicTransformerBlock` /
+    `WanTransformerBlock` / `LTXVideoTransformerBlock`'s registration:
+    `return_hidden_states_index=0, return_encoder_hidden_states_index=None`.
+
+    This only touches this project's runner code -- the venv's diffusers package itself is not
+    modified (CLAUDE.md rule). Registration is idempotent (dict assignment), so calling this
+    more than once (e.g. across server restarts within the same process, or defensively before
+    every enable_cache call) is harmless.
+    """
+    from diffusers.hooks._helpers import TransformerBlockMetadata, TransformerBlockRegistry
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3TransformerBlock
+
+    TransformerBlockRegistry.register(
+        model_class=MiniMaxH3TransformerBlock,
+        metadata=TransformerBlockMetadata(
+            return_hidden_states_index=0,
+            return_encoder_hidden_states_index=None,
+        ),
+    )
 
 
 def align_num_frames(num_frames: int) -> int:
@@ -295,7 +342,44 @@ class MiniMaxH3Runner:
         self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
         self._pipe.transformer.to(DEVICE)
         self._transformer_loaded = True
+        if H3_CACHE == "fbc":
+            self._enable_fbc()
         logger.info("transformer loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
+
+    def _fbc_last_step_was_skip(self) -> int:
+        """Best-effort introspection of whether the just-finished transformer forward skipped
+        the remaining blocks (cache hit). Reads `FBCSharedBlockState.should_compute` off the
+        head block's hook (see first_block_cache.py) -- `should_compute=False` means the tail
+        blocks were skipped and the cached residual was reused instead. This is diagnostic only
+        (for the A/B measurement task): wrapped in try/except so a diffusers-internals change
+        degrades to "unknown" (0) rather than breaking generation.
+        """
+        try:
+            from diffusers.hooks.first_block_cache import _FBC_LEADER_BLOCK_HOOK
+
+            head_block = self._pipe.transformer.transformer_blocks[0]
+            hook = head_block._diffusers_hook.get_hook(_FBC_LEADER_BLOCK_HOOK)
+            shared_state = hook.state_manager.get_state()
+            return 0 if shared_state.should_compute else 1
+        except Exception:
+            return 0
+
+    def _enable_fbc(self):
+        """Attach FirstBlockCache hooks to the (freshly loaded) transformer.
+
+        Called once right after every transformer load (startup preload, and any reload that
+        happens after `bnb-4bit` mode drops the transformer around its decode window -- see
+        `_free_transformer`/decode section of `generate()`). A freshly-loaded transformer has
+        no `_diffusers_hook` yet, so this always starts from a clean slate; there is no stale
+        state to worry about across a drop+reload cycle in bnb-4bit mode. Per-*request* reset
+        (for the more common case where the transformer stays resident across requests) is
+        handled separately in `generate()` via `_reset_stateful_cache()` + `cache_context()`.
+        """
+        from diffusers.hooks import FirstBlockCacheConfig
+
+        _register_minimax_h3_block_for_fbc()
+        self._pipe.transformer.enable_cache(FirstBlockCacheConfig(threshold=H3_CACHE_THRESHOLD))
+        logger.info("FirstBlockCache enabled on transformer (threshold=%s)", H3_CACHE_THRESHOLD)
 
     def _free_transformer(self):
         if not self._transformer_loaded:
@@ -402,6 +486,8 @@ class MiniMaxH3Runner:
             "vae_on_gpu": self._vae_on_gpu,
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
+            "cache_mode": H3_CACHE,
+            "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
             "gpu": gpu_mem_gb(),
             "ram": ram_gb(),
         }
@@ -554,17 +640,45 @@ class MiniMaxH3Runner:
         denoise_step = MiniMaxH3DenoiseStep()
         orig_loop_step = denoise_step.loop_step
         step_times = []
+        cache_skips = [0]
 
         def timed_loop_step(components, bstate, i, t):
             ts = time.time()
             result = orig_loop_step(components, bstate, i=i, t=t)
             step_times.append(time.time() - ts)
+            if H3_CACHE == "fbc":
+                cache_skips[0] += self._fbc_last_step_was_skip()
             if progress:
                 progress.update(step=i + 1, message=f"デノイズ中 {i + 1}/{num_inference_steps}")
             return result
 
         denoise_step.loop_step = timed_loop_step
-        _, state = denoise_step(pipe, state)
+        if H3_CACHE == "fbc":
+            # Per-request reset: `FirstBlockCache`'s hooks are stateful (cached head-block
+            # residual/output + tail-block residuals persist on the transformer submodules
+            # between calls, see FBCSharedBlockState in first_block_cache.py). Without this
+            # reset, the *first* denoise step of this request would see the *previous*
+            # request's leftover `head_block_residual` from its own final step and could
+            # incorrectly decide to skip computation on step 0 (which should always compute,
+            # since there is no prior-step residual within this request to compare against).
+            # `_reset_stateful_cache()` -> `HookRegistry.reset_stateful_hooks()` ->
+            # `FBCHeadBlockHook.reset_state()` -> `StateManager.reset()`, which empties the
+            # per-context state cache entirely (a fresh `FBCSharedBlockState()` is created on
+            # the next `get_state()`), not just the partial fields `FBCSharedBlockState.reset()`
+            # touches -- so this clears `head_block_output`/`head_block_residual` too, not only
+            # `tail_block_residuals`/`should_compute`.
+            self._pipe.transformer._reset_stateful_cache()
+            # `cache_context(...)` is required, not optional: `StateManager.get_state()` raises
+            # `ValueError("No context is set...")` if no context has been entered, so the very
+            # first transformer forward of this request would crash without it. H3 is
+            # guidance-distilled (no CFG, no cond/uncond branches -- confirmed in
+            # modular_pipelines/minimax_h3/denoise.py and encoders.py docstrings), so unlike
+            # Wan/Flux's per-branch "cond"/"uncond" contexts there is only one branch here; a
+            # single fixed context name for the whole request's denoise loop is correct.
+            with self._pipe.transformer.cache_context("h3"):
+                _, state = denoise_step(pipe, state)
+        else:
+            _, state = denoise_step(pipe, state)
         denoise_time = time.time() - t_denoise
 
         # --- decode ---
@@ -653,6 +767,11 @@ class MiniMaxH3Runner:
             "total_elapsed_s": round(time.time() - t_start, 2),
             "mode": mode,
             "te_quant": TE_QUANT,
+            "cache_mode": H3_CACHE,
+            "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
+            # Number of denoise steps where FBC skipped the tail blocks (cache hit).
+            # Always 0 in `none` mode (the counter never increments there).
+            "cache_skipped_steps": cache_skips[0] if H3_CACHE == "fbc" else None,
         }
         if progress:
             progress.update(phase="done", message="完了", result_path=str(mp4_path))
