@@ -68,6 +68,37 @@ There are two loading strategies, selected by the `H3_TE_QUANT` env var:
   256px tiles, verified in autoencoder_kl_minimax_h3.py) and runner.py never disables
   it, so tiled decode is already active in both modes -- there is no extra "enable
   tiling" step needed for decode-peak reduction here.
+
+`H3_LOWVRAM=1` (opt-in, default "0" leaves every mode above byte-for-byte unchanged):
+  a third loading strategy, orthogonal to `H3_TE_QUANT`/`H3_TRANSFORMER_QUANT` (it
+  forces TE_QUANT=bnb-4bit's VAE-parks-on-CPU behaviour and requires
+  H3_TRANSFORMER_QUANT=int8, see H3_LOWVRAM's own module-level comment), for
+  48GB-class cards where TE-nf4 (21GB) + transformer-int8 (34GB) = 55GB already does
+  not fit together. Steady state between requests is "nothing big resident" (only the
+  small VAE pair, parked on CPU). Phase x resident-set table for a t2va request
+  (`generate()`'s lowvram branch):
+
+    entry         : [nothing big -- any resident transformer/transformer_ref is freed]
+    encode        : [TE-nf4 21GB]                      (transformer freed if resident)
+    (TE freed)
+    denoise       : [transformer-int8 34GB + ~5GB activations ~= 39GB]  (TE freed)
+    (transformer freed)
+    decode        : [vae pair ~11GB + decode buffers]  (transformer freed, TE freed)
+    (vae parked back on CPU; nothing reloaded "for next time")
+
+  ref2va is the same shape with an extra reference-VAE-encode phase between text-encode
+  and denoise (needs `vae` on GPU while TE is *already* freed -- see
+  `generate_ref2va()`'s lowvram branch for the `_execution_device` resolution note this
+  requires, same "freeing TE makes `vae` the next resolved module, so bring vae onto
+  GPU either before or in the same breath as freeing TE" pattern `force_free_te`
+  already established for bnb-4bit/int8-both-resident mode above) and denoises against
+  `transformer_ref` instead of `transformer`.
+
+  This pays TE-load (~15-40s) + transformer-load (~35-40s, torchao int8 quantization
+  happens inline during this load) on *every* request -- there is no cross-request
+  steady state to amortize against, unlike every mode above. See README.md for the
+  measured per-phase timing breakdown and the peak-VRAM verification against a VRAM
+  ballast.
 """
 from __future__ import annotations
 
@@ -176,6 +207,61 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
 # together with `H3_TRANSFORMER_QUANT=int8`; bf16 mode (~66.3GB each) cannot fit both
 # at once and keeps the existing one-resident-at-a-time behaviour unchanged.
 H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
+
+# EXPERIMENTAL, opt-in. "0" (default) = every mode above is untouched -- this flag is
+# read nowhere else unless it is "1". "1" = 48GB-class low-VRAM mode: TE (bnb-4bit
+# nf4, ~21GB) and the big transformer (int8, ~34GB) are never allowed to be
+# GPU-resident *at the same time* -- 21+34=55GB alone already exceeds a 48GB card, so
+# unlike every mode above (which all keep at least one 60GB+ class model resident
+# between requests), this mode's steady state between requests is "nothing big"
+# (transformer/transformer_ref/TE all freed; only the small VAE pair, ~11GB, and only
+# while parked on CPU -- same as bnb-4bit's own VAE placement, see `_ensure_vaes`).
+# Each request pays TE-load + transformer-load from scratch (see `generate()`'s
+# lowvram branch): encode with TE resident -> free TE -> load transformer -> denoise
+# (transformer alone, ~34+~5GB activations -> ~39GB) -> free transformer -> VAE to GPU
+# -> decode (~11GB + buffers) -> VAE back to CPU. No transformer is reloaded at the
+# end "for next time" (CLAUDE.md #33: only short, one-way trips -- never a standing
+# swap -- and there is nothing useful to preload anyway since the *next* request needs
+# TE first, not transformer). See the module docstring addendum below H3_HIRES_DENOISE
+# for the full phase x resident-set table.
+#
+# Requires H3_TRANSFORMER_QUANT=int8 (bf16's 66.3GB transformer alone is already
+# larger than a 48GB card with headroom for anything else) -- if the transformer quant
+# was left at its own default ("none") while H3_LOWVRAM=1 is set, this is auto-upgraded
+# to "int8" below (rather than silently running an unfittable bf16 config) UNLESS the
+# operator *explicitly* set H3_TRANSFORMER_QUANT=none, in which case this raises at
+# import time instead of silently overriding an explicit choice.
+# H3_TRANSFORMER_BOTH_RESIDENT (both transformer AND transformer_ref resident at once,
+# 34+34=68GB) is incompatible with this mode and is force-disabled below regardless of
+# H3_TRANSFORMER_QUANT.
+# upscale=1 (hires-fix) is rejected with a 400-mapped ValueError in this mode (see
+# `generate()`) -- pass 2's ~4x-longer packed sequence was not verified to fit in the
+# ~9GB of headroom this mode's steady state leaves at 48GB-class VRAM.
+H3_LOWVRAM = os.environ.get("H3_LOWVRAM", "0").strip() == "1"
+if H3_LOWVRAM:
+    _explicit_transformer_quant = "H3_TRANSFORMER_QUANT" in os.environ
+    if _explicit_transformer_quant and H3_TRANSFORMER_QUANT == "none":
+        raise RuntimeError(
+            "H3_LOWVRAM=1 requires an int8 transformer (bf16's 66.3GB does not fit a "
+            "48GB-class card even alone) but H3_TRANSFORMER_QUANT=none was explicitly "
+            "set. Drop H3_TRANSFORMER_QUANT (it will default to int8 under "
+            "H3_LOWVRAM=1) or set H3_TRANSFORMER_QUANT=int8 explicitly."
+        )
+    H3_TRANSFORMER_QUANT = "int8"
+    H3_TRANSFORMER_BOTH_RESIDENT = False
+    # Every `H3_LOWVRAM` branch further down in this file (generate()/generate_ref2va())
+    # is written assuming TE_QUANT == "bnb-4bit" (it is the only TE loading strategy
+    # that produces a small-enough, movable-only-by-full-reload TE that this mode's
+    # "never resident together with the transformer" choreography can work with --
+    # `none` mode's 66.3GB bf16-native TE would not fit alongside anything else on a
+    # 48GB-class card even on its own). Reject the combination explicitly rather than
+    # silently mis-choreograph an unfittable 66.3GB TE.
+    if TE_QUANT != "bnb-4bit":
+        raise RuntimeError(
+            f"H3_LOWVRAM=1 requires H3_TE_QUANT=bnb-4bit (default), got "
+            f"H3_TE_QUANT={TE_QUANT!r}. bf16 TE (~66.3GB) cannot coexist with anything "
+            "else on a 48GB-class card."
+        )
 
 # EXPERIMENTAL, opt-in. "" (default) = whatever diffusers' attention_dispatch picks
 # natively (native/SDPA today) -- `set_attention_backend()` is never called, byte-for-byte
@@ -928,12 +1014,20 @@ class MiniMaxH3Runner:
         `bnb-4bit` mode: transformer + text_encoder(NF4) + VAEs are ALL loaded here --
         the VAEs' weights are loaded now (onto CPU, see _ensure_vaes) and the TE is
         loaded straight to GPU permanently, since nothing cycles anymore in this mode.
+        `H3_LOWVRAM=1`: this mode's whole point is that TE (21GB) and transformer
+        (34GB) are never GPU-resident together, so neither is preloaded here -- both
+        are loaded fresh, per-request, by `generate()`/`generate_ref2va()` (see the
+        H3_LOWVRAM module comment's phase table). Only the VAE pair's *weights* are
+        preloaded (onto CPU, same as bnb-4bit -- `_ensure_vaes` already parks them on
+        CPU whenever TE_QUANT=="bnb-4bit", which H3_LOWVRAM always implies), so the
+        per-request decode phase only pays a CPU->GPU move, not a disk/HF-cache load.
         """
         with self._load_lock:
             self._ensure_vaes()
-            self._ensure_transformer()
-            if TE_QUANT == "bnb-4bit":
-                self._load_text_encoder()
+            if not H3_LOWVRAM:
+                self._ensure_transformer()
+                if TE_QUANT == "bnb-4bit":
+                    self._load_text_encoder()
 
     def status(self) -> dict:
         return {
@@ -953,6 +1047,7 @@ class MiniMaxH3Runner:
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            "lowvram": H3_LOWVRAM,
             "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
@@ -1209,26 +1304,52 @@ class MiniMaxH3Runner:
             # which is unverified territory this task did not have time to check against
             # the reference. Fail loudly rather than silently mis-render.
             raise ValueError("upscale=1 (hires-fix) is only supported for t2va requests, not fl2va.")
+        if do_upscale and H3_LOWVRAM:
+            # Not verified to fit: pass 2 runs full self-attention over a ~4x longer
+            # packed sequence (~16x pass 1's attention activation cost), and this mode's
+            # whole steady state is already sized to leave only ~9GB of headroom above
+            # the int8 transformer alone (see H3_LOWVRAM's module comment) on a
+            # 48GB-class card. Fail loudly rather than risk an OOM mid-request.
+            raise ValueError("upscale=1 (hires-fix) is not supported with H3_LOWVRAM=1.")
 
         with self._load_lock:
-            # Ensure `transformer` (not `transformer_ref`) is the GPU-resident big model
-            # before anything else in this method touches it. A no-op when t2va is
-            # already the active variant (the common case -- most requests do not
-            # interleave with ref2va ones); when the previous request was a ref2va one,
-            # this frees the ~66.3GB transformer_ref first. Must run before
-            # `_load_text_encoder` below: in `none` mode that method's own
-            # `_free_transformer()` call only knows about `transformer`, not
-            # `transformer_ref`, so without this line a ref2va -> t2va switch in `none`
-            # mode would try to hold transformer_ref(66.3) + TE(66.7) at once and OOM.
-            self._switch_to_variant("t2va", progress)
-            # `none` mode: VAEs (permanent residents) + text encoder. _load_text_encoder
-            # frees the transformer internally if it is resident (TE 66GB + transformer
-            # 66GB cannot coexist in 96GB VRAM).
-            # `bnb-4bit` mode: everything is already resident from preload_all() except
-            # the VAEs, which are parked on CPU -- nothing to do here, they get moved to
-            # GPU right before the phase that needs them, below.
-            self._ensure_vaes(progress)
-            self._load_text_encoder(progress)
+            if H3_LOWVRAM:
+                # This mode's whole point is TE (21GB) and transformer (34GB) are never
+                # GPU-resident together (55GB already exceeds a 48GB-class card) -- so
+                # unlike the branch below, do NOT call `_switch_to_variant`/
+                # `_ensure_transformer` here: that would load the (int8) transformer
+                # *before* TE, and TE has not even encoded the prompt yet. Just free
+                # whichever big transformer happens to be resident (leftover from a
+                # previous request -- lowvram's own steady state never leaves one
+                # resident, but a mode-flag flip mid-process or a request that errored
+                # out mid-denoise could) without loading a replacement; the transformer
+                # is loaded further down, after TE has already finished encoding and
+                # been freed again.
+                self._free_transformer()
+                self._free_transformer_ref()
+                self._active_variant = None
+                self._ensure_vaes(progress)
+                self._load_text_encoder(progress)
+            else:
+                # Ensure `transformer` (not `transformer_ref`) is the GPU-resident big
+                # model before anything else in this method touches it. A no-op when
+                # t2va is already the active variant (the common case -- most requests
+                # do not interleave with ref2va ones); when the previous request was a
+                # ref2va one, this frees the ~66.3GB transformer_ref first. Must run
+                # before `_load_text_encoder` below: in `none` mode that method's own
+                # `_free_transformer()` call only knows about `transformer`, not
+                # `transformer_ref`, so without this line a ref2va -> t2va switch in
+                # `none` mode would try to hold transformer_ref(66.3) + TE(66.7) at once
+                # and OOM.
+                self._switch_to_variant("t2va", progress)
+                # `none` mode: VAEs (permanent residents) + text encoder.
+                # _load_text_encoder frees the transformer internally if it is resident
+                # (TE 66GB + transformer 66GB cannot coexist in 96GB VRAM).
+                # `bnb-4bit` mode: everything is already resident from preload_all()
+                # except the VAEs, which are parked on CPU -- nothing to do here, they
+                # get moved to GPU right before the phase that needs them, below.
+                self._ensure_vaes(progress)
+                self._load_text_encoder(progress)
 
         # Reset peak stats after loading so the reported peak reflects this
         # generation's encode+denoise+decode, not the (much larger, one-time) model
@@ -1320,11 +1441,55 @@ class MiniMaxH3Runner:
         # once those position_ids/layout tensors already exist on the correct device (set
         # once, from the layout step, and never touched again) sidesteps the whole
         # resolution question for the rest of the request.
-        force_free_te = TE_QUANT == "bnb-4bit" and (
+        # H3_LOWVRAM: TE is force-freed unconditionally, but -- same
+        # `_execution_device` resolution trap the comment above describes -- this
+        # cannot happen until *after* layout_step/latents_step/timesteps_step have run
+        # (see the dedicated H3_LOWVRAM branch below, which runs those three steps
+        # *before* freeing TE/loading the transformer, unlike every other branch here,
+        # which loads its big transformer up front and only then runs those steps).
+        # `vae` sits between `text_encoder` and `transformer` in this pipe's own
+        # component order (`text_encoder, tokenizer, processor, vae, scheduler,
+        # audio_scheduler, transformer, ...`), and it is a resident `nn.Module`
+        # (just CPU-placed, not freed) throughout t2va in this mode -- so simply
+        # loading the transformer first would NOT fix this the way it does for
+        # `none`/plain `bnb-4bit` mode: `_execution_device` would still resolve to
+        # `vae`'s CPU location the instant TE is freed, `transformer` never being
+        # reached in the scan. Reproduced by this task's own verification (t2va OOM'd
+        # -- no, worse, silently produced a device-mismatch `RuntimeError` deep inside
+        # the transformer's own forward, not caught until the first denoise step) the
+        # first time this branch tried to free TE right before `_ensure_transformer`,
+        # mirroring `none` mode's own ordering naively.
+        force_free_te = TE_QUANT == "bnb-4bit" and not H3_LOWVRAM and (
             do_upscale or (H3_TRANSFORMER_BOTH_RESIDENT and self._transformer_ref_loaded)
         )
 
-        if TE_QUANT == "bnb-4bit" and is_fl2va:
+        if H3_LOWVRAM:
+            # fl2va's keyframe step (if any) runs here too, while TE is still resident
+            # (harmless -- it only touches vae/scheduler, not TE) and `vae` is already
+            # on GPU from the `is_fl2va` block above this function's setup section.
+            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
+            _, state = keyframe_step(pipe, state)
+            if is_fl2va:
+                self._vae_to_cpu()
+
+            # --- layout / latents / timesteps, run NOW (TE still GPU-resident) ---
+            # `_execution_device` resolves via `text_encoder` (still resident on GPU)
+            # here, exactly like every non-lowvram bnb-4bit branch's own
+            # `force_free_te`-deferred ordering achieves -- see the long comment above.
+            layout_step = MiniMaxH3PrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
+
+            # Only now is it safe to free TE and load the (int8) transformer: every
+            # tensor that would have needed `_execution_device` to resolve correctly
+            # already exists, materialized on the right device, on `state`.
+            with self._load_lock:
+                self._free_text_encoder(force=True)
+                self._ensure_transformer(progress)
+        elif TE_QUANT == "bnb-4bit" and is_fl2va:
             # bnb-4bit + fl2va only: transformer(66.3) + TE-nf4(21.0) + vae pair(11.0)
             # already sums to ~98.3GB before any activation buffer, over this card's
             # ~95.6GB (the same three-way conflict measured for decode, see the decode
@@ -1338,6 +1503,14 @@ class MiniMaxH3Runner:
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer(progress)
+
+            # --- layout / latents / timesteps ---
+            layout_step = MiniMaxH3PrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
         else:
             # `none` mode: TE's job is done for this request -- free it and bring in the
             # transformer (which stays resident until the next request's encode phase
@@ -1360,13 +1533,13 @@ class MiniMaxH3Runner:
             keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
             _, state = keyframe_step(pipe, state)
 
-        # --- layout / latents / timesteps ---
-        layout_step = MiniMaxH3PrepareLayoutStep()
-        _, state = layout_step(pipe, state)
-        latents_step = MiniMaxH3PrepareLatentsStep()
-        _, state = latents_step(pipe, state)
-        timesteps_step = MiniMaxH3SetTimestepsStep()
-        _, state = timesteps_step(pipe, state)
+            # --- layout / latents / timesteps ---
+            layout_step = MiniMaxH3PrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
 
         # --- denoise loop, instrumented for progress polling ---
         if progress:
@@ -1605,7 +1778,7 @@ class MiniMaxH3Runner:
         # this mode keeps between requests. No-op in `none` mode (nothing was dropped
         # for decode in that mode).
         self._vae_to_cpu()
-        if TE_QUANT == "bnb-4bit":
+        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM:
             with self._load_lock:
                 self._ensure_transformer(progress)
                 if force_free_te:
@@ -1616,6 +1789,12 @@ class MiniMaxH3Runner:
                     # (which needs headroom too, right after decode's own VAE trip) is not
                     # competing with a simultaneous TE reload for VRAM.
                     self._load_text_encoder(progress)
+        # H3_LOWVRAM: deliberately do NOT reload the transformer here. This mode's
+        # steady state between requests is "nothing big resident" (see the H3_LOWVRAM
+        # module comment) -- the *next* request needs TE first, not transformer, so
+        # preloading it now would just be evicted again at that request's own encode
+        # phase for no benefit, and would leave a 34GB resident model sitting idle
+        # between requests on a card that cannot spare it.
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
@@ -1647,6 +1826,7 @@ class MiniMaxH3Runner:
             "mode": mode,
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            "lowvram": H3_LOWVRAM,
             "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
@@ -1782,9 +1962,27 @@ class MiniMaxH3Runner:
                 # fresh, later, after the reference encoder step -- same as the first-
                 # request path. No-op (cheap) when it was not resident.
                 self._free_transformer_ref()
-            self._sync_shared_components_to_ref()
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
+            # H3_LOWVRAM bug found and fixed by this task's own verification: syncing
+            # shared components (text_encoder among them) onto `self._pipe_ref` must
+            # happen AFTER `_load_text_encoder` above, not before. `_sync_shared_
+            # components_to_ref()` copies whatever `self._pipe.text_encoder` *currently*
+            # is at the moment it runs (`ModularPipeline.components` is a live
+            # attribute read, not a promise) -- in every non-lowvram mode this was
+            # always safe because TE is already resident (permanently, or reloaded from
+            # a previous request's steady state) by the time `generate_ref2va()` is
+            # entered, so syncing before vs. after `_load_text_encoder` made no
+            # observable difference. H3_LOWVRAM never preloads TE (see H3_LOWVRAM's
+            # module comment), so the old ordering synced `self._pipe.text_encoder ==
+            # None` onto `self._pipe_ref`, and the freshly loaded TE a few lines below
+            # was never propagated -- reproduced as `AttributeError: 'NoneType' object
+            # has no attribute 'config'` inside `MiniMaxH3Ref2VATextEncoderStep.
+            # encode_prompt` (`components.text_encoder.config...`) on this task's first
+            # ref2va-under-lowvram attempt. Calling this again on every request is
+            # cheap and always safe (plain attribute re-assignment of already-loaded
+            # modules, see the field comment on `_pipe_ref` in `__init__`).
+            self._sync_shared_components_to_ref()
 
         # Reset peak stats after loading so the reported peak reflects this generation's
         # encode+denoise+decode, not the (much larger, one-time) model loading peak.
@@ -1834,7 +2032,36 @@ class MiniMaxH3Runner:
         # previous ref2va request's steady state" case -- see that comment for the bug
         # this closes. Nothing more to free here; just bring vae onto GPU.
         self._vae_to_gpu()
-        if TE_QUANT == "bnb-4bit":
+        if H3_LOWVRAM:
+            # Same `_execution_device` resolution trap as generate()'s own H3_LOWVRAM
+            # branch (see its long comment): `vae` sits between `text_encoder` and
+            # `transformer_ref` in `MiniMaxH3Ref2VABlocks`' component order, and stays a
+            # resident (if CPU-placed) `nn.Module` even outside its active phase -- so
+            # freeing TE before transformer_ref is loaded is only safe once every step
+            # that resolves its device via `_execution_device` has already run and
+            # materialized its tensors. Unlike the non-lowvram int8 branch below (which
+            # tolerates TE-nf4(21) + transformer_ref-int8(34) = 55GB coexisting briefly
+            # during the transformer_ref load, then frees TE right after via the
+            # deferred `force_free_te` further down), 55GB already exceeds a
+            # 48GB-class card -- so here the reference-encoder step AND
+            # layout_step/latents_step/timesteps_step all run first, while TE is still
+            # the GPU-resident model `_execution_device` resolves to, and only then is
+            # TE freed and transformer_ref loaded.
+            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
+            _, state = reference_encoder_step(pipe, state)
+            self._vae_to_cpu()
+
+            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
+
+            with self._load_lock:
+                self._free_text_encoder(force=True)
+                self._ensure_transformer_ref(progress)
+        elif TE_QUANT == "bnb-4bit":
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
             self._vae_to_cpu()
@@ -1852,6 +2079,14 @@ class MiniMaxH3Runner:
                 # needing headroom), the same "restore steady state right before the
                 # next request needs it, not a moment sooner than necessary" shape
                 # `generate()`'s own force_free_te reload already uses.
+
+            # --- layout / latents / timesteps ---
+            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
         else:
             # `none` mode: TE's job is done -- free it and bring in transformer_ref
             # (vae is already permanently resident in this mode, so the reference
@@ -1863,13 +2098,13 @@ class MiniMaxH3Runner:
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
 
-        # --- layout / latents / timesteps ---
-        layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
-        _, state = layout_step(pipe, state)
-        latents_step = MiniMaxH3PrepareLatentsStep()
-        _, state = latents_step(pipe, state)
-        timesteps_step = MiniMaxH3SetTimestepsStep()
-        _, state = timesteps_step(pipe, state)
+            # --- layout / latents / timesteps ---
+            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
 
         # bnb-4bit mode (bf16 transformer_ref): force-free TE-nf4 (~21GB) before denoise,
         # unconditionally (unlike generate()'s hires-fix-only `force_free_te` -- a
@@ -1906,7 +2141,9 @@ class MiniMaxH3Runner:
         # own comment documents finding for its layout_step. Freeing TE only once those
         # position_ids/layout tensors already exist on the correct device (set once here,
         # and never touched again for the rest of the request) sidesteps it entirely.
-        force_free_te = TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT
+        # H3_LOWVRAM: always False here -- TE was already force-freed above, before
+        # transformer_ref was even loaded (see the H3_LOWVRAM branch above).
+        force_free_te = TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM
         if force_free_te:
             with self._load_lock:
                 self._free_text_encoder(force=True)
@@ -1999,7 +2236,7 @@ class MiniMaxH3Runner:
         torch.cuda.empty_cache()
 
         self._vae_to_cpu()
-        if TE_QUANT == "bnb-4bit":
+        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM:
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
                 if force_free_te:
@@ -2024,6 +2261,9 @@ class MiniMaxH3Runner:
                     # so it is not competing with them for VRAM during their own
                     # reloads.
                     self._ensure_transformer(progress)
+        # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
+        # "nothing big resident between requests" reasoning as generate()'s own
+        # lowvram decode tail.
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
@@ -2054,6 +2294,7 @@ class MiniMaxH3Runner:
             "mode": "ref2va",
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            "lowvram": H3_LOWVRAM,
             "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,

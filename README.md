@@ -217,6 +217,72 @@ expandable_segments:True` をrunnerが設定(int8ロード/解放サイクルの
 「54GBしか使っていないのに15GB確保失敗」が実機再現したため。diffusers-serverでも
 実績のある設定)。既定 `none` は従来とバイト一致(回帰確認済み)。
 
+## 48GB級VRAM対応 (`H3_LOWVRAM`、既定 `0`)
+
+TE-nf4(21GB)+ transformer int8(34GB)= 55GB は48GB級カードでは同時常駐できない
+(96GB機の既定・int8両常駐モードいずれも成立しない)。`H3_LOWVRAM=1` は
+「TEとtransformerを絶対に同時常駐させない」フェーズ循環方式で48GB級に対応する。
+
+- **強制**: `H3_TRANSFORMER_QUANT` 未指定なら自動で `int8` に上書きする(bf16
+  66.3GBは48GBに単体でも収まらないため)。明示的に `H3_TRANSFORMER_QUANT=none` を
+  指定した場合は起動時に `RuntimeError` で拒否する。`H3_TE_QUANT` は `bnb-4bit`
+  (既定)以外を指定するとやはり起動時に拒否する。`H3_TRANSFORMER_BOTH_RESIDENT`
+  (int8両常駐)は無条件で無効化する。
+- **定常状態**: リクエスト間は「何も大きいものが常駐しない」(VAEペアのみCPU常駐、
+  他モードのような transformer/TE の常時居座りが無い)。
+- **t2va/fl2vaのフェーズ**: [エントリ: 常駐transformer/transformer_refがあれば解放]
+  → TEロード → エンコード(+ fl2vaならkeyframeエンコード)→ **layout/latents/
+  timestepsをTE常駐のまま先に実行**(`_execution_device`解決の罠対策、下記参照)→
+  TE解放 → transformer(int8)ロード → デノイズ(~34GB+活性化~5GB≒39GB)→
+  transformer解放 → VAE→GPU → デコード(~11GB+バッファ)→ VAE→CPU
+  (**transformerは次リクエストのために再ロードしない** — 次は encode が先に必要)。
+- **ref2vaのフェーズ**: 同じ原則で、参照VAEエンコード → layout/latents/timesteps
+  (ここもTE常駐のまま)→ TE解放 → transformer_ref(int8)ロード → デノイズ → 以下同様。
+- **`_execution_device` 解決の罠(実装時に発見・修正)**: パイプラインのコンポーネント
+  順は `text_encoder, tokenizer, processor, vae, scheduler, audio_scheduler,
+  transformer, ...`。TEを先に解放してからtransformerをロードする素朴な実装だと、
+  `vae`(CPUに退避されていても“存在する”nn.Module)が`text_encoder`の次に解決され、
+  `_execution_device`が`cpu`に解決されてしまいデノイズの最初のtransformer forward
+  で `RuntimeError: Expected all tensors to be on the same device` になる
+  (実機で再現・特定)。対策として **layout/latents/timesteps は TE がまだ
+  GPU常駐のうちに実行し、それらの出力テンソルが正しいデバイスに確定してから
+  TEを解放する** 順序にした(他モードの `force_free_te` 遅延パターンと同じ発想)。
+  ref2vaでは reference_encoder_step も同様にTE常駐のうちに実行する必要がある
+  (layout_stepが参照の latent 形状に依存するため)。
+- **upscale=1(hires-fix)は非対応**: パス2は約4倍の系列長(~16倍のattention活性化
+  コスト)を要し、このモードの定常余裕(~9GB)では未検証のため、`ValueError`
+  (400)で拒否する。
+- **副次的に見つけた既存バグの修正**: `generate_ref2va()` の
+  `_sync_shared_components_to_ref()` はTEロードより**前**に呼ばれていたため、
+  TEが未ロードの状態(H3_LOWVRAM、または`none`系モードでref2vaが最初のリクエスト
+  になるケース)では `self._pipe_ref.text_encoder` に `None` が同期され、
+  `AttributeError: 'NoneType' object has no attribute 'config'` になっていた
+  (実機で再現・特定)。TEロードの**後**に呼ぶよう順序を修正した(全モード共通の
+  修正、H3_LOWVRAM専用ではない)。
+- **正しさの検証**: フェーズ循環は計算内容を変えないはずなので、同一seed
+  (768²・5秒・30steps・キツネのプロンプト、seed=12345)で `H3_LOWVRAM=1
+  H3_TRANSFORMER_QUANT=int8` のt2va出力と通常int8モードのt2va出力を比較したところ
+  **mp4がバイト完全一致**(md5一致)することを確認済み。
+- **48GB相当の実機検証**(96GB機でダミーVRAM確保により空きを~43.5GBへ制限、実48GB
+  カードの空き~47GBより厳しい条件):
+
+  | | 完走 | ピークVRAM | 内訳(概算) |
+  |---|---|---|---|
+  | t2va 1本目 | ○ | 38.68GB | TEロード~52s + transformerロード~36s + デノイズ108s + デコード6.6s |
+  | t2va 2本目(連続) | ○ | 38.94GB | 同様の固定費が毎回発生(定常状態を持たない設計どおり) |
+  | ref2va(画像参照1枚) | ○ | 43.84GB | デノイズ283s(参照行分シーケンスが伸びるため39GB台では収まらずやや高め) |
+  | upscale=1 | - | - | 実装時点でOOMリスクを判断し明示的に400で拒否(未実行) |
+
+  いずれもホストRAMスワップの増加なし(`free -g` で作業前後とも Swap used ~6GB台で
+  安定)。作業後は `H3_LOWVRAM` 未指定(完全デフォルト設定、bf16 transformer)で
+  再起動して同一プロンプトのt2vaを1本実行し、`peak_vram_gb: 91.94GB` /
+  `cache_skipped_steps: 6` など既存の実測値(本README上部の表・
+  int8量子化セクション)と同水準であることを確認し、回帰なしと判定した。
+- **量子化済みチェックポイントの事前保存によるロード時間短縮**: 未調査
+  (bnb 4bitは`save_pretrained`直列化に対応している可能性が高いが未検証。torchao
+  int8の直列化保存も同様に未検証。今回はリクエストごとの固定費 ~90-100s
+  (TEロード+transformerロード)をそのまま許容する設計とした)。
+
 ## Ref2VA (オムニ参照生成、`/api/ref2va`)
 
 順序付きの参照素材(**画像最大9・動画最大3・音声最大3、合計12**。音声単独は不可)から
