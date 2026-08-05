@@ -209,8 +209,8 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
 H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
 
 # EXPERIMENTAL, opt-in. "0" (default) = every mode above is untouched -- this flag is
-# read nowhere else unless it is "1". "1" = 48GB-class low-VRAM mode: TE (bnb-4bit
-# nf4, ~21GB) and the big transformer (int8, ~34GB) are never allowed to be
+# read nowhere else unless it is "1" or "group". "1" = 48GB-class low-VRAM mode: TE
+# (bnb-4bit nf4, ~21GB) and the big transformer (int8, ~34GB) are never allowed to be
 # GPU-resident *at the same time* -- 21+34=55GB alone already exceeds a 48GB card, so
 # unlike every mode above (which all keep at least one 60GB+ class model resident
 # between requests), this mode's steady state between requests is "nothing big"
@@ -225,43 +225,136 @@ H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
 # TE first, not transformer). See the module docstring addendum below H3_HIRES_DENOISE
 # for the full phase x resident-set table.
 #
+# "group" = 24-32GB-class low-VRAM mode (see the H3_LOWVRAM_GROUP module comment
+# further down for the full design, verified by scripts/probe_group_offload.py before
+# being wired in here): instead of a full ~34GB int8 transformer ever being
+# GPU-resident, the transformer is loaded once (CPU-resident, quantized in place via
+# `device_map="cpu"` + torchao's `Int8WeightOnlyConfig` -- confirmed this does NOT hit
+# torchao's cpu-offload skip-quantize path, since a plain string device_map becomes
+# `{"": torch.device("cpu")}`, not a per-module dict with the *string* "cpu" as a
+# value, which is the only thing `TorchAoHfQuantizer.validate_environment` checks for)
+# and kept resident in host RAM for the life of the process via
+# `enable_group_offload(block_level, num_blocks_per_group=1, use_stream=True)`, which
+# streams ~1-2 of its 50 blocks (~0.68GB each) onto GPU at a time during denoise. This
+# is diffusers' own decorator-based hook mechanism, not a CLAUDE.md-banned whole-module
+# CPU<->GPU swap: the "resident" location for a group-offloaded module IS the CPU side,
+# and the hooks manage small per-block GPU visits automatically.
+#
 # Requires H3_TRANSFORMER_QUANT=int8 (bf16's 66.3GB transformer alone is already
 # larger than a 48GB card with headroom for anything else) -- if the transformer quant
-# was left at its own default ("none") while H3_LOWVRAM=1 is set, this is auto-upgraded
+# was left at its own default ("none") while H3_LOWVRAM is set, this is auto-upgraded
 # to "int8" below (rather than silently running an unfittable bf16 config) UNLESS the
 # operator *explicitly* set H3_TRANSFORMER_QUANT=none, in which case this raises at
 # import time instead of silently overriding an explicit choice.
 # H3_TRANSFORMER_BOTH_RESIDENT (both transformer AND transformer_ref resident at once,
-# 34+34=68GB) is incompatible with this mode and is force-disabled below regardless of
-# H3_TRANSFORMER_QUANT.
-# upscale=1 (hires-fix) is rejected with a 400-mapped ValueError in this mode (see
-# `generate()`) -- pass 2's ~4x-longer packed sequence was not verified to fit in the
-# ~9GB of headroom this mode's steady state leaves at 48GB-class VRAM.
-H3_LOWVRAM = os.environ.get("H3_LOWVRAM", "0").strip() == "1"
-if H3_LOWVRAM:
+# 34+34=68GB) is incompatible with either low-VRAM mode and is force-disabled below
+# regardless of H3_TRANSFORMER_QUANT.
+# upscale=1 (hires-fix) is rejected with a 400-mapped ValueError in both low-VRAM modes
+# (see `generate()`) -- pass 2's ~4x-longer packed sequence was not verified to fit in
+# the limited headroom either mode's steady state leaves at 24-48GB-class VRAM.
+H3_LOWVRAM_RAW = os.environ.get("H3_LOWVRAM", "0").strip().lower()
+if H3_LOWVRAM_RAW not in ("0", "1", "group"):
+    raise ValueError(f"H3_LOWVRAM must be '0', '1' or 'group', got {H3_LOWVRAM_RAW!r}")
+H3_LOWVRAM = H3_LOWVRAM_RAW == "1"
+H3_LOWVRAM_GROUP = H3_LOWVRAM_RAW == "group"
+H3_LOWVRAM_ANY = H3_LOWVRAM or H3_LOWVRAM_GROUP
+if H3_LOWVRAM_ANY:
     _explicit_transformer_quant = "H3_TRANSFORMER_QUANT" in os.environ
     if _explicit_transformer_quant and H3_TRANSFORMER_QUANT == "none":
         raise RuntimeError(
-            "H3_LOWVRAM=1 requires an int8 transformer (bf16's 66.3GB does not fit a "
-            "48GB-class card even alone) but H3_TRANSFORMER_QUANT=none was explicitly "
-            "set. Drop H3_TRANSFORMER_QUANT (it will default to int8 under "
-            "H3_LOWVRAM=1) or set H3_TRANSFORMER_QUANT=int8 explicitly."
+            f"H3_LOWVRAM={H3_LOWVRAM_RAW!r} requires an int8 transformer (bf16's 66.3GB "
+            "does not fit a 48GB-class card even alone, and group offloading a bf16 "
+            "module would need ~66GB of host RAM just for the weights) but "
+            "H3_TRANSFORMER_QUANT=none was explicitly set. Drop H3_TRANSFORMER_QUANT "
+            "(it will default to int8 under H3_LOWVRAM) or set "
+            "H3_TRANSFORMER_QUANT=int8 explicitly."
         )
     H3_TRANSFORMER_QUANT = "int8"
     H3_TRANSFORMER_BOTH_RESIDENT = False
-    # Every `H3_LOWVRAM` branch further down in this file (generate()/generate_ref2va())
-    # is written assuming TE_QUANT == "bnb-4bit" (it is the only TE loading strategy
-    # that produces a small-enough, movable-only-by-full-reload TE that this mode's
-    # "never resident together with the transformer" choreography can work with --
-    # `none` mode's 66.3GB bf16-native TE would not fit alongside anything else on a
-    # 48GB-class card even on its own). Reject the combination explicitly rather than
-    # silently mis-choreograph an unfittable 66.3GB TE.
+    # Every `H3_LOWVRAM`/`H3_LOWVRAM_GROUP` branch further down in this file
+    # (generate()/generate_ref2va()) is written assuming TE_QUANT == "bnb-4bit" (it is
+    # the only TE loading strategy that produces a small-enough, movable-only-by-full-
+    # reload TE that these modes' choreography can work with -- `none` mode's 66.3GB
+    # bf16-native TE would not fit alongside anything else on a 24-48GB-class card even
+    # on its own). Reject the combination explicitly rather than silently
+    # mis-choreograph an unfittable 66.3GB TE.
     if TE_QUANT != "bnb-4bit":
         raise RuntimeError(
-            f"H3_LOWVRAM=1 requires H3_TE_QUANT=bnb-4bit (default), got "
-            f"H3_TE_QUANT={TE_QUANT!r}. bf16 TE (~66.3GB) cannot coexist with anything "
-            "else on a 48GB-class card."
+            f"H3_LOWVRAM={H3_LOWVRAM_RAW!r} requires H3_TE_QUANT=bnb-4bit (default), "
+            f"got H3_TE_QUANT={TE_QUANT!r}. bf16 TE (~66.3GB) cannot coexist with "
+            "anything else on a 24-48GB-class card."
         )
+
+# "group" mode's own RAM guard (see H3_LOWVRAM_GROUP's design comment further down):
+# the int8 transformer (~34GB) is loaded once and stays resident in host RAM for the
+# life of the process (unlike H3_LOWVRAM=1's per-request from-scratch reload) --
+# refuse to even attempt that load if host RAM is already tight, rather than silently
+# risking the swap-storm/OOM-killer incident CLAUDE.md #33 (this project's sibling
+# diffusers-server repo) documents from a past project loading a large module the
+# wrong way. Checked once, right before the first group-offload transformer load
+# (`_ensure_transformer_group`), not at import time (RAM usage can shift between
+# process start and first request).
+# 40GB (default) covers the *unpinned* CPU load (~34GB, `H3_GROUP_OFFLOAD_LOW_CPU_MEM=1`)
+# with a thin margin, but the *default* path (`H3_GROUP_OFFLOAD_LOW_CPU_MEM=0`, see that
+# var's own comment for why it is the default despite the name) eagerly pins the whole
+# transformer at `enable_group_offload()` time right after, measured to cost an
+# additional ~14-16GB of available RAM on top of the ~32GB the plain CPU load itself
+# used (avail_gb dropped 61.0->58.8 during load, then 58.8->45.3 during the pin step, in
+# this task's own probe against the real transformer) -- so the *actual* peak
+# requirement for the default configuration is closer to ~48GB than 40GB. 40GB is kept
+# as the floor (matches this var's literal meaning: do not even start the CPU load
+# below this) rather than raised to 48GB by default, since `H3_GROUP_OFFLOAD_LOW_CPU_MEM=1`
+# remains available as an explicit lower-RAM (but slower-denoise) opt-out for boxes
+# between 40-48GB of RAM -- raise this explicitly (e.g. to 48) if running the default
+# (pinned) configuration on such a box.
+H3_GROUP_OFFLOAD_MIN_RAM_GB = float(os.environ.get("H3_GROUP_OFFLOAD_MIN_RAM_GB", "40"))
+
+# "group" mode's `enable_group_offload()` knobs (see `_ensure_transformer_group`'s
+# docstring for the full design). `num_blocks_per_group=1` is diffusers-server's
+# (this project's sibling repo, CLAUDE.md #33/#34/#37) own verified default for
+# transformer group offloading -- the finest-grained onload unit, minimizing the
+# resident-on-GPU footprint at the cost of more (smaller) PCIe round trips per step.
+# `use_stream=True` overlaps the *next* group's H2D copy with the *current* group's
+# compute via a dedicated CUDA stream (double-buffered prefetch), trading ~1 extra
+# block's worth of GPU memory for less stalling on the copy.
+H3_GROUP_OFFLOAD_BLOCKS = int(os.environ.get("H3_GROUP_OFFLOAD_BLOCKS", "1"))
+H3_GROUP_OFFLOAD_USE_STREAM = os.environ.get("H3_GROUP_OFFLOAD_USE_STREAM", "1").strip() == "1"
+
+# `low_cpu_mem_usage` for `enable_group_offload()` -- default "0" (i.e. `False`), the
+# OPPOSITE of what its name suggests is the safe default, for a reason found and
+# verified empirically during this task (scripts/probe_group_offload_forward.py /
+# scripts/probe_group_offload_fix.py), not assumed from the diffusers docs:
+# `low_cpu_mem_usage=True` (diffusers' own default) skips eagerly pinning
+# `cpu_param_dict`'s tensors at `enable_group_offload()` time (`_to_cpu()`,
+# hooks/group_offloading.py), deferring pinning to every single onload instead
+# (`_pinned_memory_tensors()`, called from `_onload_from_memory()` whenever
+# `use_stream=True`). For torchao's `Int8Tensor` (this mode's transformer weight type),
+# that deferred pin path is broken: `Int8Tensor.qdata.pin_memory()` raises `RuntimeError:
+# cannot pin 'torch.cuda.CharTensor' only dense CPU tensors can be pinned` on every
+# single denoise step's block onload -- reproduced first against the real server (a
+# t2va request failing inside the FIRST transformer_blocks forward) and then isolated
+# down to a minimal dummy int8-quantized nn.Linear stack, confirming
+# `use_stream=True + low_cpu_mem_usage=True` is the unconditional trigger (both
+# `use_stream=False` and `low_cpu_mem_usage=False` independently avoid it -- see the
+# probe scripts' own output for the full traceback and A/B). `low_cpu_mem_usage=False`
+# was chosen over `use_stream=False` as this mode's actual default because it also
+# measured ~4-5x faster per-block onload against the real transformer (pinned-memory
+# H2D copies do not need to wait on a pageable-memory staging copy first): 0.04-0.07s
+# vs 0.1-0.26s onload, and offload dropped to ~0s (pinned `cpu_param_dict` tensors are
+# reused directly instead of a fresh `.to(cpu)` copy each time). The cost is paid once,
+# up front, at `enable_group_offload()` time instead of amortized per-step: pinning the
+# full ~34GB int8 transformer took an extra ~22s and reduced available host RAM by
+# ~15.7GB in that same measurement (page-locked memory cannot be swapped out, unlike the
+# `low_cpu_mem_usage=True` path's plain pageable CPU tensors) -- `H3_GROUP_OFFLOAD_MIN_RAM_GB`'s
+# guard (checked before this load starts) accounts for this. Exposed as an env var
+# rather than hardcoded so an operator on a truly RAM-starved box can opt back into the
+# slower-but-lower-RAM `low_cpu_mem_usage=True` path if needed -- but note doing so
+# still requires `H3_GROUP_OFFLOAD_USE_STREAM=0` as well (set automatically below,
+# since `low_cpu_mem_usage=True` + `use_stream=True` together are exactly the broken
+# combination) or the pin_memory() crash returns.
+H3_GROUP_OFFLOAD_LOW_CPU_MEM = os.environ.get("H3_GROUP_OFFLOAD_LOW_CPU_MEM", "0").strip() == "1"
+if H3_GROUP_OFFLOAD_LOW_CPU_MEM and "H3_GROUP_OFFLOAD_USE_STREAM" not in os.environ:
+    H3_GROUP_OFFLOAD_USE_STREAM = False
 
 # EXPERIMENTAL, opt-in. "" (default) = whatever diffusers' attention_dispatch picks
 # natively (native/SDPA today) -- `set_attention_backend()` is never called, byte-for-byte
@@ -383,6 +476,36 @@ def ram_gb() -> dict:
         "swap_used_gb": round(swap_total - swap_free, 2),
         "swap_total_gb": round(swap_total, 1),
     }
+
+
+def _log_gpu_tensor_diag(label: str, top_n: int = 20):
+    """TEMPORARY diagnostic (opt-in via H3_DEBUG_MEM_DIAG=1): walks `gc.get_objects()` for
+    live CUDA tensors and logs the largest ones by byte size, to find what is actually
+    holding VRAM at a given point (as opposed to `torch.cuda.memory_allocated()`'s
+    aggregate total, which does not say *what*). Used once during this task's own
+    32GB-ballast investigation of decode's ~16GB-on-top-of-denoise's-~30GB peak. Not
+    wired into any code path unless the env var is set -- safe to leave in place.
+    """
+    import gc as _gc
+
+    seen = set()
+    entries = []
+    for obj in _gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda:
+                key = obj.data_ptr()
+                if key in seen:
+                    continue
+                seen.add(key)
+                nbytes = obj.numel() * obj.element_size()
+                entries.append((nbytes, tuple(obj.shape), str(obj.dtype)))
+        except Exception:
+            continue
+    entries.sort(key=lambda x: -x[0])
+    total = sum(e[0] for e in entries) / 1e9
+    logger.info("[mem-diag] %s: %d live cuda tensors, %.2fGB total (dedup by data_ptr)", label, len(entries), total)
+    for nbytes, shape, dtype in entries[:top_n]:
+        logger.info("[mem-diag]   %.3fGB shape=%s dtype=%s", nbytes / 1e9, shape, dtype)
 
 
 class _NullContext:
@@ -601,8 +724,17 @@ class MiniMaxH3Runner:
         quantize in place" step, matching the component-wise cuda-direct loading pattern
         this file uses everywhere else (never a CPU-wide staging pass for a 60GB+ module,
         per CLAUDE.md #33 as referenced in the module docstring).
+
+        `H3_LOWVRAM_GROUP` ("group" mode): delegates entirely to `_ensure_transformer_group`
+        (see its docstring for the CPU-resident + block-level-group-offload design) --
+        this is a different enough loading shape (device_map="cpu", not "cuda", and the
+        module is never actually freed between requests) that it is not worth threading
+        through the branches below.
         """
         self._ensure_pipe_shell()
+        if H3_LOWVRAM_GROUP:
+            self._ensure_transformer_group(progress)
+            return
         if self._transformer_loaded:
             # int8 both-resident mode: this can be a "just mark it active again" call
             # (transformer already resident, transformer_ref was the one last used) --
@@ -667,6 +799,146 @@ class MiniMaxH3Runner:
             time.time() - t0, H3_TRANSFORMER_QUANT, gpu_mem_gb(), ram_gb(),
         )
 
+    def _check_group_offload_ram_guard(self):
+        """Refuse to start a group-offload transformer load if host RAM is already tight.
+
+        See `H3_GROUP_OFFLOAD_MIN_RAM_GB`'s module-level comment: the whole point of this
+        check is to fail loudly with a clear error *before* attempting a ~34GB CPU load,
+        rather than risk the swap-storm/OOM-killer failure mode CLAUDE.md #33 (diffusers-
+        server, this project's sibling repo) documents from a similarly-shaped mistake in
+        a different project. Cheap (`/proc/meminfo` read only), safe to call defensively.
+        """
+        avail = ram_gb()["avail_gb"]
+        if avail < H3_GROUP_OFFLOAD_MIN_RAM_GB:
+            raise RuntimeError(
+                f"H3_LOWVRAM=group requires at least {H3_GROUP_OFFLOAD_MIN_RAM_GB}GB of "
+                f"available host RAM before loading the (~34GB, permanently CPU-resident) "
+                f"int8 transformer, but only {avail}GB is available right now. Refusing to "
+                "start the load rather than risk a swap storm (see CLAUDE.md #33 in the "
+                "sibling diffusers-server repo for the incident this guards against). Free "
+                "up host RAM, or lower H3_GROUP_OFFLOAD_MIN_RAM_GB if you have verified "
+                "this box's actual headroom."
+            )
+
+    def _ensure_transformer_group(self, progress: ProgressState | None = None):
+        """`H3_LOWVRAM_GROUP` ("group" mode) transformer loading: CPU-resident int8 +
+        diffusers block-level group offload, for 24-32GB-class cards.
+
+        Unlike every other mode in this file (including `H3_LOWVRAM=1`, which frees the
+        transformer completely between requests), this mode's transformer is loaded
+        *once* and stays resident -- in host RAM, not VRAM -- for the life of the
+        process, exactly like `bnb-4bit` TE's own "load once, keep forever" shape (see
+        `_load_text_encoder`'s docstring: bnb 4bit modules cannot be `.to()`-moved
+        between devices either, so reload-from-scratch is the only alternative there;
+        here it is simply unnecessary, since a group-offloaded module's GPU visits are
+        already small and self-managed by diffusers' own hooks).
+
+        Design, verified against this file's actual constraints by
+        `scripts/probe_group_offload.py` before being wired in here (see that script's
+        own docstring and this task's write-up for the full reasoning):
+
+        1. `device_map={"transformer": "cpu"}` + `TorchAoConfig(Int8WeightOnlyConfig)`.
+           A plain string device_map value becomes `{"": torch.device("cpu")}` inside
+           `from_pretrained` (see `modeling_utils.py`'s device_map normalization) -- a
+           single-entry dict whose *value* is a `torch.device` object, not the string
+           `"cpu"`. `TorchAoHfQuantizer.validate_environment` only sets its
+           offload-skip-quantize flag (`self.offload = True`, which makes
+           `check_if_quantized_param` skip quantizing anything placed on `"cpu"`) when
+           `"cpu" in device_map.values()` -- a `torch.device("cpu") == "cpu"` comparison
+           is `False` in Python, so that flag is never set here and every eligible
+           linear layer DOES get quantized to torchao's `Int8Tensor`, even though every
+           weight lands on CPU. Confirmed empirically: probe scan found 370/370 eligible
+           linear layers as `Int8Tensor` (none fell back to plain bf16 `Tensor`), and RAM
+           dropped by ~32GB during the load (consistent with the already-measured ~34GB
+           int8 size measured on GPU in `H3_TRANSFORMER_QUANT=int8` mode).
+        2. `enable_group_offload(onload_device=cuda, offload_device=cpu,
+           offload_type="block_level", num_blocks_per_group=1, use_stream=True,
+           low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM)` -- the CPU-then-offload
+           ordering (module loaded CPU-side *first*, group offloading layered on top
+           after) is the same shape diffusers-server's sibling project (CLAUDE.md
+           #33/#34/#37) already established as correct: the hooks are in place before
+           anything ever tries to move the whole ~34GB module onto GPU at once (which is
+           the failure mode "block-level group offload" exists to avoid in the first
+           place). 50 transformer_blocks at ~0.68GB (int8) each means
+           `num_blocks_per_group=1` with `use_stream=True`'s double-buffered prefetch
+           keeps only ~1-2 blocks (~1.4GB) GPU-resident at any moment during denoise, not
+           the full 34GB. `low_cpu_mem_usage` defaults to `False` here -- see
+           `H3_GROUP_OFFLOAD_LOW_CPU_MEM`'s own module-level comment for why: diffusers'
+           own default (`True`) combined with `use_stream=True` hits a real bug for
+           torchao's `Int8Tensor` (`RuntimeError: cannot pin 'torch.cuda.CharTensor'
+           only dense CPU tensors can be pinned`, reproduced against both a minimal
+           dummy int8 stack and the real transformer, isolated to exactly this
+           combination), and the fix (`low_cpu_mem_usage=False`, which eagerly pins
+           `cpu_param_dict` once at this call instead of once per onload) also measured
+           ~4-5x faster per-block onload as a side benefit.
+        3. FBC (`H3_CACHE=fbc`) and the attention backend (`H3_ATTN_BACKEND=sage`) are
+           applied exactly as in every other mode: both are independent hook layers
+           (FBC decides whether to skip a block's compute at all; group offloading
+           decides whether that block's weights are already GPU-resident; the attention
+           backend only changes what happens inside a block's own attention call once it
+           does run) -- diffusers' `HookRegistry` supports multiple hooks per module by
+           design (see `hooks/hooks.py`), and this is exactly what the task's own
+           empirical verification (this run) is checking end-to-end, not just asserting.
+
+        No RAM-vs-VRAM cycling for the transformer itself is needed once this call
+        returns -- `_free_transformer`/decode-window drops elsewhere in this file are
+        skipped for `H3_LOWVRAM_GROUP` (see the `generate()`/`generate_ref2va()` call
+        sites), since group offloading already keeps VRAM usage low without a full
+        drop+reload.
+        """
+        if self._transformer_loaded:
+            self._active_variant = "t2va"
+            return
+        self._check_group_offload_ram_guard()
+        if progress:
+            progress.update(phase="loading_transformer", message="transformer (group offload) をロード中...")
+        t0 = time.time()
+        from diffusers import TorchAoConfig
+        from torchao.quantization import Int8WeightOnlyConfig
+
+        quant_config = TorchAoConfig(
+            Int8WeightOnlyConfig(version=2),
+            modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+        )
+        self._pipe.load_components(
+            names=["transformer"],
+            dtype=torch.bfloat16,
+            quantization_config={"transformer": quant_config},
+            device_map={"transformer": "cpu"},
+        )
+        if getattr(self._pipe, "transformer", None) is None:
+            raise RuntimeError(
+                "transformer load failed (see the diffusers 'Failed to create component "
+                "transformer' warning above for the underlying error) -- "
+                "self._pipe.transformer is still None after load_components()."
+            )
+        t1 = time.time()
+        logger.info(
+            "transformer loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
+            t1 - t0, ram_gb(),
+        )
+        self._pipe.transformer.enable_group_offload(
+            onload_device=DEVICE,
+            offload_device=CPU,
+            offload_type="block_level",
+            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
+            non_blocking=True,
+            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
+            record_stream=False,
+            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
+        )
+        self._transformer_loaded = True
+        self._active_variant = "t2va"
+        if H3_ATTN_BACKEND:
+            self._pipe.transformer.set_attention_backend(H3_ATTN_BACKEND)
+            logger.info("transformer attention backend set to %r", H3_ATTN_BACKEND)
+        if H3_CACHE == "fbc":
+            self._enable_fbc()
+        logger.info(
+            "transformer group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
+            time.time() - t1, time.time() - t0, gpu_mem_gb(), ram_gb(),
+        )
+
     def _fbc_last_step_was_skip(self) -> int:
         """Best-effort introspection of whether the just-finished transformer forward skipped
         the remaining blocks (cache hit). Reads `FBCSharedBlockState.should_compute` off the
@@ -705,7 +977,16 @@ class MiniMaxH3Runner:
     def _free_transformer(self):
         if not self._transformer_loaded:
             return
-        # Drop in place, no CPU staging (same reasoning as _free_text_encoder).
+        # Drop in place, no CPU staging (same reasoning as _free_text_encoder). In
+        # H3_LOWVRAM_GROUP mode the module's parameters mostly live on CPU already (only
+        # ~1-2 group-offloaded blocks are ever GPU-resident at a time), so this call
+        # mainly reclaims ~34GB of *host RAM*, not VRAM -- still exactly the same "drop
+        # in place, no staging trip" shape, just freeing the other kind of memory this
+        # mode keeps the model resident in. Used when switching t2va<->ref2va under
+        # H3_LOWVRAM_GROUP (see `_free_other_variant_transformer`): unlike every other
+        # mode's transformer/transformer_ref pair, group mode never keeps both resident
+        # at once (not verified to fit two ~34GB CPU-resident copies alongside TE-nf4
+        # reload headroom within this mode's RAM guard -- see H3_GROUP_OFFLOAD_MIN_RAM_GB).
         del self._pipe.transformer
         self._pipe.transformer = None
         self._transformer_loaded = False
@@ -734,8 +1015,15 @@ class MiniMaxH3Runner:
 
         int8 quantization uses the exact same recipe as `_ensure_transformer` (same
         model class/config, see `H3_INT8_MODULES_TO_NOT_CONVERT`'s comment).
+
+        `H3_LOWVRAM_GROUP`: delegates to `_ensure_transformer_ref_group` (CPU-resident
+        int8 + block-level group offload, mirroring `_ensure_transformer_group` exactly
+        but against `transformer_ref`/`self._pipe_ref`).
         """
         self._ensure_pipe_ref_shell()
+        if H3_LOWVRAM_GROUP:
+            self._ensure_transformer_ref_group(progress)
+            return
         if self._transformer_ref_loaded:
             # See `_ensure_transformer`'s matching comment: must update
             # `_active_variant` even on the cached-return path, for int8 both-resident
@@ -813,12 +1101,72 @@ class MiniMaxH3Runner:
         except Exception:
             return 0
 
+    def _ensure_transformer_ref_group(self, progress: ProgressState | None = None):
+        """`H3_LOWVRAM_GROUP` transformer_ref loading -- mirrors `_ensure_transformer_group`
+        exactly (see its docstring for the full design/verification), just against
+        `transformer_ref`/`self._pipe_ref`. Not called directly by outside code; reached
+        through `_ensure_transformer_ref`'s own `H3_LOWVRAM_GROUP` branch.
+        """
+        if self._transformer_ref_loaded:
+            self._active_variant = "ref2va"
+            return
+        self._check_group_offload_ram_guard()
+        if progress:
+            progress.update(phase="loading_transformer", message="transformer_ref (group offload) をロード中...")
+        t0 = time.time()
+        from diffusers import TorchAoConfig
+        from torchao.quantization import Int8WeightOnlyConfig
+
+        quant_config = TorchAoConfig(
+            Int8WeightOnlyConfig(version=2),
+            modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+        )
+        self._pipe_ref.load_components(
+            names=["transformer_ref"],
+            dtype=torch.bfloat16,
+            quantization_config={"transformer_ref": quant_config},
+            device_map={"transformer_ref": "cpu"},
+        )
+        if getattr(self._pipe_ref, "transformer_ref", None) is None:
+            raise RuntimeError(
+                "transformer_ref load failed (see the diffusers 'Failed to create "
+                "component transformer_ref' warning above for the underlying error) -- "
+                "self._pipe_ref.transformer_ref is still None after load_components()."
+            )
+        t1 = time.time()
+        logger.info(
+            "transformer_ref loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
+            t1 - t0, ram_gb(),
+        )
+        self._pipe_ref.transformer_ref.enable_group_offload(
+            onload_device=DEVICE,
+            offload_device=CPU,
+            offload_type="block_level",
+            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
+            non_blocking=True,
+            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
+            record_stream=False,
+            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
+        )
+        self._transformer_ref_loaded = True
+        self._active_variant = "ref2va"
+        if H3_ATTN_BACKEND:
+            self._pipe_ref.transformer_ref.set_attention_backend(H3_ATTN_BACKEND)
+            logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
+        if H3_CACHE == "fbc":
+            self._enable_fbc_ref()
+        logger.info(
+            "transformer_ref group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
+            time.time() - t1, time.time() - t0, gpu_mem_gb(), ram_gb(),
+        )
+
     def _free_transformer_ref(self):
         if not self._transformer_ref_loaded:
             return
         # Drop in place, no CPU staging -- same reasoning as _free_transformer /
         # _free_text_encoder (CLAUDE.md #33: no whole-module CPU-staging trips for
-        # 60GB+ modules on this box).
+        # 60GB+ modules on this box). In H3_LOWVRAM_GROUP mode this reclaims host RAM
+        # (see _free_transformer's matching comment), not VRAM.
         del self._pipe_ref.transformer_ref
         self._pipe_ref.transformer_ref = None
         self._transformer_ref_loaded = False
@@ -1021,10 +1369,18 @@ class MiniMaxH3Runner:
         preloaded (onto CPU, same as bnb-4bit -- `_ensure_vaes` already parks them on
         CPU whenever TE_QUANT=="bnb-4bit", which H3_LOWVRAM always implies), so the
         per-request decode phase only pays a CPU->GPU move, not a disk/HF-cache load.
+        `H3_LOWVRAM_GROUP`: unlike `H3_LOWVRAM=1`, the (group-offloaded) transformer
+        IS preloaded here and stays resident for the life of the process -- it lives in
+        host RAM, not VRAM, so there is no reason to pay its ~34GB CPU load + quantize
+        cost on every request the way `H3_LOWVRAM=1` pays a ~34GB *GPU* load each time.
+        TE still cycles per-request (not preloaded), matching `H3_LOWVRAM=1`'s choice to
+        keep the steady-state VRAM footprint minimal between requests.
         """
         with self._load_lock:
             self._ensure_vaes()
-            if not H3_LOWVRAM:
+            if H3_LOWVRAM_GROUP:
+                self._ensure_transformer()
+            elif not H3_LOWVRAM:
                 self._ensure_transformer()
                 if TE_QUANT == "bnb-4bit":
                     self._load_text_encoder()
@@ -1047,7 +1403,11 @@ class MiniMaxH3Runner:
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
-            "lowvram": H3_LOWVRAM,
+            "lowvram": H3_LOWVRAM_RAW,
+            "lowvram_group": H3_LOWVRAM_GROUP,
+            "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
+            "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
+            "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
             "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
@@ -1304,19 +1664,19 @@ class MiniMaxH3Runner:
             # which is unverified territory this task did not have time to check against
             # the reference. Fail loudly rather than silently mis-render.
             raise ValueError("upscale=1 (hires-fix) is only supported for t2va requests, not fl2va.")
-        if do_upscale and H3_LOWVRAM:
+        if do_upscale and H3_LOWVRAM_ANY:
             # Not verified to fit: pass 2 runs full self-attention over a ~4x longer
-            # packed sequence (~16x pass 1's attention activation cost), and this mode's
-            # whole steady state is already sized to leave only ~9GB of headroom above
-            # the int8 transformer alone (see H3_LOWVRAM's module comment) on a
-            # 48GB-class card. Fail loudly rather than risk an OOM mid-request.
-            raise ValueError("upscale=1 (hires-fix) is not supported with H3_LOWVRAM=1.")
+            # packed sequence (~16x pass 1's attention activation cost), and neither
+            # low-VRAM mode's steady state was sized with that much extra headroom in
+            # mind (see H3_LOWVRAM's module comment). Fail loudly rather than risk an
+            # OOM mid-request.
+            raise ValueError(f"upscale=1 (hires-fix) is not supported with H3_LOWVRAM={H3_LOWVRAM_RAW!r}.")
 
         with self._load_lock:
             if H3_LOWVRAM:
                 # This mode's whole point is TE (21GB) and transformer (34GB) are never
                 # GPU-resident together (55GB already exceeds a 48GB-class card) -- so
-                # unlike the branch below, do NOT call `_switch_to_variant`/
+                # unlike the branches below, do NOT call `_switch_to_variant`/
                 # `_ensure_transformer` here: that would load the (int8) transformer
                 # *before* TE, and TE has not even encoded the prompt yet. Just free
                 # whichever big transformer happens to be resident (leftover from a
@@ -1328,6 +1688,19 @@ class MiniMaxH3Runner:
                 self._free_transformer()
                 self._free_transformer_ref()
                 self._active_variant = None
+                self._ensure_vaes(progress)
+                self._load_text_encoder(progress)
+            elif H3_LOWVRAM_GROUP:
+                # Unlike `H3_LOWVRAM=1`, this mode's (group-offloaded) transformer is
+                # cheap to have GPU-adjacent -- it lives on CPU and only ~1-2 blocks
+                # (~1.4GB) ever visit GPU at a time, so TE-nf4 (21GB) + a resident
+                # group-offloaded transformer do not compete for VRAM the way TE(21GB) +
+                # a *fully* GPU-resident int8 transformer(34GB) would. So, same shape as
+                # the plain `bnb-4bit`/`none` branch below: `_switch_to_variant` first
+                # (frees transformer_ref if that was the last-used variant, then loads/
+                # confirms `transformer` resident -- a cheap no-op via
+                # `_ensure_transformer_group`'s early-return if it already is), then TE.
+                self._switch_to_variant("t2va", progress)
                 self._ensure_vaes(progress)
                 self._load_text_encoder(progress)
             else:
@@ -1459,11 +1832,36 @@ class MiniMaxH3Runner:
         # the transformer's own forward, not caught until the first denoise step) the
         # first time this branch tried to free TE right before `_ensure_transformer`,
         # mirroring `none` mode's own ordering naively.
-        force_free_te = TE_QUANT == "bnb-4bit" and not H3_LOWVRAM and (
+        force_free_te = TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY and (
             do_upscale or (H3_TRANSFORMER_BOTH_RESIDENT and self._transformer_ref_loaded)
         )
 
-        if H3_LOWVRAM:
+        if H3_LOWVRAM_GROUP:
+            # Transformer is already resident (loaded/confirmed in the entry section
+            # above, via `_switch_to_variant` -> `_ensure_transformer` ->
+            # `_ensure_transformer_group`) -- unlike `H3_LOWVRAM=1`, group mode's
+            # transformer does not need to be deferred behind TE/vae headroom concerns,
+            # since its GPU footprint during any of these steps is tiny (no big matmuls
+            # run yet, and even once denoise starts only ~1-2 blocks are ever
+            # GPU-resident at once). So this can run keyframe/layout/latents/timesteps
+            # exactly like plain `bnb-4bit` t2va mode's own steady state (transformer +
+            # TE both already resident), for both t2va AND fl2va (unlike plain
+            # `bnb-4bit`, which routes fl2va through its own `is_fl2va` branch above
+            # specifically to defer the transformer's ~66GB/34GB load past the keyframe
+            # vae-encode step -- unnecessary here since the transformer was never a big
+            # *GPU* load in the first place).
+            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
+            _, state = keyframe_step(pipe, state)
+            if is_fl2va:
+                self._vae_to_cpu()
+
+            layout_step = MiniMaxH3PrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
+        elif H3_LOWVRAM:
             # fl2va's keyframe step (if any) runs here too, while TE is still resident
             # (harmless -- it only touches vae/scheduler, not TE) and `vae` is already
             # on GPU from the `is_fl2va` block above this function's setup section.
@@ -1725,6 +2123,9 @@ class MiniMaxH3Runner:
             denoise_wrapper.set_block_state(state, block_state)
         denoise_time = time.time() - t_denoise
 
+        if os.environ.get("H3_DEBUG_MEM_DIAG") == "1":
+            _log_gpu_tensor_diag("post-denoise, pre-decode (t2va)")
+
         # --- decode ---
         if progress:
             progress.update(phase="decoding", message="動画/音声をデコード中...")
@@ -1741,8 +2142,41 @@ class MiniMaxH3Runner:
         # around encode. `none` mode does not need this at all -- its vae is already
         # permanently resident and its transformer/TE never coexist in the first place,
         # so dropping the transformer here would only add pointless reload churn.
-        if TE_QUANT == "bnb-4bit":
+        # `H3_LOWVRAM_GROUP`: the transformer itself is left alone here (unlike every
+        # other bnb-4bit branch) -- the group-offloaded transformer's *actual* GPU
+        # footprint is already tiny (~1-2 blocks, ~1.4GB) regardless of decode's own
+        # VAE-pair trip, so there is no transformer-vs-vae headroom conflict to resolve
+        # here in the first place, and freeing it would mean paying its ~34GB CPU load +
+        # int8 quantize cost (~35-70s, see README) on every single request instead of
+        # once at process start -- exactly the per-request churn this mode's "load once,
+        # keep forever" design (see `_ensure_transformer_group`'s docstring) exists to
+        # avoid.
+        #
+        # TE-nf4 (~21GB) is a DIFFERENT story and DOES need to be freed here, force=True,
+        # even though `force_free_te` (computed above) is False for this mode: this was
+        # found, not assumed, via this task's own 32GB-ballast investigation using
+        # `_log_gpu_tensor_diag()` (H3_DEBUG_MEM_DIAG=1) -- the initial guess that a
+        # plain `empty_cache()` would be enough (reserved-but-idle allocator cache) was
+        # WRONG. The diagnostic showed only ~22.25GB of genuinely *live* (referenced)
+        # CUDA tensors at this point, dominated by two 1.556GB `(151936, 5120)` bf16
+        # tensors -- TE-nf4's own embedding table / tied lm_head weight (151936 = Qwen3
+        # tokenizer vocab size, 5120 = text_dim) -- i.e. TE-nf4's own ~21GB footprint
+        # (kept resident throughout group mode's t2va path, since `force_free_te` is
+        # False here) is the actual culprit, not fragmentation. TE-nf4(21GB) +
+        # decode-only peak(~16.3GB, measured directly via
+        # scripts/probe_vae_tile_size.py, and found NOT to shrink with a smaller VAE
+        # tile size -- the decode buffer's size is independent of spatial tiling) = 37GB,
+        # already over a 32GB-class card's budget before the group-offloaded
+        # transformer's own tiny footprint is even counted. Freeing TE for this decode
+        # window (and reloading it right after, mirroring the "restore steady state
+        # right before the next request needs it" shape `force_free_te`'s own reload
+        # already uses elsewhere in this file) is the fix -- same bounded "short window"
+        # pattern as every other TE/transformer cycle in this file, not a new pattern.
+        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_GROUP:
             self._free_transformer()
+        elif H3_LOWVRAM_GROUP:
+            with self._load_lock:
+                self._free_text_encoder(force=True)
         self._vae_to_gpu()
         t_decode = time.time()
         video_decode_step = MiniMaxH3VideoDecodeStep()
@@ -1778,7 +2212,7 @@ class MiniMaxH3Runner:
         # this mode keeps between requests. No-op in `none` mode (nothing was dropped
         # for decode in that mode).
         self._vae_to_cpu()
-        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM:
+        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
             with self._load_lock:
                 self._ensure_transformer(progress)
                 if force_free_te:
@@ -1789,6 +2223,18 @@ class MiniMaxH3Runner:
                     # (which needs headroom too, right after decode's own VAE trip) is not
                     # competing with a simultaneous TE reload for VRAM.
                     self._load_text_encoder(progress)
+        elif H3_LOWVRAM_GROUP:
+            # The transformer was never touched around decode in this mode (see the
+            # decode section's own comment), only TE-nf4 was force-freed there to make
+            # room for the vae pair -- reload it now to restore the
+            # transformer(group-offloaded)+TE-nf4 steady state this mode keeps between
+            # requests (unlike `H3_LOWVRAM=1` just below, this mode's transformer is
+            # cheap enough to always keep ready, so there is no reason to leave TE
+            # unloaded between requests either -- the *next* request needs TE first
+            # regardless of which big model "waits", and reloading it now means the next
+            # request does not pay TE's ~15-40s reload cost on its own critical path).
+            with self._load_lock:
+                self._load_text_encoder(progress)
         # H3_LOWVRAM: deliberately do NOT reload the transformer here. This mode's
         # steady state between requests is "nothing big resident" (see the H3_LOWVRAM
         # module comment) -- the *next* request needs TE first, not transformer, so
@@ -1826,7 +2272,7 @@ class MiniMaxH3Runner:
             "mode": mode,
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
-            "lowvram": H3_LOWVRAM,
+            "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
@@ -2031,8 +2477,47 @@ class MiniMaxH3Runner:
         # `_ensure_vaes`/`_load_text_encoder`), including the "already resident from a
         # previous ref2va request's steady state" case -- see that comment for the bug
         # this closes. Nothing more to free here; just bring vae onto GPU.
-        self._vae_to_gpu()
-        if H3_LOWVRAM:
+        if H3_LOWVRAM_GROUP:
+            # UPDATE (found via this task's own 32GB-ballast verification, after the
+            # original version of this branch -- which called `self._vae_to_gpu()`
+            # unconditionally above, before this `if`, mirroring the plain `bnb-4bit`
+            # branch below -- OOM'd right at that call): TE-nf4(21GB, still resident
+            # here) + vae pair(11GB) = 32GB already exceeds a 30GB-class card's budget
+            # on its own, *before* transformer_ref is even loaded -- a genuine
+            # TE-vs-vae conflict, unrelated to this mode's transformer choreography
+            # (which is why the original comment here, reasoning only about
+            # transformer_ref's tiny footprint, missed it). Prompt+reference text
+            # encoding (`MiniMaxH3Ref2VATextEncoderStep.encode_prompt`, a bare
+            # staticmethod call, not a block -- already ran above and does not need
+            # `_execution_device`) is TE's only job for this request, and it is
+            # already done by this point -- so TE can be freed here, before `vae` goes
+            # to GPU, same as generate()'s own decode-window fix. Safe ordering for
+            # `_execution_device` (resolved by `reference_encoder_step`/`layout_step`
+            # below, per `MiniMaxH3Ref2VABlocks`' component order `text_encoder, ...,
+            # vae, ..., transformer_ref`): free TE FIRST, then bring `vae` onto GPU --
+            # by the time `reference_encoder_step` runs, `text_encoder` is gone from
+            # the scan and `vae` is already GPU-resident, so `_execution_device`
+            # resolves to `vae`'s correct (GPU) location. The reverse order (`vae` to
+            # GPU while TE is still resident, then free TE) would also resolve
+            # correctly per the scan order, but freeing first avoids ever holding
+            # TE(21)+vae(11)=32GB at the same time even transiently.
+            with self._load_lock:
+                self._free_text_encoder(force=True)
+            self._vae_to_gpu()
+            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
+            _, state = reference_encoder_step(pipe, state)
+            self._vae_to_cpu()
+            with self._load_lock:
+                self._ensure_transformer_ref(progress)
+
+            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
+        elif H3_LOWVRAM:
+            self._vae_to_gpu()
             # Same `_execution_device` resolution trap as generate()'s own H3_LOWVRAM
             # branch (see its long comment): `vae` sits between `text_encoder` and
             # `transformer_ref` in `MiniMaxH3Ref2VABlocks`' component order, and stays a
@@ -2062,6 +2547,7 @@ class MiniMaxH3Runner:
                 self._free_text_encoder(force=True)
                 self._ensure_transformer_ref(progress)
         elif TE_QUANT == "bnb-4bit":
+            self._vae_to_gpu()
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
             self._vae_to_cpu()
@@ -2089,9 +2575,12 @@ class MiniMaxH3Runner:
             _, state = timesteps_step(pipe, state)
         else:
             # `none` mode: TE's job is done -- free it and bring in transformer_ref
-            # (vae is already permanently resident in this mode, so the reference
-            # encoder step can run either before or after; doing it here mirrors
-            # generate()'s own `none`-mode ordering for keyframes).
+            # (vae is already permanently resident in this mode, so `_vae_to_gpu()` is a
+            # no-op here -- see its own guard -- kept for parity with the original
+            # unconditional call this branch used to share with the others above; the
+            # reference encoder step can run either before or after transformer_ref,
+            # doing it here mirrors generate()'s own `none`-mode ordering for keyframes).
+            self._vae_to_gpu()
             with self._load_lock:
                 self._free_text_encoder()
                 self._ensure_transformer_ref(progress)
@@ -2143,7 +2632,12 @@ class MiniMaxH3Runner:
         # and never touched again for the rest of the request) sidesteps it entirely.
         # H3_LOWVRAM: always False here -- TE was already force-freed above, before
         # transformer_ref was even loaded (see the H3_LOWVRAM branch above).
-        force_free_te = TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM
+        # H3_LOWVRAM_GROUP: always False here too -- transformer_ref's tiny actual GPU
+        # footprint never needed TE force-freed to make room for it in the first place
+        # (see the H3_LOWVRAM_GROUP branch above).
+        force_free_te = (
+            TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_ANY
+        )
         if force_free_te:
             with self._load_lock:
                 self._free_text_encoder(force=True)
@@ -2205,8 +2699,25 @@ class MiniMaxH3Runner:
         # dropped here in this mode; it is left alone (stays resident straight through
         # decode and into the next request, which is the whole point of int8 mode for
         # ref2va<->ref2va requests specifically).
-        if TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT:
+        # H3_LOWVRAM_GROUP: `transformer_ref` is left alone here -- same reasoning as
+        # generate()'s own decode section (a group-offloaded transformer_ref's actual
+        # GPU footprint never conflicted with the vae pair's headroom in the first
+        # place). TE-nf4 DOES need force-freeing here though, for the same reason found
+        # by this task's own 32GB-ballast diagnostic against generate()'s t2va path (see
+        # that decode section's own comment for the full `_log_gpu_tensor_diag()`
+        # investigation): TE-nf4's own ~21GB is real, live, referenced memory, not
+        # reclaimable via `empty_cache()` alone, and it is not needed by either decode
+        # step (MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep only touch
+        # vae/audio_vae/video_processor). `force_free_te` was already True and did the
+        # force-free earlier in this method (before denoise, per its own definition
+        # above) in the non-group-mode branches, but H3_LOWVRAM_GROUP always has
+        # `force_free_te=False` (transformer_ref's tiny footprint never needed it
+        # before denoise) -- so it has to be freed here, at decode, instead.
+        if TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
             self._free_transformer_ref()
+        elif H3_LOWVRAM_GROUP:
+            with self._load_lock:
+                self._free_text_encoder(force=True)
         self._vae_to_gpu()
         t_decode = time.time()
         video_decode_step = MiniMaxH3VideoDecodeStep()
@@ -2236,7 +2747,7 @@ class MiniMaxH3Runner:
         torch.cuda.empty_cache()
 
         self._vae_to_cpu()
-        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM:
+        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
                 if force_free_te:
@@ -2261,6 +2772,16 @@ class MiniMaxH3Runner:
                     # so it is not competing with them for VRAM during their own
                     # reloads.
                     self._ensure_transformer(progress)
+        elif H3_LOWVRAM_GROUP:
+            # `transformer_ref` was force-freed unconditionally at this method's entry
+            # (see the entry-section comment) and is not reloaded here -- ref2va never
+            # keeps a cross-request transformer_ref steady state in this mode (matches
+            # plain bnb-4bit's own non-both-resident choice). TE-nf4 is reloaded though,
+            # for the same reasoning as generate()'s own t2va decode tail: the next
+            # request (t2va or ref2va) needs TE first regardless, so restoring it now
+            # avoids paying its reload cost on that request's own critical path.
+            with self._load_lock:
+                self._load_text_encoder(progress)
         # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
         # "nothing big resident between requests" reasoning as generate()'s own
         # lowvram decode tail.
@@ -2294,7 +2815,7 @@ class MiniMaxH3Runner:
             "mode": "ref2va",
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
-            "lowvram": H3_LOWVRAM,
+            "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,

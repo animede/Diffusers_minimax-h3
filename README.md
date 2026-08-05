@@ -283,6 +283,198 @@ TE-nf4(21GB)+ transformer int8(34GB)= 55GB は48GB級カードでは同時常駐
   int8の直列化保存も同様に未検証。今回はリクエストごとの固定費 ~90-100s
   (TEロード+transformerロード)をそのまま許容する設計とした)。
 
+## 24〜32GB級VRAM対応 (`H3_LOWVRAM=group`、2026-08-05追加)
+
+`H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、
+24〜32GB級カードでは transformer 単体でも収まらない。`H3_LOWVRAM=group` は
+diffusers-server(姉妹プロジェクト)の CLAUDE.md #33/#34/#37 で確立された
+「block-level group offload」パターンをこのプロジェクトに移植したもので、transformer を
+**ホストRAMに常駐**させたまま、denoise の各ステップで必要なブロック(50層中1〜2層、
+~0.68GB×1〜2)だけを都度 GPU へ出し入れする。transformer は**プロセス起動時に一度だけ
+ロードされ、リクエストをまたいで常駐し続ける**(`H3_LOWVRAM=1` のような毎リクエスト
+再ロードは発生しない)。
+
+### PR側の「streamed offload時のload-time量子化」調査結果
+
+タスク時点で読んだ `TorchAoHfQuantizer`(`quantizers/torchao/torchao_quantizer.py`)の
+`validate_environment()` は、`device_map` に(accelerateの自動割当のような)**辞書**
+形式で `"cpu"` という**文字列値**が含まれる場合にのみ `self.offload = True` を立て、
+`check_if_quantized_param()` はこのフラグが立っていると CPU 配置のパラメータの量子化を
+スキップする(=CPUオフロードするパラメータは意図的に非量子化のまま残す設計)。
+一方、本実装が使う `device_map={"transformer": "cpu"}` は `load_components()` を経由して
+最終的に `from_pretrained()` に**プレーン文字列** `"cpu"` として渡り、
+`modeling_utils.py` の正規化コードにより `{"": torch.device("cpu")}` という
+**単一キーの辞書**(値は `torch.device` オブジェクト、文字列ではない)に変換される。
+`torch.device("cpu") == "cpu"` は Python 上で `False` になるため、
+`"cpu" in device_map.values()` は False のまま保たれ、`self.offload` は立たない。
+つまり **CPU上へロードしても量子化はスキップされず、torchaoのInt8Tensorとして
+正しく量子化される**(`scripts/probe_group_offload.py` で370/370層がInt8Tensor化
+されることを実機確認)。**CPU上でのint8量子化は問題なく可能**という結論。
+
+### 実装の要点
+
+- `_ensure_transformer_group()`(`core/runner.py`)が
+  `device_map={"transformer": "cpu"}` + `TorchAoConfig(Int8WeightOnlyConfig)` で
+  CPU上に量子化ロードしてから `enable_group_offload(offload_type="block_level",
+  num_blocks_per_group=1, use_stream=..., low_cpu_mem_usage=...)` を呼ぶ
+  (transformer_refも同型の `_ensure_transformer_ref_group()`)。
+- TEは `H3_LOWVRAM=1` と同じくbnb-4bit必須(起動時強制)。t2vaの定常状態では
+  TEはリクエストをまたいで常駐する(transformerがそもそも常駐するため、
+  TEも常駐させておいた方がリクエストごとの再ロードコストを避けられる)。
+
+### 【重大な発見】`use_stream=True` + `low_cpu_mem_usage=True`(diffusers既定)は
+torchao Int8Tensorに対してバグがあり動かない
+
+`scripts/probe_group_offload_forward.py` で実際にforwardを走らせたところ、
+`RuntimeError: cannot pin 'torch.cuda.CharTensor' only dense CPU tensors can be
+pinned` で denoise の最初のブロックで必ず失敗することを実機確認した。
+`hooks/group_offloading.py` の `_pinned_memory_tensors()`(`use_stream=True`なら
+`_onload_from_memory()` から毎ステップ無条件で呼ばれる)が
+`low_cpu_mem_usage`の値に関わらず `.pin_memory()` を試みるのに対し、
+`_init_cpu_param_dict()`(`enable_group_offload()`呼び出し時点で1回だけ実行)は
+`low_cpu_mem_usage=True` なら pin をスキップする、という非対称な実装になっており、
+両者の想定が食い違っている。torchaoの `Int8Tensor.qdata` はこの食い違いが起きると
+壊れた状態(内部的に `torch.cuda.CharTensor` として認識される)でpin_memory()が
+呼ばれてクラッシュする。`scripts/probe_group_offload_fix.py` で対照実験した結果:
+
+| 設定 | 結果 | 1ブロックあたりonload/offload |
+|---|---|---|
+| `use_stream=True, low_cpu_mem_usage=True`(diffusers既定) | **クラッシュ** | - |
+| `use_stream=False, low_cpu_mem_usage=True` | 動作OK | onload 0.1-0.26s / offload ~0.22s |
+| `use_stream=True, low_cpu_mem_usage=False` | 動作OK | **onload 0.04-0.07s** / offload ~0s |
+
+`low_cpu_mem_usage=False`(`enable_group_offload()`呼び出し時点で全パラメータを
+eagerにpin)を新既定に採用した(`H3_GROUP_OFFLOAD_LOW_CPU_MEM`、既定`0`=False)。
+理由: onloadが4-5倍速い(pinned memoryはページアウト不可でDMA転送が速いため)。
+代償はロード時に追加で~14-16GBのホストRAMをpinする(page-lockedなのでスワップ
+不可)ことと、`enable_group_offload()`自体が約22秒かかること(実機測定、
+CPU上へのロード70秒 + pin化22秒 = 合計約90秒)。より少ないRAMを優先したい場合は
+`H3_GROUP_OFFLOAD_LOW_CPU_MEM=1`(このとき`H3_GROUP_OFFLOAD_USE_STREAM`も
+明示指定しない限り自動で`0`にフォールバックする、上記の壊れる組み合わせを
+避けるため)を明示指定すればよい。
+
+### choreography最終形(フェーズ×常駐物×ピーク)
+
+| フェーズ | 常駐する大きいもの | 備考 |
+|---|---|---|
+| 起動時preload | transformer(int8, CPU常駐+groupoffloadフック) | 約90秒(CPUロード70s+pin化22s) |
+| t2va encode | TE-nf4(GPU,21GB) + transformer(CPU) | |
+| t2va denoise | TE-nf4(GPU,21GB) + transformerの1-2ブロック(GPU,~1.4GB) | |
+| t2va decode | vaeペア(GPU,~11GB) + transformerの1-2ブロック | **TEはこの窓だけ強制解放**(下記参照)、decode後に再ロード |
+| ref2va参照エンコード | vaeペア(GPU,11GB) | TEはこの窓だけ強制解放(下記参照) |
+| ref2va denoise | TE-nf4(GPU,21GB) + transformer_refの1-2ブロック | |
+| リクエスト間定常 | transformer(CPU) + TE-nf4(GPU) | ref2va後はtransformer_refが未ロードに戻る(t2va↔ref2va切替のたび再ロード) |
+
+### 【実装中に発見・修正した2つ目のバグ】decode窓・参照エンコード窓でのTE強制解放が必要だった
+
+当初「group offloadされたtransformerのGPU実消費は極小(~1.4GB)だから、decode時に
+transformerを解放する必要は無い」と設計したが、32GBダミーVRAM検証で
+`CUDA out of memory` を実機再現し、`_log_gpu_tensor_diag()`
+(`H3_DEBUG_MEM_DIAG=1`で有効化する一時診断関数、`core/runner.py`に残置)で
+実際に生存しているCUDAテンソルを列挙したところ、TE-nf4自身の埋め込みテーブル/
+lm_head重み(shape `(151936, 5120)`、bf16、1.556GB×2 = 3.1GB強を含む合計22.25GB)が
+デコード直前まで**常駐したまま**だったことが判明した(`empty_cache()`だけでは
+解放されない、実際に参照されている生きたテンソルだったため)。つまり
+TE-nf4(21GB)+ decode専用バッファ(~16.3GB、下記VAEタイル調査参照)=37GBが
+真の必要量で、transformerのフットプリントとは無関係にTEとVAEの競合だった。
+対策: **decode窓(と、ref2vaの参照VAEエンコード窓)でTEを強制解放し、窓を抜けたら
+再ロードする**(`force_free_te`とは別枠の専用ロジック、`_execution_device`解決順序
+はTE解放→vaeをGPUへ、の順で安全性を確保)。
+
+### MD5一致チェックの結果
+
+同一seed(768²・5秒・30steps・キツネのプロンプト、seed=12345)で、通常int8モード
+(`H3_LOWVRAM`未指定、`H3_TRANSFORMER_QUANT=int8`、FBC `H3_CACHE=fbc`有効)の
+出力と `H3_LOWVRAM=group` の出力を比較したところ、**FBCのキャッシュスキップ判定が
+実行経路の違いで異なった**(`cache_skipped_steps`が6→0)ため素朴な比較ではmp4が
+不一致だった。FBCは前ステップとの残差の類似度という数値的に鋭敏な判定のため、
+数学的に等価な演算でも経路が変わればスキップ判定が変わりうる(劣化ではない)。
+両モードとも `H3_CACHE=none` に揃えて再比較したところ、**mp4がバイト完全一致
+(md5一致)**することを確認した。group offloadの計算内容は既存経路と数学的に
+同一であることの裏付け。
+
+### 計測表: 32GB制限・24GB制限プローブ
+
+**32GB制限**(ダミーVRAM確保で空きを~30GBへ制限、`H3_CACHE=fbc`有効のまま):
+
+| | 完走 | ピークVRAM | 所要時間 |
+|---|---|---|---|
+| t2va 1本目(768²・5秒・30steps) | ○ | **28.67GB** | denoise 220.79s / decode 6.31s / 総計337.19s(TE初回ロード込み) |
+| t2va 2本目(連続) | ○ | **28.23GB** | denoise 220.85s / decode 6.01s / 総計278.83s(TE常駐のため短縮) |
+| ref2va(画像参照1枚、768×1344) | **RAM不足で拒否**(下記参照) | - | - |
+
+2本とも1本目と完全に同一mp4(md5一致、`be3f32a84de074990208ad0d30f31a63`)。
+ホストRAM/スワップは各フェーズとも増加なし(`free -g`のSwap usedは作業前後とも
+~7-8GB台で安定、この値は他プロセス由来の既存分)。
+
+**24GB制限プローブ**(ダミーVRAM確保で空きを~22GBへ制限):
+
+- 768²: denoise中(transformerブロックのonload)でOOM。実消費21.85GB、うち
+  TE-nf4だけで21GB。**TE-nf4自体の固定サイズ(21GB)が22GB予算の大半を占め、
+  transformerブロック1個分(~148MB)の追加onloadすら入らない**。
+- 544×960(RESOLUTION_PRESETSへ一時追加して検証、検証後に削除済み): **同一箇所・
+  同一21.85GBでOOM**。解像度を下げても失敗点も消費量も変わらず、**VAEタイル
+  縮小と同じく「解像度に依存しない固定コストが律速」であることを確認**
+  (下記VAEタイル調査参照)。
+- **結論**: 現行アーキテクチャ(TEをbnb-4bit・常時ほぼ常駐という設計)では、
+  TE-nf4単体の21GBが24GB級カードの実効予算(~22GB)の大半を占めてしまい、
+  どんな解像度でも成立しない。24GB級に対応するには、TEをdenoise中は解放する
+  (`H3_LOWVRAM=1`的な設計に戻す)か、TE自体をさらに軽量化する(GGUF等、ただし
+  transformers系モデルへのGGUF適用は構造的に困難)必要がある。本タスクの
+  スコープ外(48GB→24-32GB対応が目的で24GBは探索的プローブ)のため、
+  現時点では未対応と結論する。
+
+### VAE tiling調査結果
+
+`scripts/probe_vae_tile_size.py` で768²・124フレームのVAE decodeを単体で
+(denoiseを介さず合成潜在から)直接ベンチマークしたところ、
+**tile_sample_min_height/width を256(既定)→192→128→96まで縮小しても
+ピークVRAM(16.29GB)が全く変化しなかった**(所要時間はタイル数が増える分
+5.9s→10.5sへ悪化)。この結果から、decodeのピークは空間タイルの合成バッファでは
+なく、**時間チャンク(`tokens_chunk_size`単位)の1チャンク分をまるごとデコード
+するバッファ**か、固定的なVAEアーキテクチャのオーバーヘッドに支配されていると
+推測される(VAEクラスは時間方向のチャンクサイズを公開パラメータとして持たない
+ため、これ以上の調整はコード変更が必要で本タスクの範囲外)。
+**結論: 24-32GB級対応において空間タイルサイズの調整は無意味**(既定のままでよい)。
+
+### FBC/sage共存の確認結果
+
+全てのballast検証(32GB・24GB双方)を通じて `H3_CACHE=fbc`(既定)・
+`H3_ATTN_BACKEND=sage`(既定)を有効にしたまま実行し、group offloadのフックと
+競合するエラーは一切発生しなかった(FBCはブロック単位の計算スキップ判定、
+group offloadはブロックのGPU常駐管理、sageは各ブロック内部のattention実装、と
+三者は独立したレイヤーで動作するため)。MD5一致チェック(`H3_CACHE=none`で
+実施)とは別に、既定のFBC有効設定での通し実行(32GB制限のt2va 2本)が完走した
+ことも確認済み。
+
+### Ref2VAのRAM制約(既知の制限、未解決)
+
+`H3_LOWVRAM=group` でt2va実行後にref2vaを呼ぶと、VRAM予算に関わらず(96GB機で
+ダミーVRAM確保無しでも再現)ホストRAMガードで拒否されることを実機確認した:
+
+```
+H3_LOWVRAM=group requires at least 40.0GB of available host RAM before loading
+the (~34GB, permanently CPU-resident) int8 transformer, but only 33.0GB is
+available right now.
+```
+
+原因の切り分け: transformer解放直後は`avail_gb`が正しく回復する(44.6GB前後)が、
+その後のTE再ロード→参照VAEエンコード→レイアウト計算の過程で`avail_gb`が
+33GB前後まで下がる(実機ログで確認)。`swap_used_gb`は一貫して増加しないため
+実際のスワップ発生は無い ─ `MemAvailable`(Linuxのbuff/cache込みヒューリスティック
+推定値)の変動が、真の空きRAMより保守的に振れている可能性が高い。ただし
+`free -g`の`used`ベースで見ても94GB中62GB使用(32GB残)という状況で
+追加34GBの確保は本質的にタイトであり、ガード自体が誤りとは断定できなかった
+(96GB機でも「t2va transformerを常駐させたままref2va用transformer_refをさらに
+CPUへpinしようとする」設計そのものが、94GB RAM機の物理容量に対してすでに
+ギリギリ)。**安全側に倒し、ガードを緩めることはせず既知の制限として記録する**
+(過去のスワップ暴走事故の教訓を優先)。将来の改善候補: `preload_all()`での
+transformer即時ロードをやめてTEと同様に遅延ロード化する(初回リクエストの
+レイテンシとのトレードオフ)、またはt2va⇔ref2va切替時によりRAMを消費しない
+経路を設計する。**RAM 48GB以上のマシンでは(未検証だがRAM予算に余裕があるため)
+この問題は起きない可能性が高い**(本タスクは94GB機でのみ検証、より多いRAM
+搭載機での追試は未実施)。
+
 ## Ref2VA (オムニ参照生成、`/api/ref2va`)
 
 順序付きの参照素材(**画像最大9・動画最大3・音声最大3、合計12**。音声単独は不可)から
