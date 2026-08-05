@@ -171,6 +171,29 @@ ComfyUIコミュニティの MiniMaxH3_LatentUpscaler と同系の hires-fix。�
   作り直す。ModularPipeline の `_execution_device` はコンポーネント登録順の先頭モジュール
   で決まるため、TE解放後は `components.transformer.device` を明示的に使う
   (diffusers-server CLAUDE.md 23番・47番と同型の罠)。
+## transformer int8量子化 (`H3_TRANSFORMER_QUANT`、既定 `none`)
+
+`H3_TRANSFORMER_QUANT=int8` で transformer / transformer_ref を torchao
+(`Int8WeightOnlyConfig(version=2)`、PR #14355ドキュメントのレシピ、torchao 0.17.0)で
+int8化する。66.3GB → 34.0GB。品質は目視同等(PSNR 19dBは軌道分岐であり劣化ではない。
+int8同士は同一seedでmp4バイト一致の完全決定論)、デノイズは+5s程度(dequantコスト)。
+
+**int8時は両transformer同時常駐**(34+34+TE-nf4 21=~89GB)になり、ref2va⇔t2vaの
+変種切替時の66GB級再ロードが消える(初回のref2vaのみ~36sのコールドロード)。実測:
+
+| | bf16(既定) | int8両常駐 |
+|---|---|---|
+| t2va | 175-185s / peak 92.1GB | 177-196s / peak 59.7-91.1GB |
+| ref2va(2回目以降) | 523s / peak 87.6GB | **463-471s / peak 74.5GB** |
+| 変種切替の再ロード | 毎回~26-40s | **なし** |
+
+フェーズ制御(int8両常駐時): t2vaデノイズ前は transformer_ref 常駐時のみTE強制解放
+(89GB定常+activationsでOOMするため。実機確認)、ref2vaはTE強制解放不要になり
+デコード窓も transformer_ref 常駐のまま通る。`PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True` をrunnerが設定(int8ロード/解放サイクルの断片化で
+「54GBしか使っていないのに15GB確保失敗」が実機再現したため。diffusers-serverでも
+実績のある設定)。既定 `none` は従来とバイト一致(回帰確認済み)。
+
 ## Ref2VA (オムニ参照生成、`/api/ref2va`)
 
 順序付きの参照素材(**画像最大9・動画最大3・音声最大3、合計12**。音声単独は不可)から

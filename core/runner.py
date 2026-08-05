@@ -82,6 +82,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+# Must be set before `import torch` (PyTorch reads it once, at CUDA-allocator init
+# time). Reproduced by this task's own verification: in H3_TRANSFORMER_QUANT=int8 +
+# H3_TRANSFORMER_BOTH_RESIDENT mode, repeated int8 transformer/transformer_ref
+# load+free cycles (the decode-window drop/reload pattern used throughout this file)
+# left the allocator holding ~37GB reserved-but-unallocated in odd-sized fragments --
+# a *second* ref2va request's post-decode `transformer` reload then failed inside
+# `from_pretrained`'s `_caching_allocator_warmup` ("Tried to allocate 15.43 GiB" with
+# only 54.44GB actually allocated out of 92.55GB in use), even though the *total*
+# resident budget (transformer_ref 34 + TE-nf4 21 + transformer 34 = 89GB) was well
+# within this card's ~95.6GB -- a fragmentation failure, not an over-budget one.
+# `expandable_segments:True` lets the allocator grow/shrink a single virtual-address
+# reservation instead of caching many fixed-size blocks, which is the fix PyTorch's own
+# OOM error message suggests for exactly this "reserved but unallocated memory is
+# large" symptom. This card's ~95.6GB-vs-89GB steady-state headroom is tight enough
+# (see H3_TRANSFORMER_BOTH_RESIDENT's module-level comment) that this project needs it
+# unconditionally now, not just as an opt-in workaround -- so it is set here rather
+# than left for the operator to export before launching uvicorn (bf16/none mode is
+# unaffected either way: it never has this file's tightest headroom margins).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 from PIL import Image
@@ -135,11 +155,27 @@ if H3_TRANSFORMER_QUANT not in ("none", "int8"):
 # Upstream PR #14355's documented int8 recipe for the MiniMax-H3 transformer: skip
 # quantizing these modules (small, and/or numerically sensitive input/output
 # projections rather than the bulk attention/MLP weight that dominates the 66GB).
+# Applied identically to `transformer` and `transformer_ref` -- both are the exact same
+# `MiniMaxH3Transformer3DModel` class/config (see `_enable_fbc_ref`'s docstring: their
+# config.json files are byte-identical in the downloaded snapshot), so there is no
+# reason for the quantization recipe to differ between them.
 H3_INT8_MODULES_TO_NOT_CONVERT = [
     "proj_in", "audio_proj_in", "context_embedder",
     "time_embedder", "time_proj", "token_refiner",
     "norm_out", "proj_out", "audio_proj_out",
 ]
+
+# int8 shrinks each big transformer from ~66.3GB (bf16) to ~34.0GB (measured, see
+# logs/server_int8.log), so transformer(34.0) + transformer_ref(~34, same recipe) +
+# TE-nf4(21.0) = ~89GB steady state fits (barely -- ~6.6GB headroom) in this card's
+# ~95.6GB. In this mode both big transformers stay GPU-resident permanently once
+# loaded (loaded lazily, on first use of each variant), eliminating the ~62GB-class
+# free+reload (~26-40s) that a t2va<->ref2va switch previously incurred every time in
+# `none`/bf16 mode (see `_switch_to_variant`/`_free_other_variant_transformer`, both
+# skip freeing the other variant's transformer when this is True). Only meaningful
+# together with `H3_TRANSFORMER_QUANT=int8`; bf16 mode (~66.3GB each) cannot fit both
+# at once and keeps the existing one-resident-at-a-time behaviour unchanged.
+H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
 
 # Two-pass hires-fix (see generate(..., upscale=1)): fraction of the *sigma schedule*
 # (not step count) that pass 2 (high-res) is responsible for finishing. E.g. 0.35 with
@@ -454,6 +490,14 @@ class MiniMaxH3Runner:
         """
         self._ensure_pipe_shell()
         if self._transformer_loaded:
+            # int8 both-resident mode: this can be a "just mark it active again" call
+            # (transformer already resident, transformer_ref was the one last used) --
+            # `_switch_to_variant`'s early-return check reads `_active_variant` alongside
+            # the loaded flags, so this must still update it even on the cached-return
+            # path, or a t2va request right after a ref2va one would leave
+            # `_active_variant == "ref2va"` despite `transformer` being the one actually
+            # about to be used for denoising.
+            self._active_variant = "t2va"
             return
         if TE_QUANT != "bnb-4bit":
             # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM.
@@ -478,6 +522,25 @@ class MiniMaxH3Runner:
         else:
             self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
             self._pipe.transformer.to(DEVICE)
+        # `ModularPipeline.load_components()` swallows the underlying exception
+        # internally (`modular_pipeline.py`'s `try/except Exception: ... logger.warning
+        # (...); continue` around each component's `spec.load()`) and does NOT
+        # re-raise -- a failed load (e.g. CUDA OOM inside `from_pretrained`) just logs a
+        # warning and leaves `self._pipe.transformer` unset, with no exception for this
+        # method to catch. Reproduced during this task's own verification: an int8-mode
+        # OOM inside `from_pretrained`'s `_caching_allocator_warmup` (a fragmentation
+        # issue, not an over-budget one -- "Tried to allocate 15.43 GiB" with the
+        # allocator already holding 37GB reserved-but-unallocated) surfaced only as a
+        # confusing `AttributeError: 'NoneType' object has no attribute 'enable_cache'`
+        # three lines below, with `self._transformer_loaded` about to be wrongly marked
+        # `True` for a component that was never actually loaded. Checking explicitly
+        # here turns that into a clear, correctly-attributed error instead.
+        if getattr(self._pipe, "transformer", None) is None:
+            raise RuntimeError(
+                "transformer load failed (see the diffusers 'Failed to create component "
+                "transformer' warning above for the underlying error, often CUDA OOM) -- "
+                "self._pipe.transformer is still None after load_components()."
+            )
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_CACHE == "fbc":
@@ -537,28 +600,70 @@ class MiniMaxH3Runner:
     # ref2va transformer_ref lifecycle (mirrors transformer's, above)
     # ------------------------------------------------------------------
     def _ensure_transformer_ref(self, progress: ProgressState | None = None):
-        """Load the 66GB bf16 transformer_ref to GPU, onto the ref2va pipe shell.
+        """Load the transformer_ref (66GB bf16, or ~34GB int8-quantized -- see
+        `H3_TRANSFORMER_QUANT`) to GPU, onto the ref2va pipe shell.
 
-        `transformer` and `transformer_ref` are each ~66.3GB bf16 and cannot coexist in
-        this card's ~96GB (same one-big-model-at-a-time constraint the t2va/fl2va path
-        already enforces between TE and transformer, in `none` mode). Callers must go
-        through `_switch_to_variant("ref2va")` rather than calling this directly, so the
-        t2va transformer is freed first when it is the one resident -- this method itself
-        only handles the transformer_ref side of that swap.
+        bf16 mode: `transformer` and `transformer_ref` are each ~66.3GB and cannot
+        coexist in this card's ~96GB (same one-big-model-at-a-time constraint the
+        t2va/fl2va path already enforces between TE and transformer, in `none` TE mode).
+        Callers must go through `_switch_to_variant("ref2va")` rather than calling this
+        directly, so the t2va transformer is freed first when it is the one resident --
+        this method itself only handles the transformer_ref side of that swap.
+
+        int8 mode (`H3_TRANSFORMER_BOTH_RESIDENT`): both transformers fit at once
+        (~34GB each), so `transformer` is left alone here -- this is called directly by
+        `generate_ref2va()` without going through `_switch_to_variant`/
+        `_free_other_variant_transformer` in that mode (see those methods' docstrings).
+
+        int8 quantization uses the exact same recipe as `_ensure_transformer` (same
+        model class/config, see `H3_INT8_MODULES_TO_NOT_CONVERT`'s comment).
         """
         self._ensure_pipe_ref_shell()
         if self._transformer_ref_loaded:
+            # See `_ensure_transformer`'s matching comment: must update
+            # `_active_variant` even on the cached-return path, for int8 both-resident
+            # mode's `_switch_to_variant` early-return check.
+            self._active_variant = "ref2va"
             return
         if progress:
             progress.update(phase="loading_transformer", message="transformer_ref (ref2va) をロード中...")
         t0 = time.time()
-        self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16)
-        self._pipe_ref.transformer_ref.to(DEVICE)
+        if H3_TRANSFORMER_QUANT == "int8":
+            from diffusers import TorchAoConfig
+            from torchao.quantization import Int8WeightOnlyConfig
+
+            quant_config = TorchAoConfig(
+                Int8WeightOnlyConfig(version=2),
+                modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+            )
+            self._pipe_ref.load_components(
+                names=["transformer_ref"],
+                dtype=torch.bfloat16,
+                quantization_config={"transformer_ref": quant_config},
+                device_map={"transformer_ref": "cuda"},
+            )
+        else:
+            self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16)
+            self._pipe_ref.transformer_ref.to(DEVICE)
+        # See `_ensure_transformer`'s matching check/comment: `load_components()` does
+        # not re-raise on a failed component load (e.g. CUDA OOM), it only logs a
+        # warning and leaves the attribute unset -- verify explicitly rather than let a
+        # `None` transformer_ref surface later as a confusing AttributeError.
+        if getattr(self._pipe_ref, "transformer_ref", None) is None:
+            raise RuntimeError(
+                "transformer_ref load failed (see the diffusers 'Failed to create "
+                "component transformer_ref' warning above for the underlying error, "
+                "often CUDA OOM) -- self._pipe_ref.transformer_ref is still None after "
+                "load_components()."
+            )
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
         if H3_CACHE == "fbc":
             self._enable_fbc_ref()
-        logger.info("transformer_ref loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
+        logger.info(
+            "transformer_ref loaded to GPU in %.1fs (quant=%s). gpu=%s ram=%s",
+            time.time() - t0, H3_TRANSFORMER_QUANT, gpu_mem_gb(), ram_gb(),
+        )
 
     def _enable_fbc_ref(self):
         """Attach FirstBlockCache hooks to the (freshly loaded) transformer_ref.
@@ -605,16 +710,25 @@ class MiniMaxH3Runner:
         """Free the *other* variant's big transformer (if resident) so this request's own
         variant has room to load its own -- without loading anything itself.
 
-        `transformer`/`transformer_ref` are each ~66.3GB and never coexist in this card's
-        ~96GB. This is split out from actually loading `variant`'s own transformer (see
-        `_switch_to_variant`'s docstring for why) so a caller can free the other side
-        early -- before a vae-heavy encode step that itself needs headroom -- and defer
-        its own ~66.3GB load until after that step, mirroring the ordering `generate()`
-        already uses for the fl2va keyframe-encode-then-transformer-load sequence.
-        Idempotent: a no-op when the other variant's transformer was not resident.
+        bf16 mode: `transformer`/`transformer_ref` are each ~66.3GB and never coexist in
+        this card's ~96GB. This is split out from actually loading `variant`'s own
+        transformer (see `_switch_to_variant`'s docstring for why) so a caller can free
+        the other side early -- before a vae-heavy encode step that itself needs
+        headroom -- and defer its own ~66.3GB load until after that step, mirroring the
+        ordering `generate()` already uses for the fl2va keyframe-encode-then-
+        transformer-load sequence. Idempotent: a no-op when the other variant's
+        transformer was not resident.
+
+        int8 mode (`H3_TRANSFORMER_BOTH_RESIDENT`): a deliberate no-op. Both
+        transformers fit in VRAM at once (~34GB each + TE-nf4 21GB = ~89GB steady
+        state), so there is no "other variant" to evict any more -- this is the whole
+        point of int8 mode, eliminating the ~62GB-class free+reload a t2va<->ref2va
+        switch previously required every time.
         """
         if variant not in ("t2va", "ref2va"):
             raise ValueError(f"variant must be 't2va' or 'ref2va', got {variant!r}")
+        if H3_TRANSFORMER_BOTH_RESIDENT:
+            return
         if variant == "ref2va":
             self._free_transformer()
         else:
@@ -644,10 +758,21 @@ class MiniMaxH3Runner:
         `_free_other_variant_transformer`/`_ensure_transformer_ref` this method is built
         from, just not fused into one call for that path. Kept for `generate()`'s t2va
         entry point, where the fused "free other + load mine now" shape is safe.
+
+        int8 mode (`H3_TRANSFORMER_BOTH_RESIDENT`): `_free_other_variant_transformer` is
+        a no-op (see its docstring), so this degrades to "load `variant`'s transformer
+        if not already resident, and update `_active_variant`" -- both transformers
+        end up loaded (lazily, on each one's first use) and stay loaded from then on.
+        `_active_variant` still tracks "most recently used" in this mode: it is read by
+        the decode-window drop/reload logic in `generate()`/`generate_ref2va()`, which
+        (even in int8 mode) still drops the *just-used* transformer for the short decode
+        window to make room for the VAE pair -- see those methods' decode sections.
         """
         if variant not in ("t2va", "ref2va"):
             raise ValueError(f"variant must be 't2va' or 'ref2va', got {variant!r}")
-        if self._active_variant == variant:
+        if self._active_variant == variant and (
+            self._transformer_loaded if variant == "t2va" else self._transformer_ref_loaded
+        ):
             return
         t0 = time.time()
         self._free_other_variant_transformer(variant)
@@ -782,6 +907,12 @@ class MiniMaxH3Runner:
             "transformer_loaded": self._transformer_loaded,
             "pipe_ref_built": self._pipe_ref is not None,
             "transformer_ref_loaded": self._transformer_ref_loaded,
+            # True once both big transformers are simultaneously GPU-resident (only
+            # possible in H3_TRANSFORMER_QUANT=int8 mode, see H3_TRANSFORMER_BOTH_RESIDENT) --
+            # i.e. the t2va<->ref2va switch cost has actually been eliminated for the
+            # *current* process, not just "the flag that requests it is set".
+            "both_transformers_resident": self._transformer_loaded and self._transformer_ref_loaded,
+            "transformer_both_resident_mode": H3_TRANSFORMER_BOTH_RESIDENT,
             "active_variant": self._active_variant,
             "vae_loaded": self._vae_loaded,
             "vae_on_gpu": self._vae_on_gpu,
@@ -1124,6 +1255,23 @@ class MiniMaxH3Runner:
         # decode section below) is the same one-way "short window" pattern the transformer
         # already uses around the decode step in this mode -- not a standing swap.
         #
+        # int8 both-resident mode (`H3_TRANSFORMER_BOTH_RESIDENT`): force-free TE-nf4
+        # here too, but ONLY when `transformer_ref` also happens to be resident right
+        # now (i.e. a ref2va request has run at some point in this process's life).
+        # Reproduced by this task's own verification, exactly the OOM this comment
+        # predicts: transformer(34) + transformer_ref(34) + TE-nf4(21) = ~89GB measured
+        # as 90.84GB allocated (steady state, see `status()`'s `allocated_gb`) left only
+        # ~4-6GB of headroom, and t2va's own denoise activations (measured ~4.9GB peak
+        # over the transformer+TE-only 55GB baseline in this same task's test 1, i.e.
+        # the *same* activation footprint t2va always had) pushed it over: "Tried to
+        # allocate 1.16 GiB" with 92.05GB already in use, ~1.2GB free. When
+        # `transformer_ref` is NOT resident (fresh process, or this process has never
+        # served a ref2va request yet), this is unnecessary churn -- t2va's own resident
+        # set is just transformer(34) + TE-nf4(21) = 55GB, the same safe budget it always
+        # ran at before this task (see test 1's 59.71GB peak, well under 95.6GB).
+        # Reloaded after decode, below -- same "restore the steady state for the next
+        # request" shape the pre-existing `do_upscale` force_free_te reload uses.
+        #
         # IMPORTANT: this free is deliberately deferred until *after* layout_step/
         # latents_step/timesteps_step below, not done here alongside the transformer load.
         # `MiniMaxH3ModularPipeline._execution_device` (used by all three of those blocks)
@@ -1137,7 +1285,9 @@ class MiniMaxH3Runner:
         # once those position_ids/layout tensors already exist on the correct device (set
         # once, from the layout step, and never touched again) sidesteps the whole
         # resolution question for the rest of the request.
-        force_free_te = do_upscale and TE_QUANT == "bnb-4bit"
+        force_free_te = TE_QUANT == "bnb-4bit" and (
+            do_upscale or (H3_TRANSFORMER_BOTH_RESIDENT and self._transformer_ref_loaded)
+        )
 
         if TE_QUANT == "bnb-4bit" and is_fl2va:
             # bnb-4bit + fl2va only: transformer(66.3) + TE-nf4(21.0) + vae pair(11.0)
@@ -1203,6 +1353,17 @@ class MiniMaxH3Runner:
             # pass 1 of *this* request) cannot make step 0 of the new call wrongly skip.
             self._pipe.transformer._reset_stateful_cache()
             return self._pipe.transformer.cache_context("h3")
+
+        if force_free_te and not do_upscale:
+            # int8 both-resident mode only (the only way `force_free_te` can be True
+            # here -- `do_upscale` always takes the hires-fix branch below, which has
+            # its own force_free_te handling already). Safe to free now for the same
+            # reason the hires-fix branch's own comment gives: layout_step/latents_step/
+            # timesteps_step have already run above and their outputs are already
+            # materialized as tensors on `state`, so `_execution_device` resolution is
+            # no longer touched by freeing text_encoder from here on.
+            with self._load_lock:
+                self._free_text_encoder(force=True)
 
         if not do_upscale:
             denoise_step = MiniMaxH3DenoiseStep()
@@ -1552,20 +1713,39 @@ class MiniMaxH3Runner:
             # after the reference encoder step and (in bnb-4bit mode) after the vae
             # pair is parked back on CPU -- the same ordering `generate()` uses for
             # fl2va's keyframe step vs. transformer, just against the ref2va pair.
-            self._free_other_variant_transformer("ref2va")
-            # Also free transformer_ref itself unconditionally, even though this is the
-            # ref2va variant's *own* transformer: unlike the very first ref2va request
-            # (where it is never loaded yet), a *second* (or later) ref2va request in a
-            # row finds it already GPU-resident -- `_ensure_transformer_ref` at the end of
-            # the *previous* request's decode section restores the transformer_ref+TE-nf4
-            # steady state between requests, the same way `generate()`'s own `transformer`
-            # stays resident between t2va requests. Reproduced during this task's own
-            # verification: a second ref2va request's `_vae_to_gpu()` (below, via the
-            # reference encoder step) logged `allocated_gb: 98.81` (transformer_ref 66.3 +
-            # TE 21-ish + vae pair 11.0 all at once) and OOM'd on the first VAE conv. It is
-            # reloaded fresh, later, after the reference encoder step -- same as the first-
-            # request path. No-op (cheap) when it was not resident.
-            self._free_transformer_ref()
+            #
+            # int8 both-resident mode (`H3_TRANSFORMER_BOTH_RESIDENT`): this is a no-op
+            # (see `_free_other_variant_transformer`'s docstring) -- `transformer` stays
+            # resident (~34GB) through the reference-encode step below too. Even so, the
+            # VAE-pair headroom conflict this comment describes still applies with BOTH
+            # transformers resident: transformer(34) + transformer_ref(34, if resident
+            # from steady state) + TE-nf4(21) + vae pair(11) = ~100GB, over this card's
+            # ~95.6GB. See the `H3_TRANSFORMER_BOTH_RESIDENT` branch just below, which
+            # frees only `transformer` (t2va's, the variant NOT being served by this
+            # request) for this step instead of `transformer_ref` -- keeping ref2va's own
+            # transformer_ref resident across the whole request (and across repeated
+            # ref2va requests), which is the actual switch-elimination this mode exists
+            # for. `transformer` is reloaded later, in the decode section below (see its
+            # comment there for why the reload is deferred that far rather than done
+            # right after the reference-encode step).
+            if H3_TRANSFORMER_BOTH_RESIDENT:
+                self._free_transformer()
+            else:
+                self._free_other_variant_transformer("ref2va")
+                # Also free transformer_ref itself unconditionally, even though this is
+                # the ref2va variant's *own* transformer: unlike the very first ref2va
+                # request (where it is never loaded yet), a *second* (or later) ref2va
+                # request in a row finds it already GPU-resident -- `_ensure_transformer_ref`
+                # at the end of the *previous* request's decode section restores the
+                # transformer_ref+TE-nf4 steady state between requests, the same way
+                # `generate()`'s own `transformer` stays resident between t2va requests.
+                # Reproduced during this task's own verification: a second ref2va
+                # request's `_vae_to_gpu()` (below, via the reference encoder step)
+                # logged `allocated_gb: 98.81` (transformer_ref 66.3 + TE 21-ish + vae
+                # pair 11.0 all at once) and OOM'd on the first VAE conv. It is reloaded
+                # fresh, later, after the reference encoder step -- same as the first-
+                # request path. No-op (cheap) when it was not resident.
+                self._free_transformer_ref()
             self._sync_shared_components_to_ref()
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
@@ -1624,6 +1804,18 @@ class MiniMaxH3Runner:
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
+                # NOTE: `transformer` (t2va's, freed at this method's entry in
+                # H3_TRANSFORMER_BOTH_RESIDENT mode) is deliberately NOT reloaded here.
+                # ref2va's denoise loop already runs a longer packed sequence than t2va's
+                # (reference condition rows are prepended ahead of the generated ones --
+                # see `force_free_te`'s comment below), so transformer_ref(34) +
+                # TE-nf4(21) = 55GB steady state is kept as the *only* budget carried
+                # into denoise, leaving the same headroom this task measured safe for
+                # ref2va's own activation footprint. Reloading `transformer` back is
+                # deferred to the decode section below (after denoise has finished
+                # needing headroom), the same "restore steady state right before the
+                # next request needs it, not a moment sooner than necessary" shape
+                # `generate()`'s own force_free_te reload already uses.
         else:
             # `none` mode: TE's job is done -- free it and bring in transformer_ref
             # (vae is already permanently resident in this mode, so the reference
@@ -1643,16 +1835,28 @@ class MiniMaxH3Runner:
         timesteps_step = MiniMaxH3SetTimestepsStep()
         _, state = timesteps_step(pipe, state)
 
-        # bnb-4bit mode: force-free TE-nf4 (~21GB) before denoise, unconditionally (unlike
-        # generate()'s hires-fix-only `force_free_te` -- a reference always adds condition
-        # rows ahead of the generated ones, so ref2va's packed sequence is longer than
-        # plain t2va's even at the same target resolution/duration, and this task's own
-        # first real request reproduced the consequence: transformer_ref(66.3) + TE-
-        # nf4(21.0) = 87.5GB steady state left only ~8GB of headroom, and the very first
-        # denoise step OOM'd inside attention ("Tried to allocate 1.23 GiB" with 92.4GB
-        # already in use) with just one 2048px-short-edge image reference at 768x768/5s).
-        # Reloaded after decode, below -- same "restore the steady state for the next
-        # request" shape `generate()`'s own force_free_te reload uses.
+        # bnb-4bit mode (bf16 transformer_ref): force-free TE-nf4 (~21GB) before denoise,
+        # unconditionally (unlike generate()'s hires-fix-only `force_free_te` -- a
+        # reference always adds condition rows ahead of the generated ones, so ref2va's
+        # packed sequence is longer than plain t2va's even at the same target
+        # resolution/duration, and this task's own first real request reproduced the
+        # consequence: transformer_ref(66.3) + TE-nf4(21.0) = 87.5GB steady state left
+        # only ~8GB of headroom, and the very first denoise step OOM'd inside attention
+        # ("Tried to allocate 1.23 GiB" with 92.4GB already in use) with just one
+        # 2048px-short-edge image reference at 768x768/5s). Reloaded after decode,
+        # below -- same "restore the steady state for the next request" shape
+        # generate()'s own force_free_te reload uses.
+        #
+        # int8 mode (`H3_TRANSFORMER_BOTH_RESIDENT`): transformer_ref is only ~34GB, so
+        # transformer_ref(34) + TE-nf4(21) = 55GB leaves ~40GB of headroom for denoise
+        # activations -- comfortably more than the ~5GB t2va's own activations measured
+        # at 768x768 (see H3_INT8_MODULES_TO_NOT_CONVERT-adjacent log excerpt in this
+        # task's verification), so TE does not need to be force-freed here at all in
+        # this mode. (`transformer`, t2va's, was already freed at this method's entry in
+        # this mode and stays freed through denoise -- see that comment -- so the actual
+        # resident set during ref2va's denoise here is just transformer_ref + TE-nf4,
+        # identical in shape to bf16 mode's own post-force-free state, just without
+        # needing the force-free step to get there.)
         #
         # IMPORTANT (same reasoning as generate()'s force_free_te comment): this free is
         # deliberately deferred until after layout_step/latents_step/timesteps_step above,
@@ -1666,7 +1870,7 @@ class MiniMaxH3Runner:
         # own comment documents finding for its layout_step. Freeing TE only once those
         # position_ids/layout tensors already exist on the correct device (set once here,
         # and never touched again for the rest of the request) sidesteps it entirely.
-        force_free_te = TE_QUANT == "bnb-4bit"
+        force_free_te = TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT
         if force_free_te:
             with self._load_lock:
                 self._free_text_encoder(force=True)
@@ -1716,7 +1920,19 @@ class MiniMaxH3Runner:
         # the reference rows and decode only the generated ones) ---
         if progress:
             progress.update(phase="decoding", message="動画/音声をデコード中...")
-        if TE_QUANT == "bnb-4bit":
+        # bf16 mode: transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) would exceed
+        # this card's ~95.6GB (same three-way conflict as everywhere else in this
+        # file), so transformer_ref is dropped for this short decode window and
+        # reloaded right after (see below).
+        # int8 both-resident mode: `transformer` (t2va's) was already freed at this
+        # method's entry and never reloaded before now (see the entry-section and
+        # force_free_te comments above) -- resident set going into decode is just
+        # transformer_ref(34) + TE-nf4(21) = 55GB, and adding the vae pair(11) is only
+        # 66GB, comfortably under budget. So transformer_ref does NOT need to be
+        # dropped here in this mode; it is left alone (stays resident straight through
+        # decode and into the next request, which is the whole point of int8 mode for
+        # ref2va<->ref2va requests specifically).
+        if TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT:
             self._free_transformer_ref()
         self._vae_to_gpu()
         t_decode = time.time()
@@ -1758,6 +1974,20 @@ class MiniMaxH3Runner:
                     # the two big reloads are not competing for VRAM at the same time,
                     # mirroring generate()'s own force_free_te reload ordering.
                     self._load_text_encoder(progress)
+                if H3_TRANSFORMER_BOTH_RESIDENT:
+                    # Restore the int8 both-resident steady state (`transformer` +
+                    # `transformer_ref` + TE-nf4 all resident) for the *next* request.
+                    # `transformer` (t2va's) was freed at this method's entry to make
+                    # room for the reference VAE-encode step and has stayed freed
+                    # through denoise/decode since (see the entry-section comment).
+                    # Now that decode's own vae-pair trip is done (`_vae_to_cpu()` just
+                    # above), there is headroom again: transformer_ref(34) + TE-nf4(21)
+                    # = 55GB resident, +34GB for this reload = 89GB, the same steady
+                    # state `generate()`'s own t2va path settles into. Reloaded last
+                    # (after transformer_ref/TE, whichever of those needed restoring)
+                    # so it is not competing with them for VRAM during their own
+                    # reloads.
+                    self._ensure_transformer(progress)
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
