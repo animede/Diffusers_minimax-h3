@@ -171,6 +171,29 @@ ComfyUIコミュニティの MiniMaxH3_LatentUpscaler と同系の hires-fix。�
   作り直す。ModularPipeline の `_execution_device` はコンポーネント登録順の先頭モジュール
   で決まるため、TE解放後は `components.transformer.device` を明示的に使う
   (diffusers-server CLAUDE.md 23番・47番と同型の罠)。
+## Sage Attention (`H3_ATTN_BACKEND`、既定 `sage`)
+
+sm_120(Blackwell)向けにソースビルドした SageAttention 2.2.0 を既定で使う
+(ビルドは `scripts/build_sageattention.sh`、約2分。**必ず `MAX_JOBS=4 NVCC_THREADS=2` +
+systemd-run のメモリ上限付きで実行**——無制限並列nvccはホストRAM枯渇でシステム巻き添え
+事故歴あり。`CUDA_HOME=/usr/local/cuda-12.8` の明示が必要、既定のcuda-13.0はtorchの
+cu128と不一致)。PyPI/コミュニティのLinux向けsm_120 wheelは存在しなかった(全てWindows)。
+
+- 実測: デノイズ 118s→104s(**-12%**)。完全決定論(同一seed 2本バイト一致)。品質は
+  目視同等(PSNR 21dBは int8-QK 近似による軌道ドリフトで劣化ではない)
+- `H3_ATTN_BACKEND=default` で従来のSDPAに戻る
+- FBCと独立に併用可: sage + `H3_CACHE_THRESHOLD=0.1` でデノイズ67s(-43%、リクエスト
+  ~125s。FBC 0.1の構図ドリフト特性は既知どおり)
+- hub系backend(`flash_hub`/`sage_hub`)は torch 2.9 向けビルドがHub側に存在せず不成立
+  (2026-08-05時点。環境の問題ではない)
+
+## ステップ数の指針(蒸留モデル、実測 2026-08-05)
+
+`num_inference_steps` はAPI/UIパラメータ。30(検証既定)に対し **20で-15%、16で-31%** の
+デノイズ短縮。16/20とも単フレーム品質・時間方向の安定性に破綻なし(ただし構図は
+ステップ数で変わる)。ドラフト用途は16-20、本番は30が目安。ステップを減らすと
+FBCのスキップ機会も減る(30stepsで7スキップ→16stepsで0)ため、効果は単純比例しない。
+
 ## transformer int8量子化 (`H3_TRANSFORMER_QUANT`、既定 `none`)
 
 `H3_TRANSFORMER_QUANT=int8` で transformer / transformer_ref を torchao

@@ -177,6 +177,34 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
 # at once and keeps the existing one-resident-at-a-time behaviour unchanged.
 H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
 
+# EXPERIMENTAL, opt-in. "" (default) = whatever diffusers' attention_dispatch picks
+# natively (native/SDPA today) -- `set_attention_backend()` is never called, byte-for-byte
+# identical to pre-this-flag behaviour. Any other value is passed straight to
+# `transformer.set_attention_backend(...)` / `transformer_ref.set_attention_backend(...)`
+# right after each big transformer loads (see `_ensure_transformer`/`_ensure_transformer_ref`)
+# -- e.g. "sage" for SageAttention (see AttentionBackendName in diffusers/models/
+# attention_dispatch.py for the full list of valid strings: "sage", "sage_varlen",
+# "flash", "flash_hub", "xformers", ...). This project's stock `sageattention` install
+# (comfy-env's 2.2.0, inherited via venv/site-packages/comfy_env.pth) has no sm_120
+# (Blackwell) kernel compiled in -- confirmed by task-time probe: `sageattn(q,k,v)` raises
+# "no kernel image is available for execution on the device". A source rebuild with
+# `TORCH_CUDA_ARCH_LIST=12.0` (see third_party/SageAttention, scripts/build_sageattention.sh)
+# targeting this box's actual arch is required before "sage"/"sage_varlen" can work; if the
+# import-time sm_120 kernel is missing, `set_attention_backend("sage")` itself will not
+# raise (it only stores the backend name on `self.processor._attention_backend`) but the
+# first denoise step will, inside `sageattn()`. FBC (`H3_CACHE`) and this flag are
+# independent and compose: FBC skips whole blocks based on residual similarity, this flag
+# only changes how the *executed* blocks compute attention internally.
+# "sage" (default; A/B verified 2026-08-05): SageAttention 2.2.0 built from source for
+# sm_120 (scripts/build_sageattention.sh, ~2min build). Denoise 118s -> 104s (-12%) vs
+# SDPA, fully deterministic (two same-seed runs byte-identical), visual quality
+# equivalent (the ~21dB PSNR vs SDPA is trajectory drift from the int8-QK approximation,
+# not degradation -- same phenomenon as H3_TRANSFORMER_QUANT=int8). Set
+# H3_ATTN_BACKEND=default to revert to the pre-sage SDPA path.
+H3_ATTN_BACKEND = os.environ.get("H3_ATTN_BACKEND", "sage").strip().lower()
+if H3_ATTN_BACKEND in ("default", "none"):
+    H3_ATTN_BACKEND = ""
+
 # Two-pass hires-fix (see generate(..., upscale=1)): fraction of the *sigma schedule*
 # (not step count) that pass 2 (high-res) is responsible for finishing. E.g. 0.35 with
 # num_inference_steps=30 means pass 1 runs steps 0..18 (round(29*0.65)=19 of the 29 model
@@ -543,6 +571,9 @@ class MiniMaxH3Runner:
             )
         self._transformer_loaded = True
         self._active_variant = "t2va"
+        if H3_ATTN_BACKEND:
+            self._pipe.transformer.set_attention_backend(H3_ATTN_BACKEND)
+            logger.info("transformer attention backend set to %r", H3_ATTN_BACKEND)
         if H3_CACHE == "fbc":
             self._enable_fbc()
         logger.info(
@@ -658,6 +689,9 @@ class MiniMaxH3Runner:
             )
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
+        if H3_ATTN_BACKEND:
+            self._pipe_ref.transformer_ref.set_attention_backend(H3_ATTN_BACKEND)
+            logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
         if H3_CACHE == "fbc":
             self._enable_fbc_ref()
         logger.info(
@@ -919,6 +953,7 @@ class MiniMaxH3Runner:
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
             "gpu": gpu_mem_gb(),
@@ -1612,6 +1647,7 @@ class MiniMaxH3Runner:
             "mode": mode,
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
             "upscale": int(do_upscale),
@@ -2018,6 +2054,7 @@ class MiniMaxH3Runner:
             "mode": "ref2va",
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            "attn_backend": H3_ATTN_BACKEND or "default",
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
             "cache_skipped_steps": cache_skips[0] if H3_CACHE == "fbc" else None,
