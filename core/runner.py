@@ -117,6 +117,30 @@ if H3_CACHE not in ("none", "fbc"):
     raise ValueError(f"H3_CACHE must be 'none' or 'fbc', got {H3_CACHE!r}")
 H3_CACHE_THRESHOLD = float(os.environ.get("H3_CACHE_THRESHOLD", "0.05"))
 
+# EXPERIMENTAL, opt-in, not yet A/B'd against the committed default at task-write time
+# (this env var and its wiring are themselves the subject of that pending A/B -- see
+# dev_notes/ or the task that added this comment). "none" (default) = transformer stays
+# bf16, byte-for-byte identical to pre-int8 behaviour (quantize_ is never called).
+# "int8" = the transformer is weight-only int8-quantized in place via torchao
+# (Int8WeightOnlyConfig(version=2), diffusers' TorchAoConfig plumbing) right after its
+# bf16 load, using the modules_to_not_convert list from the upstream PR's documented
+# recipe (small projection/embedding/norm layers that are numerically sensitive or tiny
+# enough that quantizing them buys no memory and risks more error than it is worth).
+# Only the transformer is affected; transformer_ref (ref2va) and the text_encoder
+# (H3_TE_QUANT, already bnb-4bit nf4 by default) are untouched by this flag.
+H3_TRANSFORMER_QUANT = os.environ.get("H3_TRANSFORMER_QUANT", "none").strip().lower()
+if H3_TRANSFORMER_QUANT not in ("none", "int8"):
+    raise ValueError(f"H3_TRANSFORMER_QUANT must be 'none' or 'int8', got {H3_TRANSFORMER_QUANT!r}")
+
+# Upstream PR #14355's documented int8 recipe for the MiniMax-H3 transformer: skip
+# quantizing these modules (small, and/or numerically sensitive input/output
+# projections rather than the bulk attention/MLP weight that dominates the 66GB).
+H3_INT8_MODULES_TO_NOT_CONVERT = [
+    "proj_in", "audio_proj_in", "context_embedder",
+    "time_embedder", "time_proj", "token_refiner",
+    "norm_out", "proj_out", "audio_proj_out",
+]
+
 # Two-pass hires-fix (see generate(..., upscale=1)): fraction of the *sigma schedule*
 # (not step count) that pass 2 (high-res) is responsible for finishing. E.g. 0.35 with
 # num_inference_steps=30 means pass 1 runs steps 0..18 (round(29*0.65)=19 of the 29 model
@@ -411,13 +435,22 @@ class MiniMaxH3Runner:
         logger.info("vae/audio_vae -> CPU in %.2fs. gpu=%s", time.time() - t0, gpu_mem_gb())
 
     def _ensure_transformer(self, progress: ProgressState | None = None):
-        """Load the 66GB bf16 transformer to GPU.
+        """Load the 66GB bf16 transformer to GPU (or, with `H3_TRANSFORMER_QUANT=int8`,
+        weight-only int8-quantize it via torchao in the same `from_pretrained` call).
 
         `none` mode: frees the text_encoder first if resident (they cannot coexist).
         `bnb-4bit` mode: TE-nf4 is permanently resident, nothing to free here. Called at
         startup, and again after every request's decode phase (which drops the
         transformer for its ~9s window -- see the decode section of `generate()`) to
         restore the transformer+TE-nf4 steady state between requests.
+
+        int8 path: `quantization_config` is passed straight into `load_components`
+        (same per-component-kwarg dict shape `_load_text_encoder` already uses for TE's
+        `BitsAndBytesConfig`), so `from_pretrained` quantizes the module as it materializes
+        each shard on `device_map="cuda"` -- there is no separate "load bf16 to GPU, then
+        quantize in place" step, matching the component-wise cuda-direct loading pattern
+        this file uses everywhere else (never a CPU-wide staging pass for a 60GB+ module,
+        per CLAUDE.md #33 as referenced in the module docstring).
         """
         self._ensure_pipe_shell()
         if self._transformer_loaded:
@@ -428,13 +461,31 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="loading_transformer", message="transformer をロード中...")
         t0 = time.time()
-        self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
-        self._pipe.transformer.to(DEVICE)
+        if H3_TRANSFORMER_QUANT == "int8":
+            from diffusers import TorchAoConfig
+            from torchao.quantization import Int8WeightOnlyConfig
+
+            quant_config = TorchAoConfig(
+                Int8WeightOnlyConfig(version=2),
+                modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+            )
+            self._pipe.load_components(
+                names=["transformer"],
+                dtype=torch.bfloat16,
+                quantization_config={"transformer": quant_config},
+                device_map={"transformer": "cuda"},
+            )
+        else:
+            self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
+            self._pipe.transformer.to(DEVICE)
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_CACHE == "fbc":
             self._enable_fbc()
-        logger.info("transformer loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
+        logger.info(
+            "transformer loaded to GPU in %.1fs (quant=%s). gpu=%s ram=%s",
+            time.time() - t0, H3_TRANSFORMER_QUANT, gpu_mem_gb(), ram_gb(),
+        )
 
     def _fbc_last_step_was_skip(self) -> int:
         """Best-effort introspection of whether the just-finished transformer forward skipped
@@ -736,6 +787,7 @@ class MiniMaxH3Runner:
             "vae_on_gpu": self._vae_on_gpu,
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
+            "transformer_quant": H3_TRANSFORMER_QUANT,
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
             "gpu": gpu_mem_gb(),
@@ -1398,6 +1450,7 @@ class MiniMaxH3Runner:
             "total_elapsed_s": round(time.time() - t_start, 2),
             "mode": mode,
             "te_quant": TE_QUANT,
+            "transformer_quant": H3_TRANSFORMER_QUANT,
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
             "upscale": int(do_upscale),
@@ -1734,6 +1787,7 @@ class MiniMaxH3Runner:
             "total_elapsed_s": round(time.time() - t_start, 2),
             "mode": "ref2va",
             "te_quant": TE_QUANT,
+            "transformer_quant": H3_TRANSFORMER_QUANT,
             "cache_mode": H3_CACHE,
             "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
             "cache_skipped_steps": cache_skips[0] if H3_CACHE == "fbc" else None,
