@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
+import core.settings as settings
 from core.llm import LLMConnectionError, VALID_MODES, enhance_prompt, get_llm_url
 from core.runner import (
     FPS,
@@ -125,6 +126,67 @@ def api_progress():
         return _current_progress.snapshot()
 
 
+@app.get("/api/settings")
+def api_settings():
+    """Current instant/reload-group settings + choice lists (see core/settings.py).
+    The UI reads this once at load to seed its controls with the server's actual
+    current state, not hardcoded defaults.
+    """
+    return settings.current_settings_snapshot()
+
+
+@app.post("/api/settings/apply")
+def api_settings_apply(
+    transformer_quant: Optional[str] = Form(None),
+    te_quant: Optional[str] = Form(None),
+    te_prune: Optional[bool] = Form(None),
+    lowvram: Optional[str] = Form(None),
+    video_vae_fp16: Optional[bool] = Form(None),
+):
+    """Apply a new reload-group configuration: unloads every big model and reloads
+    under the new settings (core.settings.apply_reload_settings -> runner.unload_all()
+    + runner.preload_all(), no process restart -- see that function's docstring).
+
+    409 while a generation is in progress (same generation_lock as /api/t2va etc, so an
+    apply can never race an in-flight denoise loop or vice versa). 400 for an invalid/
+    unverified combination (mirrors core/runner.py's own startup validation).
+    """
+    fields = {}
+    if transformer_quant is not None:
+        fields["transformer_quant"] = transformer_quant
+    if te_quant is not None:
+        fields["te_quant"] = te_quant
+    if te_prune is not None:
+        fields["te_prune"] = te_prune
+    if lowvram is not None:
+        fields["lowvram"] = lowvram
+    if video_vae_fp16 is not None:
+        fields["video_vae_fp16"] = video_vae_fp16
+
+    acquired = _generation_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(409, "生成が進行中のため設定を適用できません。完了を待ってから再試行してください。")
+    global _current_progress
+    job_id = uuid.uuid4().hex[:12]
+    progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
+    with _progress_guard:
+        _current_progress = progress
+    try:
+        progress.update(phase="loading", message="設定を適用中(モデル再ロード)...")
+        result = settings.apply_reload_settings(runner, **fields)
+        progress.update(phase="done", message="設定適用完了")
+        return JSONResponse(result)
+    except ValueError as e:
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("settings apply failed")
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(500, f"settings apply failed: {e}")
+    finally:
+        _generation_lock.release()
+
+
 def _run_generation(
     prompt: str,
     resolution: str,
@@ -136,6 +198,10 @@ def _run_generation(
     upscale: int = 0,
     height: Optional[int] = None,
     width: Optional[int] = None,
+    cache: Optional[str] = None,
+    cache_threshold: Optional[float] = None,
+    attn: Optional[str] = None,
+    turbo: Optional[bool] = None,
 ) -> dict:
     global _current_progress
 
@@ -183,6 +249,10 @@ def _run_generation(
             last_image=last_image,
             progress=progress,
             upscale=upscale,
+            cache=cache,
+            cache_threshold=cache_threshold,
+            attn=attn,
+            turbo=turbo,
         )
         result["job_id"] = job_id
         result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
@@ -207,8 +277,16 @@ def api_t2va(
     upscale: int = Form(0),
     height: Optional[int] = Form(None),
     width: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
 ):
-    """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。"""
+    """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。
+
+    cache/cache_threshold/attn/turbo は即反映(再ロード不要)の任意パラメータ。
+    未指定ならサーバの現在の既定(環境変数由来)のまま(core/settings.py 参照)。
+    """
     result = _run_generation(
         prompt=prompt,
         resolution=resolution,
@@ -220,6 +298,10 @@ def api_t2va(
         upscale=upscale,
         height=height,
         width=width,
+        cache=cache,
+        cache_threshold=cache_threshold,
+        attn=attn,
+        turbo=turbo,
     )
     return JSONResponse(result)
 
@@ -235,8 +317,15 @@ def api_fl2va(
     last_image: Optional[UploadFile] = File(None),
     height: Optional[int] = Form(None),
     width: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
 ):
-    """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。"""
+    """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。
+
+    cache/cache_threshold/attn/turbo は即反映(再ロード不要)の任意パラメータ。
+    """
     if image is None and last_image is None:
         raise HTTPException(400, "FL2VA には image または last_image のいずれかが必要です")
 
@@ -253,6 +342,10 @@ def api_fl2va(
         last_image=pil_last_image,
         height=height,
         width=width,
+        cache=cache,
+        cache_threshold=cache_threshold,
+        attn=attn,
+        turbo=turbo,
     )
     return JSONResponse(result)
 
@@ -297,6 +390,10 @@ def api_ref2va(
     seconds: Optional[float] = Form(None),
     num_inference_steps: int = Form(30),
     seed: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
 ):
     """ref2va: 画像最大9・動画最大3・音声最大3(計12参照)からの動画+音声生成。
 
@@ -305,6 +402,9 @@ def api_ref2va(
     持つ参照(音声単体 or 音声付き動画)がちょうど1本のときのみ(その音声長が生成尺になる、
     MiniMaxH3Ref2VASetupStep.prepare_references の仕様どおり) -- それ以外で省略すると
     ValueError を 400 に変換して返す。
+
+    cache/cache_threshold/attn/turbo は即反映(再ロード不要)の任意パラメータ
+    (transformer_ref へ適用される)。
     """
     global _current_progress
 
@@ -368,6 +468,10 @@ def api_ref2va(
                 num_inference_steps=num_inference_steps,
                 seed=seed,
                 progress=progress,
+                cache=cache,
+                cache_threshold=cache_threshold,
+                attn=attn,
+                turbo=turbo,
             )
             result["job_id"] = job_id
             result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"

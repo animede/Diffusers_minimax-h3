@@ -278,6 +278,77 @@
     font-size: 12px;
     line-height: 1.7;
   }
+  /* --- 即反映 (instant-apply) 設定: 生成ボタンの直上 --- */
+  .instant-settings {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .instant-settings-title { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text);
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+  }
+  .checkbox-row input[type=checkbox] { width: auto; margin: 0; }
+  .checkbox-row input[type=number] {
+    width: 64px;
+    padding: 3px 6px;
+    font-size: 12px;
+    display: inline-block;
+  }
+  .checkbox-row select {
+    width: auto;
+    padding: 3px 6px;
+    font-size: 12px;
+    display: inline-block;
+  }
+  .checkbox-row.disabled { opacity: 0.45; }
+  .checkbox-row.disabled label, .checkbox-row.disabled { cursor: not-allowed; }
+  /* --- 再ロード設定: サーバ状態欄の近く --- */
+  details.reload-settings {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+  }
+  details.reload-settings summary { cursor: pointer; color: var(--muted); }
+  .reload-body { margin-top: 8px; }
+  .reload-field { margin-bottom: 8px; }
+  .reload-field label { margin: 0 0 3px; font-size: 11px; }
+  .reload-field select {
+    padding: 5px 8px;
+    font-size: 12px;
+  }
+  .reload-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+  .reload-checkbox input[type=checkbox] { width: auto; margin: 0; }
+  button.apply-btn {
+    width: 100%;
+    padding: 8px;
+    background: #0d0f14;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-top: 4px;
+  }
+  button.apply-btn:hover:not(:disabled) { background: #17233f; }
+  button.apply-btn:disabled { border-color: var(--border); color: var(--muted); cursor: not-allowed; }
+  .reload-hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .reload-hint.warn { color: #e0a94c; }
 </style>
 </head>
 <body>
@@ -416,6 +487,28 @@
         </label>
       </div>
 
+      <!-- 即反映 (instant-apply) 設定: リクエスト単位、再ロード不要。
+           core/settings.py の resolve_instant_settings() が未指定時はサーバの
+           現在の既定にフォールバックするため、ここを一切触らなくても既存の挙動のまま。 -->
+      <div class="instant-settings">
+        <div class="instant-settings-title">即反映設定(生成のたびに反映・再ロード不要)</div>
+        <div class="checkbox-row" id="row-cache">
+          <input type="checkbox" id="cache-enabled">
+          <label style="margin:0;" for="cache-enabled">FirstBlockCache</label>
+          <span style="color:var(--muted);">threshold</span>
+          <input type="number" id="cache-threshold" value="0.05" min="0" max="1" step="0.01">
+        </div>
+        <div class="checkbox-row" id="row-attn">
+          <input type="checkbox" id="attn-sage">
+          <label style="margin:0;" for="attn-sage">Sage Attention</label>
+        </div>
+        <div class="checkbox-row" id="row-turbo">
+          <input type="checkbox" id="turbo-enabled">
+          <label style="margin:0;" for="turbo-enabled">Turbo LoRA(4-8ステップ推奨)</label>
+        </div>
+        <div class="hint" id="instant-hint"></div>
+      </div>
+
       <button type="submit" class="generate" id="generate-btn">生成</button>
       <div class="hint">蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。</div>
     </form>
@@ -426,6 +519,48 @@
     </div>
 
     <div class="server-status" id="server-status">サーバ状態を確認中...</div>
+
+    <!-- 再ロードが必要な設定: モデルを解放して新設定でロードし直す(サーバプロセスは
+         再起動しない。core/settings.py の apply_reload_settings() -> runner.unload_all()
+         + runner.preload_all())。variant=option value は core/settings.py の
+         RELOAD_*_CHOICES と一致させること。 -->
+    <details class="reload-settings" id="reload-settings">
+      <summary>再ロードが必要な設定(transformer量子化・TE量子化・低VRAMモード等)</summary>
+      <div class="reload-body">
+        <div class="reload-field">
+          <label>transformer 量子化</label>
+          <select id="reload-transformer-quant">
+            <option value="none">none (bf16)</option>
+            <option value="int8">int8</option>
+          </select>
+        </div>
+        <div class="reload-field">
+          <label>text_encoder 量子化</label>
+          <select id="reload-te-quant">
+            <option value="bnb-4bit">bnb-4bit (nf4)</option>
+            <option value="none">none (bf16)</option>
+          </select>
+        </div>
+        <div class="reload-checkbox">
+          <input type="checkbox" id="reload-te-prune">
+          <label style="margin:0;" for="reload-te-prune">TEレイヤー削除(51/64層のみ構築)</label>
+        </div>
+        <div class="reload-field">
+          <label>低VRAMモード</label>
+          <select id="reload-lowvram">
+            <option value="0">0 (無効・48GB超級)</option>
+            <option value="1">1 (48GB級・per-request reload)</option>
+            <option value="group">group (24-32GB級・group offload常駐)</option>
+          </select>
+        </div>
+        <div class="reload-checkbox">
+          <input type="checkbox" id="reload-video-vae-fp16">
+          <label style="margin:0;" for="reload-video-vae-fp16">video VAE を fp16 化(実験的)</label>
+        </div>
+        <button type="button" class="apply-btn" id="reload-apply-btn">適用(再ロード)</button>
+        <div class="reload-hint" id="reload-hint">変更なし</div>
+      </div>
+    </details>
   </div>
 
   <div class="panel">
@@ -458,6 +593,90 @@ const customSizeRow = document.getElementById('custom-size-row');
 const customWidthEl = document.getElementById('custom-width');
 const customHeightEl = document.getElementById('custom-height');
 const sizeEffectLineEl = document.getElementById('size-effect-line');
+
+// --- 即反映 (instant-apply) / 再ロード設定の要素参照 ---
+const cacheEnabledEl = document.getElementById('cache-enabled');
+const cacheThresholdEl = document.getElementById('cache-threshold');
+const attnSageEl = document.getElementById('attn-sage');
+const turboEnabledEl = document.getElementById('turbo-enabled');
+const rowCacheEl = document.getElementById('row-cache');
+const rowAttnEl = document.getElementById('row-attn');
+const rowTurboEl = document.getElementById('row-turbo');
+const instantHintEl = document.getElementById('instant-hint');
+const reloadTransformerQuantEl = document.getElementById('reload-transformer-quant');
+const reloadTeQuantEl = document.getElementById('reload-te-quant');
+const reloadTePruneEl = document.getElementById('reload-te-prune');
+const reloadLowvramEl = document.getElementById('reload-lowvram');
+const reloadVideoVaeFp16El = document.getElementById('reload-video-vae-fp16');
+const reloadApplyBtn = document.getElementById('reload-apply-btn');
+const reloadHintEl = document.getElementById('reload-hint');
+const upscaleEl = document.getElementById('upscale');
+
+// core/settings.py の RELOAD_ETA_S と同じ値(サーバ側が権威、これは表示専用のフォールバック)
+let RELOAD_ETA_S = { transformer_quant: 36, te_quant: 40, te_prune: 5, lowvram: 90, video_vae_fp16: 5 };
+// サーバから取得した現在の設定 (GET /api/settings)。turbo のグレーアウト判定・
+// reload適用ボタンの活性判定(現在値との差分)に使う。
+let CURRENT_SETTINGS = null;
+
+function turboIncompatibleReason() {
+  // core/settings.py の validate_instant_settings() と同じ規則: turbo は
+  // lowvram(1/group) または transformer_both_resident(int8 かつ lowvram=0、両
+  // transformer 同時常駐)と未検証のため組み合わせ不可。upscale チェックボックスとの
+  // 組み合わせも同様(generate() 側で do_upscale + turbo=1 は 400)。
+  if (!CURRENT_SETTINGS) return null;
+  const c = CURRENT_SETTINGS.constraints || {};
+  const r = CURRENT_SETTINGS.reload || {};
+  if (r.lowvram && r.lowvram !== '0') {
+    return `低VRAMモード(lowvram=${r.lowvram})とturboの組み合わせは未検証のため無効化しています`;
+  }
+  if (c.transformer_both_resident) {
+    return 'transformer/transformer_ref 両方常駐(int8)とturboの組み合わせは未検証のため無効化しています';
+  }
+  if (upscaleEl && upscaleEl.checked) {
+    return '2xアップスケールとturboの組み合わせは未対応のため無効化しています(アップスケールを外すと選択できます)';
+  }
+  return null;
+}
+
+function updateTurboAvailability() {
+  const reason = turboIncompatibleReason();
+  if (reason) {
+    if (turboEnabledEl.checked) turboEnabledEl.checked = false;
+    turboEnabledEl.disabled = true;
+    rowTurboEl.classList.add('disabled');
+    rowTurboEl.title = reason;
+  } else {
+    turboEnabledEl.disabled = false;
+    rowTurboEl.classList.remove('disabled');
+    rowTurboEl.title = '';
+  }
+  updateInstantHint();
+}
+
+function updateInstantHint() {
+  const parts = [];
+  if (turboEnabledEl.checked) parts.push('turbo有効時はFirstBlockCacheが自動的に無効化されます');
+  instantHintEl.textContent = parts.join(' / ');
+}
+
+cacheEnabledEl.addEventListener('change', () => {
+  cacheThresholdEl.disabled = !cacheEnabledEl.checked;
+});
+cacheThresholdEl.disabled = !cacheEnabledEl.checked;
+
+turboEnabledEl.addEventListener('change', () => {
+  // Turbo LoRA is community-verified at 8 steps -- default steps to that when turned
+  // on, and back to 30 when turned off, but only if the user has not hand-edited the
+  // field away from one of those two defaults (per the task brief: "ユーザーが手で
+  // 変えた値は尊重してよい").
+  if (turboEnabledEl.checked) {
+    if (stepsEl.value === '' || stepsEl.value === '30') stepsEl.value = '8';
+  } else {
+    if (stepsEl.value === '8') stepsEl.value = '30';
+  }
+  updateInstantHint();
+});
+if (upscaleEl) upscaleEl.addEventListener('change', updateTurboAvailability);
 
 // --- サイズ/秒数の丸めプレビュー ---
 // 丸めの権威はサーバ(app.py の round_canvas_value / seconds_to_num_frames)だが、
@@ -861,6 +1080,112 @@ async function refreshServerStatus() {
 refreshServerStatus();
 setInterval(refreshServerStatus, 4000);
 
+// --- 即反映 / 再ロード設定: 起動時に GET /api/settings から読んでUIへ反映 ---
+// 再ロード設定フォームに触れたかどうか(触れた後はポーリングでの上書きをしない -- 生成中の
+// サーバステータス更新(4秒毎)が入力中の選択を巻き戻すと編集しづらいため)。
+let RELOAD_TOUCHED = false;
+
+function applySettingsToControls(data) {
+  CURRENT_SETTINGS = data;
+  const i = data.instant, r = data.reload;
+  if (RELOAD_TOUCHED === false) {
+    // ユーザーがまだ手を触れていない項目だけサーバ値で上書きする(ポーリング中に
+    // 入力中の値を消さないため)。初回ロード時は全項目未使用なのでここで全部埋まる。
+    cacheEnabledEl.checked = (i.cache === 'fbc');
+    cacheThresholdEl.value = i.cache_threshold;
+    cacheThresholdEl.disabled = !cacheEnabledEl.checked;
+    attnSageEl.checked = (i.attn === 'sage');
+    turboEnabledEl.checked = i.turbo;
+    reloadTransformerQuantEl.value = r.transformer_quant;
+    reloadTeQuantEl.value = r.te_quant;
+    reloadTePruneEl.checked = r.te_prune;
+    reloadLowvramEl.value = r.lowvram;
+    reloadVideoVaeFp16El.checked = r.video_vae_fp16;
+  }
+  if (data.reload_eta_s) RELOAD_ETA_S = data.reload_eta_s;
+  updateTurboAvailability();
+  updateReloadApplyState();
+}
+
+async function loadSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    applySettingsToControls(data);
+  } catch (e) {
+    reloadHintEl.textContent = '設定の取得に失敗しました';
+  }
+}
+loadSettings();
+
+[reloadTransformerQuantEl, reloadTeQuantEl, reloadTePruneEl, reloadLowvramEl, reloadVideoVaeFp16El].forEach(el => {
+  el.addEventListener('change', () => { RELOAD_TOUCHED = true; updateReloadApplyState(); });
+});
+
+function reloadChangedFields() {
+  if (!CURRENT_SETTINGS) return [];
+  const r = CURRENT_SETTINGS.reload;
+  const changed = [];
+  if (reloadTransformerQuantEl.value !== r.transformer_quant) changed.push('transformer_quant');
+  if (reloadTeQuantEl.value !== r.te_quant) changed.push('te_quant');
+  if (reloadTePruneEl.checked !== r.te_prune) changed.push('te_prune');
+  if (reloadLowvramEl.value !== r.lowvram) changed.push('lowvram');
+  if (reloadVideoVaeFp16El.checked !== r.video_vae_fp16) changed.push('video_vae_fp16');
+  return changed;
+}
+
+function updateReloadApplyState() {
+  // lowvram!=0 は int8 を要求する(サーバ側の自動アップグレード規則、
+  // core/settings.py の apply_reload_settings 参照)。UI側でも同じ規則を先取りして
+  // 見せる(未選択のまま送っても400にはならないが、ユーザーに分かりやすくするため)。
+  // reloadChangedFields() より前に適用すること -- 後だと、この調整で初めて現在値と
+  // 異なることになったフィールド(例: lowvram=1選択時に自動でte_quantがbnb-4bitへ
+  // 変わるケース)が変更点の一覧・ETA計算に反映されない。
+  if (reloadLowvramEl.value !== '0') {
+    reloadTeQuantEl.value = 'bnb-4bit';
+    if (reloadTransformerQuantEl.value === 'none') reloadTransformerQuantEl.value = 'int8';
+  }
+  const changed = reloadChangedFields();
+  if (!changed.length) {
+    reloadApplyBtn.disabled = true;
+    reloadHintEl.textContent = '変更なし';
+    reloadHintEl.classList.remove('warn');
+    return;
+  }
+  reloadApplyBtn.disabled = false;
+  const etaMax = Math.max(...changed.map(f => RELOAD_ETA_S[f] || 30));
+  reloadHintEl.textContent = `変更: ${changed.join(', ')} — 適用には目安 約${etaMax}秒(モデル解放+再ロード)`;
+  reloadHintEl.classList.add('warn');
+}
+
+reloadApplyBtn.addEventListener('click', async () => {
+  reloadApplyBtn.disabled = true;
+  reloadApplyBtn.textContent = '適用中(再ロード)...';
+  reloadHintEl.textContent = 'モデルを解放して新設定でロード中です。しばらくお待ちください...';
+  const fd = new FormData();
+  fd.append('transformer_quant', reloadTransformerQuantEl.value);
+  fd.append('te_quant', reloadTeQuantEl.value);
+  fd.append('te_prune', reloadTePruneEl.checked ? '1' : '');
+  fd.append('lowvram', reloadLowvramEl.value);
+  fd.append('video_vae_fp16', reloadVideoVaeFp16El.checked ? '1' : '');
+  try {
+    const res = await fetch('/api/settings/apply', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+    RELOAD_TOUCHED = false;
+    applySettingsToControls(data);
+    reloadHintEl.textContent = `適用完了 (${data.reload_time_s}s, 変更: ${(data.changed_fields || []).join(', ') || 'なし'})`;
+    reloadHintEl.classList.remove('warn');
+    refreshServerStatus();
+  } catch (e) {
+    reloadHintEl.textContent = 'エラー: ' + e.message;
+    reloadHintEl.classList.add('warn');
+  } finally {
+    reloadApplyBtn.textContent = '適用(再ロード)';
+    updateReloadApplyState();
+  }
+});
+
 form.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const prompt = promptEl.value.trim();
@@ -881,6 +1206,17 @@ form.addEventListener('submit', async (ev) => {
   fd.append('num_inference_steps', stepsEl.value);
   if (seedEl.value) fd.append('seed', seedEl.value);
 
+  // 即反映 (instant-apply) 設定 -- 常に明示送信する(チェック無し = "none"/"default"
+  // を明示的にサーバへ伝える。未送信だとサーバ既定=環境変数の値にフォールバックして
+  // しまい、UIでチェックを外した意図が伝わらないため)。
+  fd.append('cache', cacheEnabledEl.checked ? 'fbc' : 'none');
+  if (cacheEnabledEl.checked) fd.append('cache_threshold', cacheThresholdEl.value);
+  fd.append('attn', attnSageEl.checked ? 'sage' : 'default');
+  // 空文字ではなく明示的に '0' を送る: 空文字は「未指定(=サーバ既定を使う)」と
+  // 解釈されうるため、H3_TURBO_LORA=1 で起動したサーバではチェックを外しても
+  // turbo が無効にならない恐れがある。
+  fd.append('turbo', turboEnabledEl.checked ? '1' : '0');
+
   // "auto" はサーバ既定に任せる(t2va/fl2va は resolution を送らなければ 768x768、
   // ref2va は height/width を送らなければ H3 自身の 16:9)。"custom" は幅/高さを
   // そのまま送り、丸めはサーバ(round_canvas_value)に任せる。
@@ -899,7 +1235,6 @@ form.addEventListener('submit', async (ev) => {
   if (mode === 't2va') {
     appendSize();
     fd.append('seconds', secondsEl.value);
-    const upscaleEl = document.getElementById('upscale');
     if (upscaleEl && upscaleEl.checked) fd.append('upscale', '1');
   } else if (mode === 'fl2va') {
     url = '/api/fl2va';
@@ -972,6 +1307,8 @@ function renderResult(data) {
       <div><b>デノイズ時間:</b> ${data.denoise_time_s}s (avg ${data.avg_step_time_s}s/step) / <b>デコード:</b> ${data.decode_time_s}s</div>
       <div><b>合計時間:</b> ${data.total_elapsed_s}s / <b>ピークVRAM:</b> ${data.peak_vram_gb}GB</div>
       <div><b>音声:</b> rms=${data.audio_rms.toFixed(5)} peak=${data.audio_peak.toFixed(4)} @ ${data.audio_sampling_rate}Hz</div>
+      <div><b>即反映設定:</b> cache=${data.cache ?? data.cache_mode} ${data.cache === 'fbc' && data.cache_skipped_steps != null ? `(skip ${data.cache_skipped_steps}/${data.num_inference_steps})` : ''} /
+        attn=${data.attn_backend} / turbo=${data.turbo ?? data.turbo_lora}</div>
     </div>
     <details class="used-prompt">
       <summary>使用したプロンプト全文(比較評価用)</summary>

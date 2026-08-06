@@ -717,6 +717,38 @@ ComfyUI コミュニティ等で出た改良を本アプリ(diffusers 経路)へ
 (取り込んだもの / 調査の結果取り込まなかったもの / 着想を得て自前実装したもの、
 それぞれの出典・実測値・判定・踏んだ罠)。
 
+## UIからの設定切替 (2026-08-06)
+
+環境変数でしか変えられなかったオプトイン設定を、性質で2つに分けてUIから操作できる。
+
+### 即反映(生成ボタン直上のチェックボックス、再ロード不要)
+
+FirstBlockCache(+しきい値)・Sage Attention・Turbo LoRA。リクエストごとのパラメータ
+(`cache` / `cache_threshold` / `attn` / `turbo`)として送り、`MiniMaxH3Runner.
+apply_instant_settings()` が生成ロック取得後・denoise前に常駐transformerへ適用する
+(`disable_cache()`/`enable_cache()`、`set_attention_backend()`、`_TurboLoRALinear.enabled`)。
+**未指定なら従来どおりプロセス既定**なので既存のcurl/スクリプトは無変更で動く。
+turbo有効時はFBCを自動的に無効化する(元の安全規則を踏襲)。
+
+実測(同一seed、再起動なしで切替): FBC on 100.8s(6スキップ)/ off 129.3s(0スキップ)、
+Sage on 129.3s / off(native) 158.5s、Turbo on(8steps) 38.9s。
+
+### 再ロードが必要(ヘッダの折りたたみ + 「適用(再ロード)」ボタン)
+
+transformer int8・TE量子化・TEレイヤー削除・低VRAMモード・video VAE fp16。
+`POST /api/settings/apply` が `core/settings.py` の `apply_reload_settings()` を呼び、
+**プロセスは再起動せず** runner内で全モデルを解放→新設定でロードし直す
+(自プロセスをkillすると誰も起動し直せずUIごと復帰不能になるため、
+os.execv/self-kill の類は実装しない)。生成中は409、未検証の組み合わせは400。
+
+実測: transformer_quant none→int8→none が 56.0s / 55.0s(GPU 87.5→55.0→87.3GB)、
+lowvram 0→1→0 も往復動作。`GET /api/settings` が現在値と選択肢を返し、UIはこれで初期化する。
+
+**UI実装の注意**: チェックボックスOFFは空文字ではなく明示的に `turbo=0` を送ること
+(空文字は「未指定=サーバ既定」と解釈されうるため、`H3_TURBO_LORA=1` で起動した
+サーバではチェックを外しても無効化されない恐れがある)。turboとupscaleは相互排他で、
+片方を選ぶともう片方が自動的に解除・無効化される(サーバ側の400と整合)。
+
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
 ### 1. diffusers PR #14355 のマージ待ち — **安易に上げないこと**

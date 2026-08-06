@@ -610,8 +610,20 @@ class _TurboLoRALinear(torch.nn.Module):
         self.base = base
         self.register_buffer("lora_a", lora_a, persistent=False)
         self.register_buffer("lora_b", lora_b, persistent=False)
+        # Instant on/off toggle for the *instant-apply* settings group (turbo LoRA is
+        # request-scoped, not reload-scoped -- see the task brief / core/settings.py):
+        # the wrapper module itself is only ever installed once (lazily, on first
+        # request with turbo=1), then left in place permanently and just flipped on/off
+        # per request via this flag. Cheap (`if` + early return, no tensor op) and safe
+        # to flip from the request thread while `_load_lock` is held, matching how every
+        # other per-request knob (FBC threshold, attention backend) in this file is
+        # applied: no reload, no module replacement, just a stored setting the next
+        # forward call reads.
+        self.enabled = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return self.base(x)
         return self.base(x) + torch.nn.functional.linear(
             torch.nn.functional.linear(x, self.lora_a), self.lora_b
         )
@@ -827,6 +839,26 @@ def apply_turbo_lora(transformer, lora_path: str) -> int:
     return n_wrapped
 
 
+def set_turbo_lora_enabled(transformer, enabled: bool) -> int:
+    """Flip every already-wrapped `_TurboLoRALinear` module's `enabled` flag in place.
+
+    Instant, no reload: `apply_turbo_lora()` only ever needs to run once per transformer
+    (wrapping is structural -- replacing `nn.Linear` modules with `_TurboLoRALinear`
+    ones); a *disabled* wrapper's `forward()` degrades to exactly `self.base(x)` (see
+    `_TurboLoRALinear.forward`), so toggling this flag on/off between requests is
+    numerically equivalent to the LoRA never having been applied at all, without paying
+    the ~780MB download + fuse_projections()/wrap cost again. Returns the number of
+    wrapper modules found (0 if the turbo LoRA was never applied to this transformer --
+    callers use this to distinguish "toggled" from "nothing to toggle, apply it first").
+    """
+    n = 0
+    for module in transformer.modules():
+        if isinstance(module, _TurboLoRALinear):
+            module.enabled = enabled
+            n += 1
+    return n
+
+
 def align_num_frames(num_frames: int) -> int:
     while num_frames % 17 != 5:
         num_frames += 1
@@ -990,6 +1022,15 @@ class MiniMaxH3Runner:
         # H3_TURBO_LORA only: cached local path of the downloaded turbo LoRA safetensors,
         # resolved once per process by `_download_turbo_lora_if_needed()`.
         self._turbo_lora_path: str | None = None
+        # Instant-apply turbo toggle (see core/settings.py / _TurboLoRALinear.enabled):
+        # whether `apply_turbo_lora()` has structurally wrapped `transformer`'s Linear
+        # modules yet. Wrapping only ever happens once per transformer instance (lazily,
+        # on the first request that asks for turbo=1) -- once wrapped, every later
+        # request just flips `_TurboLoRALinear.enabled` via `set_turbo_lora_enabled()`,
+        # which is instant (no reload). Reset to False whenever `transformer` itself is
+        # freed/reloaded (a fresh module has no wrapping yet).
+        self._turbo_lora_wrapped = False
+        self._turbo_lora_wrapped_ref = False
 
     # ------------------------------------------------------------------
     # Component lifecycle
@@ -1199,6 +1240,7 @@ class MiniMaxH3Runner:
             # module comment for why a handful of turbo steps leaves FBC no safe window.
             self._download_turbo_lora_if_needed()
             n = apply_turbo_lora(self._pipe.transformer, self._turbo_lora_path)
+            self._turbo_lora_wrapped = True
             logger.info("H3_TURBO_LORA=1: applied turbo LoRA (%d layers wrapped), FBC force-disabled", n)
         if H3_ATTN_BACKEND:
             self._pipe.transformer.set_attention_backend(H3_ATTN_BACKEND)
@@ -1418,6 +1460,7 @@ class MiniMaxH3Runner:
         del self._pipe.transformer
         self._pipe.transformer = None
         self._transformer_loaded = False
+        self._turbo_lora_wrapped = False
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("transformer freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
@@ -1598,9 +1641,139 @@ class MiniMaxH3Runner:
         del self._pipe_ref.transformer_ref
         self._pipe_ref.transformer_ref = None
         self._transformer_ref_loaded = False
+        self._turbo_lora_wrapped_ref = False
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("transformer_ref freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
+
+    # ------------------------------------------------------------------
+    # Instant-apply per-request settings (cache/attn/turbo) -- see core/settings.py's
+    # module docstring for the full instant-vs-reload split. Every method here is meant
+    # to run in well under a second (no reload, no big tensor copy) and is applied fresh
+    # at the top of every generate()/generate_ref2va() call, right after that request's
+    # transformer is confirmed GPU-resident and before denoise starts -- so a client
+    # that never passes these fields sees byte-for-byte the same behaviour as before
+    # they existed (whatever the process-wide H3_CACHE/H3_ATTN_BACKEND/H3_TURBO_LORA
+    # env vars resolved to at transformer-load time), and a client that does pass them
+    # gets an immediate per-request override with no server restart or model reload.
+    # ------------------------------------------------------------------
+    def _apply_cache_setting(self, transformer, cache: str, threshold: float, label: str = "transformer"):
+        """Enable/disable FirstBlockCache on an already-loaded transformer, or just
+        change its threshold, without any reload.
+
+        `cache`: "fbc" or "none". `threshold`: only meaningful when cache == "fbc".
+        Idempotent per (cache, threshold) pair -- re-applying the same combination is a
+        cheap no-op (checked via `_cache_config` introspection) rather than an
+        unnecessary disable+re-enable, which would also needlessly reset the stateful
+        cache's leftover residual from mid-request (harmless here since this is only
+        ever called between requests, before the loop, but kept minimal anyway).
+        `enable_cache()` raises `ValueError` if a cache is already enabled (see
+        `MiniMaxH3Transformer3DModel.enable_cache`'s source, inherited from
+        `CacheMixin`) -- so an existing FBC hook must always be `disable_cache()`d
+        first before installing a new one, even just to change the threshold.
+        """
+        if transformer is None:
+            return
+        from diffusers.hooks import FirstBlockCacheConfig
+
+        currently_enabled = bool(getattr(transformer, "is_cache_enabled", False))
+        current_threshold = None
+        if currently_enabled:
+            current_config = getattr(transformer, "_cache_config", None)
+            current_threshold = getattr(current_config, "threshold", None)
+
+        if cache == "fbc":
+            if currently_enabled and current_threshold == threshold:
+                return  # already exactly this configuration
+            if currently_enabled:
+                transformer.disable_cache()
+            _register_minimax_h3_block_for_fbc()
+            transformer.enable_cache(FirstBlockCacheConfig(threshold=threshold))
+            logger.info("%s: FirstBlockCache enabled (threshold=%s)", label, threshold)
+        else:
+            if currently_enabled:
+                transformer.disable_cache()
+                logger.info("%s: FirstBlockCache disabled", label)
+
+    def _apply_attn_setting(self, transformer, attn: str, label: str = "transformer"):
+        """Set the attention backend on an already-loaded transformer, no reload.
+
+        `attn`: "default" (diffusers' own native/SDPA dispatch -- `set_attention_backend`
+        is simply never called, byte-for-byte the same as this project's own
+        `H3_ATTN_BACKEND=""` behaviour) or any `AttentionBackendName` value (e.g. "sage",
+        "native"). `set_attention_backend()` itself is a pure attribute-set over every
+        attention submodule (see its source: no tensor copy, no reload) -- safe and cheap
+        to call on every request even when the value has not changed.
+        """
+        if transformer is None:
+            return
+        if attn and attn != "default":
+            transformer.set_attention_backend(attn)
+            logger.info("%s: attention backend set to %r", label, attn)
+        # attn == "default"/"" : leave whatever backend is already active alone. There is
+        # no diffusers API to "unset" a backend back to native once another has been
+        # selected other than explicitly requesting "native" -- but this project's own
+        # process-wide default is native/SDPA (H3_ATTN_BACKEND=""'s behaviour, i.e.
+        # set_attention_backend is simply never called at load time), so a request that
+        # wants that same default explicitly should pass attn="native", not "default".
+        # "default" here specifically means "do not touch whatever the server's current
+        # backend is" -- distinguishing "no opinion" from "force native" matters once a
+        # previous request in this same process instant-applied a non-default backend.
+
+    def _apply_turbo_setting(self, transformer, turbo: bool, is_ref: bool = False, progress: ProgressState | None = None):
+        """Enable/disable the turbo LoRA on an already-loaded transformer for this
+        request only, no reload.
+
+        First call with `turbo=True` against a given transformer instance structurally
+        wraps its Linear modules via `apply_turbo_lora()` (downloading the ~780MB
+        checkpoint once per process if not already cached, and paying the one-time
+        `fuse_projections()` + wrap cost, a few seconds) -- every later call, on either
+        transformer instance, just flips `_TurboLoRALinear.enabled` via
+        `set_turbo_lora_enabled()`, which is instant. Wrapping state is tracked per
+        transformer instance (`self._turbo_lora_wrapped` / `_wrapped_ref`) and reset to
+        False whenever that transformer is freed/reloaded (see `_free_transformer(_ref)`)
+        since a fresh module has no wrapping yet.
+        """
+        if transformer is None:
+            return
+        wrapped_attr = "_turbo_lora_wrapped_ref" if is_ref else "_turbo_lora_wrapped"
+        label = "transformer_ref" if is_ref else "transformer"
+        if turbo and not getattr(self, wrapped_attr):
+            if progress:
+                progress.update(message=f"turbo LoRA を {label} へ適用中...")
+            self._download_turbo_lora_if_needed()
+            n = apply_turbo_lora(transformer, self._turbo_lora_path)
+            setattr(self, wrapped_attr, True)
+            logger.info("turbo LoRA lazily applied to %s (%d layers wrapped)", label, n)
+        elif getattr(self, wrapped_attr):
+            n = set_turbo_lora_enabled(transformer, turbo)
+            logger.debug("%s: turbo LoRA %s (%d wrapper modules)", label, "enabled" if turbo else "disabled", n)
+        # else: turbo requested False and it was never wrapped in the first place --
+        # nothing to do, the transformer's Linears are still the plain unwrapped ones.
+
+    def apply_instant_settings(
+        self,
+        transformer,
+        resolved: dict,
+        is_ref: bool = False,
+        progress: ProgressState | None = None,
+    ) -> None:
+        """Apply the full instant-apply settings group (cache/attn/turbo) to one
+        transformer instance, in the order that matters least-to-most structural:
+        attention backend (pure attribute set) -> cache (hook install/remove) -> turbo
+        (Linear module wrap, only on first use). See each `_apply_*_setting` method's
+        own docstring. Called from `generate()`/`generate_ref2va()` right after the
+        request's transformer is confirmed resident, before the denoise loop.
+
+        `resolved` is the dict `core.settings.resolve_instant_settings()` returns --
+        uses `resolved["effective_cache"]` (not `resolved["cache"]`) so a turbo=True
+        request's FBC force-off (see that function's docstring) actually takes effect
+        on the transformer, not just in the reported settings.
+        """
+        label = "transformer_ref" if is_ref else "transformer"
+        self._apply_attn_setting(transformer, resolved["attn"], label=label)
+        self._apply_cache_setting(transformer, resolved["effective_cache"], resolved["cache_threshold"], label=label)
+        self._apply_turbo_setting(transformer, resolved["turbo"], is_ref=is_ref, progress=progress)
 
     def _free_other_variant_transformer(self, variant: str):
         """Free the *other* variant's big transformer (if resident) so this request's own
@@ -1838,6 +2011,57 @@ class MiniMaxH3Runner:
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("text_encoder freed (force=%s). gpu=%s ram=%s", force, gpu_mem_gb(), ram_gb())
+
+    def _free_vaes(self):
+        """Drop vae/audio_vae entirely (not just move to CPU -- see `_vae_to_cpu` for the
+        short-window move used mid-request; this is the full free, used only by
+        `unload_all()`). Needed because `_ensure_vaes()` early-returns when
+        `self._vae_loaded` is already True, so a reload-group change to
+        `H3_VIDEO_VAE_FP16` (whether the video VAE is cast to fp16 after load) or
+        `TE_QUANT` (whether the VAE pair defaults to parked-on-CPU or
+        permanently-on-GPU) would otherwise silently keep serving the *old* VAE
+        placement/dtype after `apply_reload_settings()` flips the underlying env-var
+        equivalents. Same "drop in place, no CPU staging" shape as
+        `_free_transformer`/`_free_text_encoder` (CLAUDE.md #33) -- the VAE pair is only
+        ~11GB either way, small enough that staging concerns do not really apply, but
+        consistency with the rest of this file's unload methods is kept anyway.
+        """
+        if not self._vae_loaded:
+            return
+        if getattr(self._pipe, "vae", None) is not None:
+            del self._pipe.vae
+            self._pipe.vae = None
+        if getattr(self._pipe, "audio_vae", None) is not None:
+            del self._pipe.audio_vae
+            self._pipe.audio_vae = None
+        self._vae_loaded = False
+        self._vae_on_gpu = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("vae/audio_vae freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
+
+    def unload_all(self):
+        """Free every big model this runner may be holding (both transformers, both
+        text_encoder references, the VAE pair) -- used by
+        `core.settings.apply_reload_settings()` before reloading under a new
+        configuration, and safe to call any time nothing is mid-request (callers must
+        hold the same lock `generate()`/`generate_ref2va()` use -- `apply_reload_settings`
+        gets this for free via the app-level generation lock, see app.py).
+
+        Deliberately does NOT drop `self._pipe`/`self._pipe_ref` (the ModularPipeline
+        shells themselves) -- rebuilding those is cheap and stateless (see
+        `_ensure_pipe_shell`/`_ensure_pipe_ref_shell`'s own docstrings: no component
+        weights, just the block-spec wiring), so there is no reason to pay that cost
+        again. `_active_variant` is reset to None since neither transformer is resident
+        any more after this call.
+        """
+        t0 = time.time()
+        self._free_transformer()
+        self._free_transformer_ref()
+        self._free_text_encoder(force=True)
+        self._free_vaes()
+        self._active_variant = None
+        logger.info("unload_all: done in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
 
     def preload_all(self):
         """Load the steady-state residents once at startup.
@@ -2108,6 +2332,10 @@ class MiniMaxH3Runner:
         last_image: Image.Image | None = None,
         progress: ProgressState | None = None,
         upscale: int = 0,
+        cache: str | None = None,
+        cache_threshold: float | None = None,
+        attn: str | None = None,
+        turbo: bool | None = None,
     ) -> dict:
         """
         Runs T2VA (image=None, last_image=None) or FL2VA (either/both given).
@@ -2120,8 +2348,18 @@ class MiniMaxH3Runner:
         at 2x resolution. The returned `height`/`width` reflect the actual (2x) output
         resolution in that case.
 
+        `cache`/`cache_threshold`/`attn`/`turbo`: instant-apply per-request overrides
+        (see core/settings.py) for FirstBlockCache, the attention backend, and the
+        turbo LoRA -- each defaults to whatever this process's own H3_CACHE/
+        H3_CACHE_THRESHOLD/H3_ATTN_BACKEND/H3_TURBO_LORA env var resolved to when left
+        `None`, so an existing caller that never passes these sees unchanged behaviour.
+        Applied in-place to the already-resident transformer, no reload.
+
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats.
         """
+        import core.settings as settings
+
+        instant = settings.resolve_instant_settings(cache, cache_threshold, attn, turbo)
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
             MiniMaxH3PrepareLatentsStep,
             MiniMaxH3PrepareLayoutStep,
@@ -2162,13 +2400,13 @@ class MiniMaxH3Runner:
             # mind (see H3_LOWVRAM's module comment). Fail loudly rather than risk an
             # OOM mid-request.
             raise ValueError(f"upscale=1 (hires-fix) is not supported with H3_LOWVRAM={H3_LOWVRAM_RAW!r}.")
-        if do_upscale and H3_TURBO_LORA:
-            # Not part of this task's A/B scope (5/8/16/30-step single-pass only) and the
-            # hires-fix branch's own FBC bookkeeping (`_fbc_last_step_was_skip()` calls
-            # further down) is not guarded against H3_TURBO_LORA the way the single-pass
-            # path's is -- rather than silently skip that bookkeeping too, reject the
-            # combination until it is actually verified.
-            raise ValueError("upscale=1 (hires-fix) is not supported with H3_TURBO_LORA=1.")
+        # Not part of this task's A/B scope (5/8/16/30-step single-pass only) and the
+        # hires-fix branch's own FBC bookkeeping (`_fbc_last_step_was_skip()` calls
+        # further down) is not guarded against turbo the way the single-pass path's is
+        # -- rather than silently skip that bookkeeping too, reject the combination
+        # until it is actually verified. Checked against the *resolved* (possibly
+        # request-overridden) turbo value, not the raw H3_TURBO_LORA env-var default.
+        settings.validate_instant_settings_for_upscale(instant, do_upscale)
 
         with self._load_lock:
             if H3_LOWVRAM:
@@ -2471,6 +2709,17 @@ class MiniMaxH3Runner:
         # `height`/`width` args.
         out_height, out_width = state.get("height"), state.get("width")
 
+        # Instant-apply this request's cache/attn/turbo settings now that `transformer`
+        # is confirmed resident in every branch above (this is the first point after the
+        # if/elif/else above where that is unconditionally true) -- no reload, see
+        # `apply_instant_settings()`'s own docstring. Every gate from here on in this
+        # method reads `instant["cache"]`/`instant["turbo"]` (the *resolved*,
+        # possibly-request-overridden values), not the raw H3_CACHE/H3_TURBO_LORA
+        # globals, so a request that left these fields unset still gets exactly the
+        # same behaviour as before this feature existed (resolve_instant_settings()
+        # already folded the current globals in as the default).
+        self.apply_instant_settings(self._pipe.transformer, instant, is_ref=False, progress=progress)
+
         def _fbc_reset_and_context():
             # Same reasoning as the single-pass path below: per-request/per-pass reset is
             # required so a stale residual from a previous call (previous request, or
@@ -2523,14 +2772,14 @@ class MiniMaxH3Runner:
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 step_times.append(time.time() - ts)
-                if H3_CACHE == "fbc" and not H3_TURBO_LORA:
+                if instant["effective_cache"] == "fbc":
                     cache_skips[0] += self._fbc_last_step_was_skip()
                 if progress:
                     progress.update(step=i + 1, message=f"デノイズ中 {i + 1}/{num_inference_steps}")
                 return result
 
             denoise_step.loop_step = timed_loop_step
-            if H3_CACHE == "fbc" and not H3_TURBO_LORA:
+            if instant["effective_cache"] == "fbc":
                 # Per-request reset: `FirstBlockCache`'s hooks are stateful (cached head-block
                 # residual/output + tail-block residuals persist on the transformer submodules
                 # between calls, see FBCSharedBlockState in first_block_cache.py). Without this
@@ -2622,7 +2871,7 @@ class MiniMaxH3Runner:
                 # `num_condition_video_rows` is always 0 here (t2va only, enforced earlier
                 # in generate()), so `bstate.latents`/`bstate.noise_pred[0]` are entirely
                 # generated video rows with no conditioning-row prefix to skip.
-                fbc_cm = _fbc_reset_and_context() if H3_CACHE == "fbc" else None
+                fbc_cm = _fbc_reset_and_context() if instant["effective_cache"] == "fbc" else None
                 cm = fbc_cm if fbc_cm is not None else _NullContext()
                 with cm:
                     for i in range(i_start, i_end):
@@ -2636,7 +2885,7 @@ class MiniMaxH3Runner:
                             last_step_info["t"] = float(t)
                         _, bstate = scheduler_block(pipe, bstate, i=i, t=t)
                         step_times.append(time.time() - ts)
-                        if H3_CACHE == "fbc":
+                        if instant["effective_cache"] == "fbc":
                             cache_skips[0] += self._fbc_last_step_was_skip()
                         if progress:
                             progress.update(
@@ -2817,10 +3066,19 @@ class MiniMaxH3Runner:
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
-            "attn_backend": H3_ATTN_BACKEND or "default",
-            "cache_mode": H3_CACHE if not H3_TURBO_LORA else "none (force-disabled by H3_TURBO_LORA)",
-            "cache_threshold": H3_CACHE_THRESHOLD if (H3_CACHE == "fbc" and not H3_TURBO_LORA) else None,
-            "turbo_lora": H3_TURBO_LORA,
+            # Instant-apply settings actually used for this request (resolved --
+            # reflects any per-request cache/cache_threshold/attn/turbo override, not
+            # just the process-wide env-var defaults). "cache_mode" mirrors the old
+            # field name/shape (a human-readable string noting the turbo force-off)
+            # for backward compatibility with any existing caller parsing this field;
+            # "cache"/"turbo"/"attn_backend" below are the new, directly-machine-
+            # readable equivalents.
+            "attn_backend": instant["attn"],
+            "cache_mode": instant["cache"] if not instant["turbo"] else "none (force-disabled by turbo=1)",
+            "cache": instant["effective_cache"],
+            "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
+            "turbo_lora": instant["turbo"],
+            "turbo": instant["turbo"],
             "upscale": int(do_upscale),
             "hires_denoise": H3_HIRES_DENOISE if do_upscale else None,
             "pass1_steps": n1 if do_upscale else None,
@@ -2829,9 +3087,8 @@ class MiniMaxH3Runner:
             "interpolate_time_s": round(interpolate_time, 3) if interpolate_time is not None else None,
             "pass2_time_s": round(pass2_time, 2) if pass2_time is not None else None,
             # Number of denoise steps where FBC skipped the tail blocks (cache hit).
-            # Always 0 in `none` mode (the counter never increments there) and always
-            # None under H3_TURBO_LORA (FBC is force-disabled, see above).
-            "cache_skipped_steps": cache_skips[0] if (H3_CACHE == "fbc" and not H3_TURBO_LORA) else None,
+            # Always 0 in `none`/turbo mode (the counter never increments there).
+            "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
         }
         if progress:
             progress.update(phase="done", message="完了", result_path=str(mp4_path))
@@ -2851,6 +3108,10 @@ class MiniMaxH3Runner:
         num_inference_steps: int = 30,
         seed: int | None = None,
         progress: ProgressState | None = None,
+        cache: str | None = None,
+        cache_threshold: float | None = None,
+        attn: str | None = None,
+        turbo: bool | None = None,
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
@@ -2871,9 +3132,18 @@ class MiniMaxH3Runner:
         assumes t2va's `num_condition_video_rows == 0`, which is never true here (a
         reference always adds condition rows).
 
+        `cache`/`cache_threshold`/`attn`/`turbo`: same instant-apply overrides as
+        `generate()` (see core/settings.py), applied to `transformer_ref` instead of
+        `transformer`. `upscale` is not a parameter here at all (see above), so there is
+        no upscale-vs-turbo interaction to validate on this path.
+
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats, in the
         same shape `generate()` returns (plus `references_summary`).
         """
+        import core.settings as settings
+
+        instant = settings.resolve_instant_settings(cache, cache_threshold, attn, turbo)
+
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
             MiniMaxH3PrepareLatentsStep,
             MiniMaxH3Ref2VAPrepareLayoutStep,
@@ -3197,6 +3467,11 @@ class MiniMaxH3Runner:
         cache_skips = [0]
         out_height, out_width = state.get("height"), state.get("width")
 
+        # Instant-apply this request's cache/attn/turbo settings -- see generate()'s
+        # matching comment for the full reasoning. `transformer_ref` is confirmed
+        # resident by every branch above this point.
+        self.apply_instant_settings(self._pipe_ref.transformer_ref, instant, is_ref=True, progress=progress)
+
         def _fbc_reset_and_context():
             self._pipe_ref.transformer_ref._reset_stateful_cache()
             return self._pipe_ref.transformer_ref.cache_context("h3")
@@ -3208,14 +3483,14 @@ class MiniMaxH3Runner:
             ts = time.time()
             result = orig_loop_step(components, bstate, i=i, t=t)
             step_times.append(time.time() - ts)
-            if H3_CACHE == "fbc":
+            if instant["effective_cache"] == "fbc":
                 cache_skips[0] += self._fbc_last_step_was_skip_ref()
             if progress:
                 progress.update(step=i + 1, message=f"デノイズ中 {i + 1}/{num_inference_steps}")
             return result
 
         denoise_step.loop_step = timed_loop_step
-        if H3_CACHE == "fbc":
+        if instant["effective_cache"] == "fbc":
             # Per-request reset -- see generate()'s matching comment for why this is
             # required (a stale head-block residual from a previous call could otherwise
             # make step 0 wrongly skip).
@@ -3362,10 +3637,13 @@ class MiniMaxH3Runner:
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
-            "attn_backend": H3_ATTN_BACKEND or "default",
-            "cache_mode": H3_CACHE,
-            "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
-            "cache_skipped_steps": cache_skips[0] if H3_CACHE == "fbc" else None,
+            "attn_backend": instant["attn"],
+            "cache_mode": instant["cache"] if not instant["turbo"] else "none (force-disabled by turbo=1)",
+            "cache": instant["effective_cache"],
+            "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
+            "turbo_lora": instant["turbo"],
+            "turbo": instant["turbo"],
+            "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
