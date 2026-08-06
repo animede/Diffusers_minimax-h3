@@ -686,6 +686,46 @@ venv/bin/python scripts/probe_t2va.py
 - `GET /api/status`: ロード状態・VRAM/RAM
 - `GET /api/progress`: 生成中の進捗ポーリング用
 
+## 今後の外部イベント待ち(積み残し、2026-08-06時点)
+
+### 1. diffusers PR #14355 のマージ待ち — **安易に上げないこと**
+
+本アプリは PR #14355(`Add MiniMax-H3`)のブランチに依存する。2026-08-06時点で
+**open / draft / 未マージ**(mergeable_state: unstable)。venvは
+`refs/pull/14355/head` の **abc5e9b(2026-08-02)にピン留め**されている
+(`pip` の `direct_url.json` で確認可)。
+
+**上げると壊れる可能性が高い**: 8/4〜8/5にPRへ4コミット追加されており、特に
+`8ab3662`(Minimax h3 follow up: review & refactor、#14371)と
+`99ced1b`(Fix the H3 fast tests against **the refactored state contract**)が入っている。
+本アプリの `core/runner.py` は Modular のブロック(`MiniMaxH3SetTimestepsStep`、
+`MiniMaxH3LoopDenoiser` 等)を**自前で呼び**、`get_block_state()`/`set_block_state()`・
+`state.get(...)`・`row_timestep_plan` といった state 契約に強く依存しているため、
+この refactor に追従するには相応の改修が要る。**現構成は全機能をA/B実測済みなので、
+マージされるまでは据え置きが安全**。追従する際は「まず t2va の同一seed MD5一致」で
+回帰を確認すること(本リポジトリの各機能はこの手法で等価性を検証してある)。
+
+なお int8 レシピ(`TorchAoConfig` + `Int8WeightOnlyConfig`)は abc5e9b に既に含まれて
+おり、**マージを待たずに使える**(`H3_TRANSFORMER_QUANT=int8` として実装済み)。
+
+### 2. Turbo LoRA 完成版のリリース待ち
+
+`H3_TURBO_LORA=1` の配線は完成済み(上記セクション参照)。現行LoRAは作者(Ostris氏)が
+「デモ/プレビュー、学習途上」と明記しているため既定OFF。**完成版が出たら、
+LoRAファイルの差し替えと同一seed A/Bだけで既定化を判断できる**状態にしてある。
+
+### 3. 未着手の改善候補(優先度順、いずれも急ぎではない)
+
+- **量子化済みチェックポイントの事前保存**: `H3_LOWVRAM=1`/`group` はリクエストごとに
+  TE/transformerを再ロードするため ~90-100s の固定費がある。bnb-4bit は
+  `save_pretrained` で直列化できるはず、torchao int8 は要調査。効けば低VRAMモードの
+  体感が大きく変わる
+- **16GB級対応**: TEのストリーミング実行(ブロック単位でGPUへ流す)が必要。現状の床は
+  TE-nf4削除版の常駐17.45GB(上記セクション参照)
+- **torch.compile**: 未検証。FBC/group offload の hook との相性(graph break)確認が要る
+- **torchao の C++ カーネル**: int8モードの dequant コスト(+5s)を解消しうるが
+  torch>=2.11 が必要で、venv全体のリグレッションリスクが大きい(非推奨)
+
 ## ライセンス注意
 
 MiniMax Community License(非商用無料、商用は年商$20M未満まで、要クレジット)。
