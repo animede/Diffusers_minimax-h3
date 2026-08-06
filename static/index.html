@@ -128,6 +128,59 @@
     cursor: pointer;
   }
   .dropzone-clear:hover { color: var(--text); border-color: var(--accent); }
+  /* Ref2VA 参照タイル(左列=画像 / 右列=動画・音声) */
+  .ref-cols { display: flex; gap: 10px; margin-top: 10px; align-items: flex-start; }
+  .ref-col { flex: 1; min-width: 0; }
+  .ref-col-title { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .ref-tile {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px;
+    margin-bottom: 6px;
+    background: rgba(255,255,255,0.02);
+  }
+  .ref-thumb {
+    width: 56px;
+    height: 42px;
+    flex: none;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #0a0c10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+  }
+  .ref-thumb img, .ref-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .ref-meta { flex: 1; min-width: 0; }
+  .ref-name {
+    font-size: 12px;
+    color: var(--accent);
+    font-family: ui-monospace, monospace;
+  }
+  .ref-fname {
+    font-size: 11px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ref-del {
+    flex: none;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    border-radius: 6px;
+    width: 22px;
+    height: 22px;
+    line-height: 1;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .ref-del:hover { color: var(--error); border-color: var(--error); }
   .status-box {
     margin-top: 14px;
     font-size: 12px;
@@ -289,16 +342,25 @@
         <div class="dropzone" id="dz-ref-files">
           <span class="dropzone-icon">📎</span>
           <span class="dropzone-text">ドラッグ&ドロップ、またはクリックして選択(複数可・追加されます)</span>
-          <button type="button" class="dropzone-clear" style="display:none;">クリア</button>
           <input type="file" id="ref-files" multiple accept="image/*,video/*,audio/*">
         </div>
         <div class="hint">
-          <b>選択した順序がそのまま参照順になります</b>(プロンプト内の &lt;Picture i&gt;/&lt;Video k&gt;/&lt;Audio j&gt;
-          ラベルとrotary配置に反映)。種別はファイルの拡張子/content-typeから自動判定。
+          <b>追加した順序がそのまま参照順になります</b>。各参照はプロンプト内で下のタイルに表示される
+          名前(&lt;Picture i&gt;/&lt;Video k&gt;/&lt;Audio j&gt;、種別ごとに1始まり)で参照できます。
           音声を含む参照(音声単体 or 音声付き動画)がちょうど1本のときのみ、下の秒数を
           空欄にしてその音声長を生成尺として使えます。
         </div>
-        <div id="ref-file-list" class="hint" style="margin-top:8px;"></div>
+        <div class="ref-cols" id="ref-cols" style="display:none;">
+          <div class="ref-col">
+            <div class="ref-col-title">画像 (<span id="ref-count-image">0</span>/9)</div>
+            <div id="ref-col-images"></div>
+          </div>
+          <div class="ref-col">
+            <div class="ref-col-title">動画 (<span id="ref-count-video">0</span>/3)・音声/音楽 (<span id="ref-count-audio">0</span>/3)</div>
+            <div id="ref-col-media"></div>
+          </div>
+        </div>
+        <div id="ref-order-line" class="hint" style="margin-top:6px;"></div>
       </div>
 
       <div class="row" id="resolution-row">
@@ -373,7 +435,6 @@ const fl2vaFields = document.getElementById('fl2va-fields');
 const ref2vaFields = document.getElementById('ref2va-fields');
 const resolutionRow = document.getElementById('resolution-row');
 const refFilesEl = document.getElementById('ref-files');
-const refFileListEl = document.getElementById('ref-file-list');
 
 let mode = 't2va';
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -404,16 +465,125 @@ function _refKindLabel(file) {
   return '不明';
 }
 
-refFilesEl.addEventListener('change', () => {
-  const files = Array.from(refFilesEl.files);
-  if (!files.length) {
-    refFileListEl.textContent = '';
-    return;
+// --- Ref2VA 参照の管理(モデル仕様上限・参照名解決・タイル表示) ---
+// サーバ/diffusers側の仕様(packing_ref2va.py): 画像≤9・動画≤3・音声≤3・計≤12。
+// プロンプト内ラベルは種別ごとに1始まり・リクエスト順で <Picture i>/<Video k>/<Audio j>。
+// input.files は削除操作を表現しづらいため、JS配列 refItems を唯一の真実とし、
+// 送信時はここから FormData を組み立てる(配列順=参照順)。
+const REF_LIMITS = { '画像': 9, '動画': 3, '音声': 3 };
+const REF_TOTAL_LIMIT = 12;
+const REF_LABEL_NAME = { '画像': 'Picture', '動画': 'Video', '音声': 'Audio' };
+let refItems = [];  // [{file, kind, url}]
+
+const refColsEl = document.getElementById('ref-cols');
+const refColImagesEl = document.getElementById('ref-col-images');
+const refColMediaEl = document.getElementById('ref-col-media');
+const refOrderLineEl = document.getElementById('ref-order-line');
+const refDropzoneEl = document.getElementById('dz-ref-files');
+
+function refKindCounts() {
+  const c = { '画像': 0, '動画': 0, '音声': 0 };
+  refItems.forEach(it => { if (c[it.kind] !== undefined) c[it.kind]++; });
+  return c;
+}
+
+function addRefFiles(files) {
+  const rejected = [];
+  const counts = refKindCounts();
+  for (const f of files) {
+    const kind = _refKindLabel(f);
+    if (kind === '不明') { rejected.push(`${f.name}(種別不明)`); continue; }
+    if (refItems.length >= REF_TOTAL_LIMIT) { rejected.push(`${f.name}(計12まで)`); continue; }
+    if (counts[kind] >= REF_LIMITS[kind]) { rejected.push(`${f.name}(${kind}は最大${REF_LIMITS[kind]})`); continue; }
+    counts[kind]++;
+    refItems.push({ file: f, kind, url: URL.createObjectURL(f) });
   }
-  refFileListEl.innerHTML = '参照順: ' + files
-    .map((f, i) => `${i + 1}. [${_refKindLabel(f)}] ${f.name}`)
-    .join(' &nbsp;→&nbsp; ');
-});
+  if (rejected.length) {
+    setStatus('上限のため追加できませんでした: ' + rejected.join(', '), true);
+  }
+  renderRefItems();
+}
+
+function removeRefItem(idx) {
+  const [removed] = refItems.splice(idx, 1);
+  if (removed) URL.revokeObjectURL(removed.url);
+  renderRefItems();
+}
+
+function refDisplayName(item, perKindIndex) {
+  return `<${REF_LABEL_NAME[item.kind]} ${perKindIndex}>`;
+}
+
+function renderRefItems() {
+  refColImagesEl.innerHTML = '';
+  refColMediaEl.innerHTML = '';
+  const perKind = { '画像': 0, '動画': 0, '音声': 0 };
+  const orderParts = [];
+
+  refItems.forEach((item, idx) => {
+    perKind[item.kind]++;
+    const label = refDisplayName(item, perKind[item.kind]);
+    orderParts.push(label);
+
+    const tile = document.createElement('div');
+    tile.className = 'ref-tile';
+
+    const thumb = document.createElement('div');
+    thumb.className = 'ref-thumb';
+    if (item.kind === '画像') {
+      const img = document.createElement('img');
+      img.src = item.url;
+      img.alt = item.file.name;
+      thumb.appendChild(img);
+    } else if (item.kind === '動画') {
+      // preload=metadata + muted で先頭フレームがサムネイルとして描画される
+      const v = document.createElement('video');
+      v.src = item.url;
+      v.muted = true;
+      v.preload = 'metadata';
+      v.playsInline = true;
+      thumb.appendChild(v);
+    } else {
+      thumb.textContent = '🎵';
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'ref-meta';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'ref-name';
+    nameEl.textContent = label;
+    const fnameEl = document.createElement('div');
+    fnameEl.className = 'ref-fname';
+    fnameEl.textContent = item.file.name;
+    fnameEl.title = item.file.name;
+    meta.appendChild(nameEl);
+    meta.appendChild(fnameEl);
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'ref-del';
+    del.textContent = '×';
+    del.title = 'この参照を削除(以降の参照名は自動で振り直されます)';
+    del.addEventListener('click', () => removeRefItem(idx));
+
+    tile.appendChild(thumb);
+    tile.appendChild(meta);
+    tile.appendChild(del);
+    (item.kind === '画像' ? refColImagesEl : refColMediaEl).appendChild(tile);
+  });
+
+  const counts = refKindCounts();
+  document.getElementById('ref-count-image').textContent = counts['画像'];
+  document.getElementById('ref-count-video').textContent = counts['動画'];
+  document.getElementById('ref-count-audio').textContent = counts['音声'];
+
+  refColsEl.style.display = refItems.length ? 'flex' : 'none';
+  // 上限到達時はD&Dエリア自体を出さない
+  refDropzoneEl.style.display = refItems.length >= REF_TOTAL_LIMIT ? 'none' : 'flex';
+  refOrderLineEl.textContent = refItems.length
+    ? '参照順(rotary配置順): ' + orderParts.join(' → ')
+    : '';
+}
 
 // --- ドラッグ&ドロップ対応のファイル選択 ---
 // input[type=file] はそのまま残し(既存の送信ロジックが .files を読む)、
@@ -485,7 +655,24 @@ function setupDropzone(zoneId, inputEl, opts) {
 
 setupDropzone('dz-image', imageFileEl, { multiple: false });
 setupDropzone('dz-last-image', lastImageFileEl, { multiple: false });
-setupDropzone('dz-ref-files', refFilesEl, { multiple: true });
+
+// Ref2VA のドロップゾーンは refItems 配列で管理する専用配線(setupDropzoneは使わない)
+refDropzoneEl.addEventListener('click', () => refFilesEl.click());
+refFilesEl.addEventListener('change', () => {
+  addRefFiles(Array.from(refFilesEl.files || []));
+  refFilesEl.value = '';  // 同じファイルを続けて選んでも change が発火するようリセット
+});
+['dragenter', 'dragover'].forEach(ev => refDropzoneEl.addEventListener(ev, (e) => {
+  e.preventDefault(); e.stopPropagation(); refDropzoneEl.classList.add('dragover');
+}));
+['dragleave', 'dragend'].forEach(ev => refDropzoneEl.addEventListener(ev, (e) => {
+  e.preventDefault(); e.stopPropagation(); refDropzoneEl.classList.remove('dragover');
+}));
+refDropzoneEl.addEventListener('drop', (e) => {
+  e.preventDefault(); e.stopPropagation();
+  refDropzoneEl.classList.remove('dragover');
+  addRefFiles(Array.from(e.dataTransfer.files || []));
+});
 
 // ドロップ位置を外した時にブラウザがファイルを開いてしまうのを防ぐ
 ['dragover', 'drop'].forEach(ev => document.addEventListener(ev, (e) => {
@@ -615,16 +802,16 @@ form.addEventListener('submit', async (ev) => {
     if (lastImageFileEl.files[0]) fd.append('last_image', lastImageFileEl.files[0]);
   } else if (mode === 'ref2va') {
     url = '/api/ref2va';
-    const refFiles = Array.from(refFilesEl.files);
-    if (!refFiles.length) {
-      setStatus('参照ファイルを1つ以上選択してください', true);
+    if (!refItems.length) {
+      setStatus('参照ファイルを1つ以上追加してください', true);
       generateBtn.disabled = false;
       generateBtn.textContent = '生成';
       if (polling) { clearInterval(polling); polling = null; }
       return;
     }
-    // Append order matters: this is what the server packs as reference order.
-    refFiles.forEach(f => fd.append('references', f));
+    // Append order matters: this is what the server packs as reference order
+    // (refItems の配列順 = UI表示の <Picture i>/<Video k>/<Audio j> の採番順)。
+    refItems.forEach(it => fd.append('references', it.file));
     // Seconds may be left blank for Ref2VA (server derives it from a lone
     // audio-bearing reference); only send it when the user filled it in.
     if (secondsEl.value) fd.append('seconds', secondsEl.value);
