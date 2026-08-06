@@ -851,10 +851,19 @@ LoRAファイルの差し替えと同一seed A/Bだけで既定化を判断で�
 - **torchao の C++ カーネル**: int8モードの dequant コスト(+5s)を解消しうるが
   torch>=2.11 が必要で、venv全体のリグレッションリスクが大きい(非推奨)
 
-## ライセンス注意
+## ライセンス
 
-MiniMax Community License(非商用無料、商用は年商$20M未満まで、要クレジット)。
-本ワークスペース自体はモデル重みを含まない。
+**このリポジトリのコードは Apache License 2.0**([LICENSE](LICENSE))。
+モデル重みは含まれない。
+
+使用するモデル/重みのライセンスは別途それぞれに従うこと:
+
+| 対象 | ライセンス |
+|---|---|
+| MiniMax-H3 本体の重み | MiniMax Community License(非商用無料、商用は年商$20M未満まで、要クレジット) |
+| Turbo LoRA(`larryvrh/MiniMax-H3-Turbo-Lora`) | Apache-2.0 |
+| Qwen3-VL-32B(text_encoder) | Qwen 公式のライセンスに従う |
+| diffusers / transformers / torchao / SageAttention 等 | 各パッケージのライセンス |
 
 ## LLMプロンプト強化(2026-08-04追加)
 
