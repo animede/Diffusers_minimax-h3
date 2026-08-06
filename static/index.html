@@ -373,6 +373,7 @@
             <option value="768x768">768×768 (正方形)</option>
             <option value="768x1344">1344×768 (横長)</option>
             <option value="1344x768">768×1344 (縦長)</option>
+            <option value="custom">任意 (32の倍数へ丸め)</option>
             <option value="auto">自動 (サーバ既定 / Ref2VAは16:9)</option>
           </select>
         </div>
@@ -381,6 +382,21 @@
           <input type="number" id="seconds" value="5" min="5" max="15" step="0.5">
         </div>
       </div>
+
+      <!-- min/max/step は付けない: 付けるとHTML5の入力検証(stepMismatch等)が
+           「丸める前の端数」を不正扱いにして送信自体をブロックしてしまう。
+           範囲外・端数はサーバ(round_canvas_value)とプレビューで丸める。 -->
+      <div class="row" id="custom-size-row" style="display:none;">
+        <div>
+          <label>幅 (px、256〜2048)</label>
+          <input type="number" id="custom-width" value="1024" placeholder="1024">
+        </div>
+        <div>
+          <label>高さ (px、256〜2048)</label>
+          <input type="number" id="custom-height" value="576" placeholder="576">
+        </div>
+      </div>
+      <div class="hint" id="size-effect-line"></div>
 
       <div class="row">
         <div>
@@ -438,6 +454,67 @@ const serverStatusEl = document.getElementById('server-status');
 const fl2vaFields = document.getElementById('fl2va-fields');
 const ref2vaFields = document.getElementById('ref2va-fields');
 const sizeRow = document.getElementById('size-row');
+const customSizeRow = document.getElementById('custom-size-row');
+const customWidthEl = document.getElementById('custom-width');
+const customHeightEl = document.getElementById('custom-height');
+const sizeEffectLineEl = document.getElementById('size-effect-line');
+
+// --- サイズ/秒数の丸めプレビュー ---
+// 丸めの権威はサーバ(app.py の round_canvas_value / seconds_to_num_frames)だが、
+// 送信前に「実際に使われる値」を見せるため同じ規則をUIでも実装する。定数は
+// /api/status の constraints から受け取り、取得できるまでは既定値で動かす。
+let H3_CONSTRAINTS = {
+  canvas_multiple: 32, canvas_min: 256, canvas_max: 2048, canvas_native_max: 1344,
+  fps: 24, frame_step: 17, frame_offset: 5,
+};
+
+function roundCanvasValue(v) {
+  const c = H3_CONSTRAINTS;
+  v = Math.max(c.canvas_min, Math.min(c.canvas_max, Math.round(Number(v) || 0)));
+  return Math.round(v / c.canvas_multiple) * c.canvas_multiple;
+}
+
+function secondsToNumFrames(sec) {
+  const c = H3_CONSTRAINTS;
+  const minS = Number(secondsEl.min) || 5, maxS = Number(secondsEl.max) || 15;
+  let s = Math.max(minS, Math.min(maxS, Number(sec)));
+  let n = Math.round(s * c.fps);
+  while (n % c.frame_step !== c.frame_offset) n++;   // align_num_frames と同じ
+  return n;
+}
+
+function updateSizeEffectLine() {
+  const parts = [];
+  if (resolutionEl.value === 'custom') {
+    const w = roundCanvasValue(customWidthEl.value);
+    const h = roundCanvasValue(customHeightEl.value);
+    let sizeText = `実際の生成サイズ: 幅${w}×高さ${h}`;
+    if (Number(customWidthEl.value) !== w || Number(customHeightEl.value) !== h) {
+      sizeText += `(入力値を${H3_CONSTRAINTS.canvas_multiple}の倍数へ丸め)`;
+    }
+    if (Math.max(w, h) > H3_CONSTRAINTS.canvas_native_max) {
+      sizeText += ` ※ネイティブ範囲(最大${H3_CONSTRAINTS.canvas_native_max})超え・VRAMと品質は未検証`;
+    }
+    parts.push(sizeText);
+  }
+  if (secondsEl.value) {
+    const n = secondsToNumFrames(secondsEl.value);
+    const dur = (n / H3_CONSTRAINTS.fps).toFixed(2);
+    parts.push(`実際の尺: ${n}フレーム (${dur}秒 @${H3_CONSTRAINTS.fps}fps、${H3_CONSTRAINTS.frame_step}n+${H3_CONSTRAINTS.frame_offset}へ切り上げ)`);
+  }
+  sizeEffectLineEl.textContent = parts.join(' / ');
+}
+
+function updateCustomSizeVisibility() {
+  customSizeRow.style.display = (resolutionEl.value === 'custom') ? 'flex' : 'none';
+  updateSizeEffectLine();
+}
+
+resolutionEl.addEventListener('change', updateCustomSizeVisibility);
+[customWidthEl, customHeightEl, secondsEl].forEach(el => {
+  el.addEventListener('input', updateSizeEffectLine);
+  el.addEventListener('change', updateSizeEffectLine);
+});
 const refFilesEl = document.getElementById('ref-files');
 
 let mode = 't2va';
@@ -459,6 +536,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     } else if (mode !== 'ref2va' && resolutionEl.value === 'auto' && resolutionEl.dataset.prevPreset) {
       resolutionEl.value = resolutionEl.dataset.prevPreset;
     }
+    updateCustomSizeVisibility();
   });
 });
 
@@ -763,6 +841,12 @@ async function refreshServerStatus() {
     const res = await fetch('/api/status');
     const data = await res.json();
     const r = data.runner;
+    if (data.constraints) {
+      H3_CONSTRAINTS = Object.assign({}, H3_CONSTRAINTS, data.constraints);
+      // min/max/step は意図的に設定しない(HTML5検証が端数入力の送信を止めるため)。
+      // 代わりにラベルへ範囲を出し、丸め結果はプレビューとサーバで担保する。
+      updateSizeEffectLine();
+    }
     serverStatusEl.innerHTML =
       `te_quant: ${r.te_quant} | busy: ${data.busy} | active_variant: ${r.active_variant ?? '-'}<br>` +
       `transformer(t2va): ${r.transformer_loaded} | transformer_ref(ref2va): ${r.transformer_ref_loaded} | vae: ${r.vae_loaded}` +
@@ -798,18 +882,28 @@ form.addEventListener('submit', async (ev) => {
   if (seedEl.value) fd.append('seed', seedEl.value);
 
   // "auto" はサーバ既定に任せる(t2va/fl2va は resolution を送らなければ 768x768、
-  // ref2va は height/width を送らなければ H3 自身の 16:9)。
-  const presetSelected = resolutionEl.value !== 'auto';
+  // ref2va は height/width を送らなければ H3 自身の 16:9)。"custom" は幅/高さを
+  // そのまま送り、丸めはサーバ(round_canvas_value)に任せる。
+  const sizeMode = resolutionEl.value;   // プリセット名 | 'custom' | 'auto'
+  const appendSize = () => {
+    if (sizeMode === 'auto') return;
+    if (sizeMode === 'custom') {
+      fd.append('height', roundCanvasValue(customHeightEl.value));
+      fd.append('width', roundCanvasValue(customWidthEl.value));
+    } else {
+      fd.append('resolution', sizeMode);
+    }
+  };
 
   let url = '/api/t2va';
   if (mode === 't2va') {
-    if (presetSelected) fd.append('resolution', resolutionEl.value);
+    appendSize();
     fd.append('seconds', secondsEl.value);
     const upscaleEl = document.getElementById('upscale');
     if (upscaleEl && upscaleEl.checked) fd.append('upscale', '1');
   } else if (mode === 'fl2va') {
     url = '/api/fl2va';
-    if (presetSelected) fd.append('resolution', resolutionEl.value);
+    appendSize();
     fd.append('seconds', secondsEl.value);
     if (imageFileEl.files[0]) fd.append('image', imageFileEl.files[0]);
     if (lastImageFileEl.files[0]) fd.append('last_image', lastImageFileEl.files[0]);
@@ -827,8 +921,11 @@ form.addEventListener('submit', async (ev) => {
     refItems.forEach(it => fd.append('references', it.file));
     // /api/ref2va はプリセット文字列ではなく height/width を受け取る。プリセットの
     // キーは "高さx幅" の順(app.py の RESOLUTION_PRESETS と同じ規約)。
-    if (presetSelected) {
-      const [h, w] = resolutionEl.value.split('x').map(Number);
+    if (sizeMode === 'custom') {
+      fd.append('height', roundCanvasValue(customHeightEl.value));
+      fd.append('width', roundCanvasValue(customWidthEl.value));
+    } else if (sizeMode !== 'auto') {
+      const [h, w] = sizeMode.split('x').map(Number);
       fd.append('height', h);
       fd.append('width', w);
     }

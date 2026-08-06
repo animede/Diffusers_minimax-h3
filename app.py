@@ -22,6 +22,7 @@ from PIL import Image
 
 from core.llm import LLMConnectionError, VALID_MODES, enhance_prompt, get_llm_url
 from core.runner import (
+    FPS,
     H3_TURBO_LORA,
     H3_TURBO_STEPS_DEFAULT,
     MAX_SECONDS,
@@ -29,6 +30,7 @@ from core.runner import (
     MiniMaxH3Reference,
     MiniMaxH3Runner,
     ProgressState,
+    seconds_to_num_frames,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -54,6 +56,23 @@ RESOLUTION_PRESETS = {
     "768x1344": (768, 1344),
     "1344x768": (1344, 768),
 }
+
+# 任意サイズ指定のための丸め規則。MiniMax-H3 のキャンバスは 32 の倍数でなければならず
+# (`MINIMAX_H3_CANVAS_MULTIPLE`、`MiniMaxH3Ref2VASetupStep._check_inputs` 等が
+# 満たさない値を ValueError にする)、ネイティブのキャンバスは短辺 768・最大 768x1344。
+# ここでは「エラーにせず丸める」方針を取り、下限/上限でクランプしてから 32 の倍数へ
+# 四捨五入する(上限はモデルカードの 2K 記載に合わせた実験用の余地。ネイティブ範囲を
+# 超える指定は VRAM も品質も未検証なので UI 側で注意書きを出す)。
+CANVAS_MULTIPLE = 32
+CANVAS_MIN = 256
+CANVAS_MAX = 2048
+CANVAS_NATIVE_MAX = 1344  # ネイティブ範囲の目安(超過は実験的)
+
+
+def round_canvas_value(value: int) -> int:
+    """1辺を H3 の規則(32の倍数)へ丸め、[CANVAS_MIN, CANVAS_MAX] にクランプする。"""
+    value = max(CANVAS_MIN, min(CANVAS_MAX, int(value)))
+    return int(round(value / CANVAS_MULTIPLE)) * CANVAS_MULTIPLE
 
 # H3_TURBO_LORA=1: the turbo LoRA is community-verified at 8 steps (see core/runner.py's
 # H3_TURBO_LORA module comment) -- default `num_inference_steps` to that instead of the
@@ -84,6 +103,17 @@ def api_status():
         "min_seconds": MIN_SECONDS,
         "max_seconds": MAX_SECONDS,
         "resolutions": list(RESOLUTION_PRESETS.keys()),
+        # 任意サイズ/秒数のUI側プレビュー用。丸めの権威はサーバ(下の各エンドポイント)
+        # だが、UIが同じ規則で「実際に使われる値」を先に見せられるように公開する。
+        "constraints": {
+            "canvas_multiple": CANVAS_MULTIPLE,
+            "canvas_min": CANVAS_MIN,
+            "canvas_max": CANVAS_MAX,
+            "canvas_native_max": CANVAS_NATIVE_MAX,
+            "fps": FPS,
+            "frame_step": 17,   # num_frames は 17n + 5 (align_num_frames)
+            "frame_offset": 5,
+        },
     }
 
 
@@ -104,12 +134,27 @@ def _run_generation(
     image: Optional[Image.Image],
     last_image: Optional[Image.Image],
     upscale: int = 0,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
 ) -> dict:
     global _current_progress
 
-    if resolution not in RESOLUTION_PRESETS:
-        raise HTTPException(400, f"unknown resolution preset: {resolution}")
-    height, width = RESOLUTION_PRESETS[resolution]
+    # height/width を明示指定した場合はプリセットより優先し、H3の規則へ丸める
+    # (エラーにはしない)。片方だけの指定は誤用なので 400。
+    if (height is None) != (width is None):
+        raise HTTPException(400, "height と width は両方指定してください(片方だけの指定は不可)")
+    if height is not None:
+        height = round_canvas_value(height)
+        width = round_canvas_value(width)
+    else:
+        if resolution not in RESOLUTION_PRESETS:
+            raise HTTPException(400, f"unknown resolution preset: {resolution}")
+        height, width = RESOLUTION_PRESETS[resolution]
+
+    # 秒数もモデルの許容範囲へ丸める(エラーにしない)。実際のフレーム数は
+    # seconds_to_num_frames() が 17n+5 へ切り上げるため、生成尺は要求秒数より
+    # わずかに長くなることがある(レスポンスの num_frames / duration_s が実値)。
+    seconds = max(MIN_SECONDS, min(MAX_SECONDS, float(seconds)))
 
     if not (MIN_SECONDS <= seconds <= MAX_SECONDS):
         raise HTTPException(400, f"seconds must be between {MIN_SECONDS} and {MAX_SECONDS}, got {seconds}")
@@ -160,7 +205,10 @@ def api_t2va(
     num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
     seed: Optional[int] = Form(None),
     upscale: int = Form(0),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
 ):
+    """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。"""
     result = _run_generation(
         prompt=prompt,
         resolution=resolution,
@@ -170,6 +218,8 @@ def api_t2va(
         image=None,
         last_image=None,
         upscale=upscale,
+        height=height,
+        width=width,
     )
     return JSONResponse(result)
 
@@ -183,7 +233,10 @@ def api_fl2va(
     seed: Optional[int] = Form(None),
     image: Optional[UploadFile] = File(None),
     last_image: Optional[UploadFile] = File(None),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
 ):
+    """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。"""
     if image is None and last_image is None:
         raise HTTPException(400, "FL2VA には image または last_image のいずれかが必要です")
 
@@ -198,6 +251,8 @@ def api_fl2va(
         seed=seed,
         image=pil_image,
         last_image=pil_last_image,
+        height=height,
+        width=width,
     )
     return JSONResponse(result)
 
@@ -259,8 +314,14 @@ def api_ref2va(
         raise HTTPException(400, "references is required (at least one image/video/audio file)")
     if (height is None) != (width is None):
         raise HTTPException(400, "height と width は両方指定するか、両方省略してください")
-    if seconds is not None and not (MIN_SECONDS <= seconds <= MAX_SECONDS):
-        raise HTTPException(400, f"seconds must be between {MIN_SECONDS} and {MAX_SECONDS}, got {seconds}")
+    # 32の倍数でない値はエラーにせず丸める(t2va/fl2va と同じ方針。省略時はサーバが
+    # H3 自身の 16:9 キャンバスを解決するので触らない)。
+    if height is not None:
+        height = round_canvas_value(height)
+        width = round_canvas_value(width)
+    # 秒数も許容範囲へ丸める(省略時は音声参照1本からサーバが導出する)。
+    if seconds is not None:
+        seconds = max(MIN_SECONDS, min(MAX_SECONDS, float(seconds)))
 
     # Each upload is spooled to a real temp file: MiniMaxH3Reference(image=path) /
     # (video=path) / (audio=path) decodes a path itself (PyAV for video/audio, PIL for
