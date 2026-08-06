@@ -92,6 +92,42 @@
   button.generate:hover { background: var(--accent-hover); }
   button.generate:disabled { background: #3a3f4b; cursor: not-allowed; color: var(--muted); }
   .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  /* ドラッグ&ドロップ対応のファイル選択欄(コンパクト) */
+  .dropzone {
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: rgba(255,255,255,0.02);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    transition: border-color .12s, background .12s;
+  }
+  .dropzone:hover { border-color: var(--accent); }
+  .dropzone.dragover {
+    border-color: var(--accent);
+    border-style: solid;
+    background: rgba(91,140,255,0.10);
+    color: var(--text);
+  }
+  .dropzone input[type=file] { display: none; }
+  .dropzone-icon { font-size: 14px; opacity: .75; flex: none; }
+  .dropzone-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dropzone-text.filled { color: var(--text); }
+  .dropzone-clear {
+    flex: none;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .dropzone-clear:hover { color: var(--text); border-color: var(--accent); }
   .status-box {
     margin-top: 14px;
     font-size: 12px;
@@ -232,15 +268,30 @@
 
       <div id="fl2va-fields" style="display:none;">
         <label>先頭フレーム画像 (image, 任意)</label>
-        <input type="file" id="image-file" accept="image/*">
+        <div class="dropzone" id="dz-image">
+          <span class="dropzone-icon">🖼</span>
+          <span class="dropzone-text">ドラッグ&ドロップ、またはクリックして選択</span>
+          <button type="button" class="dropzone-clear" style="display:none;">クリア</button>
+          <input type="file" id="image-file" accept="image/*">
+        </div>
         <label>末尾フレーム画像 (last_image, 任意)</label>
-        <input type="file" id="last-image-file" accept="image/*">
+        <div class="dropzone" id="dz-last-image">
+          <span class="dropzone-icon">🖼</span>
+          <span class="dropzone-text">ドラッグ&ドロップ、またはクリックして選択</span>
+          <button type="button" class="dropzone-clear" style="display:none;">クリア</button>
+          <input type="file" id="last-image-file" accept="image/*">
+        </div>
         <div class="hint">どちらか一方でも可。両方指定すると先頭→末尾のフレーム間を生成。</div>
       </div>
 
       <div id="ref2va-fields" style="display:none;">
         <label>参照ファイル (references, 画像最大9・動画最大3・音声最大3、計12まで)</label>
-        <input type="file" id="ref-files" multiple accept="image/*,video/*,audio/*">
+        <div class="dropzone" id="dz-ref-files">
+          <span class="dropzone-icon">📎</span>
+          <span class="dropzone-text">ドラッグ&ドロップ、またはクリックして選択(複数可・追加されます)</span>
+          <button type="button" class="dropzone-clear" style="display:none;">クリア</button>
+          <input type="file" id="ref-files" multiple accept="image/*,video/*,audio/*">
+        </div>
         <div class="hint">
           <b>選択した順序がそのまま参照順になります</b>(プロンプト内の &lt;Picture i&gt;/&lt;Video k&gt;/&lt;Audio j&gt;
           ラベルとrotary配置に反映)。種別はファイルの拡張子/content-typeから自動判定。
@@ -363,6 +414,84 @@ refFilesEl.addEventListener('change', () => {
     .map((f, i) => `${i + 1}. [${_refKindLabel(f)}] ${f.name}`)
     .join(' &nbsp;→&nbsp; ');
 });
+
+// --- ドラッグ&ドロップ対応のファイル選択 ---
+// input[type=file] はそのまま残し(既存の送信ロジックが .files を読む)、
+// ドロップされた File を DataTransfer 経由で input.files に流し込む。
+// プログラム的な代入では change が発火しないので手動で dispatch する。
+function setupDropzone(zoneId, inputEl, opts) {
+  const zone = document.getElementById(zoneId);
+  if (!zone || !inputEl) return;
+  const textEl = zone.querySelector('.dropzone-text');
+  const clearBtn = zone.querySelector('.dropzone-clear');
+  const placeholder = textEl.textContent;
+  const multiple = !!(opts && opts.multiple);
+
+  function setFiles(files) {
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
+    inputEl.files = dt.files;
+    inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function refresh() {
+    const files = Array.from(inputEl.files || []);
+    if (!files.length) {
+      textEl.textContent = placeholder;
+      textEl.classList.remove('filled');
+      clearBtn.style.display = 'none';
+      return;
+    }
+    textEl.textContent = multiple
+      ? `${files.length}件: ` + files.map(f => f.name).join(', ')
+      : files[0].name;
+    textEl.classList.add('filled');
+    clearBtn.style.display = '';
+  }
+
+  zone.addEventListener('click', (e) => {
+    if (e.target === clearBtn) return;
+    inputEl.click();
+  });
+  clearBtn.addEventListener('click', () => setFiles([]));
+  inputEl.addEventListener('change', refresh);
+
+  ['dragenter', 'dragover'].forEach(ev => zone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    zone.classList.add('dragover');
+  }));
+  ['dragleave', 'dragend'].forEach(ev => zone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    zone.classList.remove('dragover');
+  }));
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    zone.classList.remove('dragover');
+    const dropped = Array.from(e.dataTransfer.files || []);
+    if (!dropped.length) return;
+    if (multiple) {
+      // 参照は順序に意味があるため、ドロップは「置き換え」ではなく「末尾へ追加」。
+      setFiles(Array.from(inputEl.files || []).concat(dropped));
+    } else {
+      setFiles([dropped[0]]);
+    }
+  });
+
+  refresh();
+}
+
+setupDropzone('dz-image', imageFileEl, { multiple: false });
+setupDropzone('dz-last-image', lastImageFileEl, { multiple: false });
+setupDropzone('dz-ref-files', refFilesEl, { multiple: true });
+
+// ドロップ位置を外した時にブラウザがファイルを開いてしまうのを防ぐ
+['dragover', 'drop'].forEach(ev => document.addEventListener(ev, (e) => {
+  if (e.target.closest && e.target.closest('.dropzone')) return;
+  e.preventDefault();
+}));
 
 // --- LLMプロンプト強化 ---
 const enhanceModeEl = document.getElementById('enhance-mode');
