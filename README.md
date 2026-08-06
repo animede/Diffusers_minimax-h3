@@ -2,10 +2,12 @@
 
 MiniMax H3 (Hailuo 3.0) の機能確認用スタンドアロンアプリ。動画+ステレオ音声を1回のデノイズで
 同時生成するオムニモーダル33Bモデルを、diffusers の Modular Diffusers 経路 (PR #14355) で
-動かす。将来 [diffusers-server](../diffusers-server) へ統合するための先行検証ワークスペース
-(diffusers-server 本体には一切手を入れていない)。
+動かす。将来 [diffusers-server](https://github.com/animede/diffusers-server) へ統合するための
+先行検証ワークスペース(diffusers-server 本体には一切手を入れていない)。
 
-詳細な調査メモは `../diffusers-server/dev_notes/handoff-minimax-h3.md` を参照。
+このREADMEの数値は**すべて実機の実測値**で、環境は RTX PRO 6000 Blackwell 96GB / RAM 94GB /
+Ubuntu 24.04。低VRAM構成については 18GB 相当までVRAMバラストで検証している(下記の
+VRAM対応表を参照)。
 
 ## 構成
 
@@ -24,12 +26,75 @@ minimax-h3/
 └── venv/                  # 専用venv (.gitignore対象、下記参照)
 ```
 
-## セットアップ済みの環境
+## インストール
 
-- `venv/` — comfy-env 継承 (torch 2.9.0+cu128 / transformers 5.1.0 / PyAV 16.0.1) +
-  PR #14355 版 diffusers 0.40.0.dev0。fastapi/uvicorn/python-multipart も既に揃っている
-  (追加インストール不要)。
-- ハード: RTX PRO 6000 Blackwell 96GB, RAM 94GB。
+### 必要なもの
+
+| | 要件 |
+|---|---|
+| GPU | 18GB 以上(構成により 96GB / 80GB / 48GB / 32GB / 18GB。下の「VRAM対応表」参照) |
+| ホストRAM | 64GB 以上を推奨(`H3_LOWVRAM=group` は int8 重み ~34GB をRAMに常駐させるため 48GB 以上の空きが必要) |
+| ディスク | 約 145GB(T2VA/FL2VA のみ)/ 約 207GB(Ref2VA も使う場合) |
+| CUDA | 12.8 系(torch 2.9.0+cu128 に合わせる)。SageAttention をビルドするなら `nvcc` も同系統 |
+| Python | 3.12 |
+| その他 | `ffmpeg`(ギャラリーの連結・情報取得に使用。無くても生成自体は動く) |
+
+### 手順
+
+```bash
+git clone https://github.com/animede/Diffusers_minimax-h3.git
+cd Diffusers_minimax-h3
+python3.12 -m venv venv
+
+# PyTorch (cu128)
+venv/bin/pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+
+# diffusers は PR #14355 の「検証済みコミットに固定」して入れる(下の注意を必ず読むこと)
+venv/bin/pip install "git+https://github.com/huggingface/diffusers.git@abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc"
+
+# transformers は 5.14.1 以上が必須
+#   (5.1.0 には Qwen3VLProcessor.create_mm_token_type_ids が無く、PR #14355 のエンコーダが動かない)
+venv/bin/pip install "transformers==5.14.1" accelerate==1.12.0 safetensors huggingface_hub
+
+# 動画/音声の多重化と Web API
+venv/bin/pip install av==16.0.1 fastapi==0.104.1 "uvicorn==0.24.0" python-multipart pillow numpy
+
+# text_encoder の 4bit 量子化(既定の H3_TE_QUANT=bnb-4bit に必要)
+venv/bin/pip install bitsandbytes==0.49.0
+
+# transformer の int8 量子化を使う場合のみ(H3_TRANSFORMER_QUANT=int8 / H3_LOWVRAM)
+#   0.18 以降は torch>=2.11 を要求するため 0.17.0 を固定する
+venv/bin/pip install torchao==0.17.0
+```
+
+> **重要: diffusers はコミット固定のまま使うこと。**
+> MiniMax-H3 は PR #14355 でのみ提供されており、2026-08-06 時点で **未マージ(draft)**。
+> 本アプリは Modular のブロック(`MiniMaxH3SetTimestepsStep` / `MiniMaxH3LoopDenoiser` 等)を
+> 自前で呼び、`get_block_state()` / `state.get(...)` / `row_timestep_plan` といった
+> state 契約に強く依存している。PR には 8/5 に **state contract の refactor** が入っており、
+> 最新版へ上げると動かなくなる公算が高い。詳細は末尾「今後の外部イベント待ち」を参照。
+
+### SageAttention(任意、既定で有効)
+
+既定の `H3_ATTN_BACKEND=sage` を使うには sm_120 向けのビルドが要る(Linux 向けの
+事前ビルド wheel は存在しない)。**ビルドしない場合は `H3_ATTN_BACKEND=default` を
+指定して起動すること**(デノイズが約12%遅くなるだけで、機能に影響はない)。
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 scripts/build_sageattention.sh
+```
+
+> ビルドは **必ず並列数を制限する**こと(スクリプトは `MAX_JOBS=4 NVCC_THREADS=2` +
+> systemd-run のメモリ上限付きで実行する)。無制限の並列 nvcc はホストRAMを食い潰し、
+> システム全体を巻き込んで OOM する。
+
+### 起動
+
+```bash
+venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+```
+
+ブラウザで `http://<host>:8611/` を開く。初回起動時にモデルをロードするため数分かかる。
 
 ## モデルの取得
 
@@ -45,6 +110,37 @@ venv/bin/python scripts/download_t2va.py
 
 内部で `allow_patterns` を使い、必要なサブフォルダのみを取得する。ダウンロード中は
 `logs/du_monitor.log` でキャッシュサイズを監視できる(170GB超で警告)。
+
+## VRAM対応表と主な環境変数(早見表)
+
+用途に応じた起動例(すべて実測済み。詳細は以降の各節)。
+
+| GPU | 起動時の指定 | t2va 実測(768²・5秒) |
+|---|---|---|
+| 96GB | (指定なし=既定) | peak 92GB / 約160秒 |
+| 80GB級 | `H3_TRANSFORMER_QUANT=int8` | peak 59.7GB / 約160秒 |
+| 48GB級 | `H3_LOWVRAM=1` | peak 38.9GB / 約215秒 |
+| 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒 |
+| 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
+
+```bash
+# 例: 32GB級GPUで起動する
+H3_LOWVRAM=group H3_TE_PRUNE=1 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+```
+
+主な環境変数(既定値。多くは**UIからも切り替えられる**ので、恒久的に変えたい時だけ指定する):
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `H3_TE_QUANT` | `bnb-4bit` | text_encoder の量子化(`none` は bf16 で 66.7GB) |
+| `H3_TE_PRUNE` | `0` | TE の未使用上位レイヤー削除(出力は不変、-3.6GB) |
+| `H3_TRANSFORMER_QUANT` | `none` | `int8` で transformer を 66.3→34GB |
+| `H3_LOWVRAM` | `0` | `1`=48GB級のフェーズ循環 / `group`=32GB級の block offload |
+| `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%) |
+| `H3_ATTN_BACKEND` | `sage` | `default` で SageAttention 不要 |
+| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL) |
+| `H3_VIDEO_VAE_FP16` | `0` | video VAE を fp16 化(デコードのピークを削減) |
+| `H3_LLM_URL` | `http://127.0.0.1:64650` | プロンプト強化に使うローカルLLM(任意機能) |
 
 ## VRAM/RAM 設計 (重要、実測に基づく)
 
