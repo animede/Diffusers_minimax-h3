@@ -230,6 +230,95 @@
     text-decoration: none;
     font-size: 12px;
   }
+  /* --- 生成済み動画ギャラリー --- */
+  .gallery-panel { margin-top: 20px; }
+  .gallery-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .gallery-toolbar button {
+    padding: 7px 12px;
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .gallery-toolbar button:hover:not(:disabled) { border-color: var(--accent); }
+  .gallery-toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .gallery-toolbar button.danger:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
+  .gallery-toolbar button.primary:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .gallery-count { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .gallery-hint { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+  .gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
+  }
+  .gallery-empty {
+    color: var(--muted);
+    font-size: 13px;
+    padding: 20px;
+    text-align: center;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+  }
+  .gallery-tile {
+    position: relative;
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .gallery-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .gallery-thumb-wrap {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    background: #000;
+  }
+  .gallery-thumb-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .gallery-checkbox {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 18px;
+    height: 18px;
+    z-index: 2;
+  }
+  .gallery-order-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2;
+  }
+  .gallery-info {
+    padding: 6px 8px;
+    font-size: 11px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .gallery-info .name {
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .server-status {
     font-size: 11px;
     color: var(--muted);
@@ -567,6 +656,22 @@
     <h2>結果</h2>
     <div id="result-area">
       <div class="placeholder">まだ生成していません</div>
+    </div>
+
+    <div class="gallery-panel">
+      <h2>生成済み動画</h2>
+      <div class="gallery-hint">連結順は「チェックした順」です(ギャラリー表示順は新しい順)。</div>
+      <div class="gallery-toolbar">
+        <button type="button" id="gallery-select-all">全選択</button>
+        <button type="button" id="gallery-select-none">全解除</button>
+        <button type="button" class="danger" id="gallery-delete-btn" disabled>選択を削除</button>
+        <button type="button" class="primary" id="gallery-concat-btn" disabled>選択を連結</button>
+        <button type="button" id="gallery-refresh-btn">再読込</button>
+        <span class="gallery-count" id="gallery-count">0件選択</span>
+      </div>
+      <div class="gallery-grid" id="gallery-grid">
+        <div class="gallery-empty">読み込み中...</div>
+      </div>
     </div>
   </div>
 </div>
@@ -1281,6 +1386,7 @@ form.addEventListener('submit', async (ev) => {
     setStatus('完了');
     progressInner.style.width = '100%';
     renderResult(data);
+    refreshGallery();
   } catch (e) {
     setStatus('エラー: ' + e.message, true);
   } finally {
@@ -1321,6 +1427,215 @@ function renderResult(data) {
   // プロンプトはテキストとして安全に挿入(HTMLエスケープ回避)
   resultArea.querySelector('.used-prompt-body').textContent = data.prompt || promptEl.value;
 }
+
+// ============================================================================
+// 生成済み動画ギャラリー
+// ============================================================================
+const galleryGrid = document.getElementById('gallery-grid');
+const galleryCountEl = document.getElementById('gallery-count');
+const galleryDeleteBtn = document.getElementById('gallery-delete-btn');
+const galleryConcatBtn = document.getElementById('gallery-concat-btn');
+const gallerySelectAllBtn = document.getElementById('gallery-select-all');
+const gallerySelectNoneBtn = document.getElementById('gallery-select-none');
+const galleryRefreshBtn = document.getElementById('gallery-refresh-btn');
+
+let galleryItems = [];          // 直近取得した一覧(新しい順)
+let gallerySelectedOrder = [];  // 選択したファイル名を "チェックした順" で保持(連結順)
+
+function fmtBytes(n) {
+  if (n == null) return '-';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + 'KB';
+  return (n / (1024 * 1024)).toFixed(1) + 'MB';
+}
+
+function fmtDuration(sec) {
+  if (sec == null) return '-';
+  return sec.toFixed(1) + 's';
+}
+
+async function refreshGallery() {
+  try {
+    const res = await fetch('/api/outputs');
+    const data = await res.json();
+    galleryItems = data.items || [];
+    // 削除済み・存在しないファイルの選択は捨てる
+    const names = new Set(galleryItems.map(it => it.name));
+    gallerySelectedOrder = gallerySelectedOrder.filter(n => names.has(n));
+    renderGallery();
+  } catch (e) {
+    galleryGrid.innerHTML = '<div class="gallery-empty">一覧の取得に失敗しました</div>';
+  }
+}
+
+function renderGallery() {
+  if (!galleryItems.length) {
+    galleryGrid.innerHTML = '<div class="gallery-empty">生成済み動画はまだありません</div>';
+    updateGalleryToolbar();
+    return;
+  }
+  galleryGrid.innerHTML = '';
+  galleryItems.forEach(item => {
+    const selectedIdx = gallerySelectedOrder.indexOf(item.name);
+    const isSelected = selectedIdx !== -1;
+
+    const tile = document.createElement('div');
+    tile.className = 'gallery-tile' + (isSelected ? ' selected' : '');
+    tile.dataset.name = item.name;
+
+    const thumbWrap = document.createElement('div');
+    thumbWrap.className = 'gallery-thumb-wrap';
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'gallery-checkbox';
+    cb.checked = isSelected;
+    cb.addEventListener('click', (e) => e.stopPropagation());
+    cb.addEventListener('change', () => toggleGallerySelection(item.name));
+
+    const video = document.createElement('video');
+    video.src = item.url + '#t=0.1';
+    video.muted = true;
+    video.preload = 'metadata';
+    video.playsInline = true;
+
+    thumbWrap.appendChild(video);
+    thumbWrap.appendChild(cb);
+
+    // バッジは常に作っておき、選択状態は表示/非表示と文字だけで切り替える
+    // (選択のたびにタイルを作り直すと <video> が全数再生成され、ちらつきと
+    //  メタデータ再取得が発生するため。差分更新は updateGallerySelectionUI())
+    const badge = document.createElement('div');
+    badge.className = 'gallery-order-badge';
+    badge.textContent = isSelected ? String(selectedIdx + 1) : '';
+    badge.style.display = isSelected ? '' : 'none';
+    thumbWrap.appendChild(badge);
+
+    const info = document.createElement('div');
+    info.className = 'gallery-info';
+    const resLine = (item.width && item.height) ? `${item.width}×${item.height}` : '解像度不明';
+    info.innerHTML = `
+      <div class="name" title="${item.name}">${item.name}</div>
+      <div>${fmtDuration(item.duration)} / ${resLine} / ${fmtBytes(item.size)}</div>
+    `;
+
+    tile.appendChild(thumbWrap);
+    tile.appendChild(info);
+    tile.addEventListener('click', () => toggleGallerySelection(item.name));
+
+    galleryGrid.appendChild(tile);
+  });
+  updateGalleryToolbar();
+}
+
+function toggleGallerySelection(name) {
+  const idx = gallerySelectedOrder.indexOf(name);
+  if (idx === -1) {
+    gallerySelectedOrder.push(name);
+  } else {
+    gallerySelectedOrder.splice(idx, 1);
+  }
+  updateGallerySelectionUI();
+}
+
+// 選択状態だけを既存タイルへ差分反映する(renderGallery() は DOM を作り直すため
+// <video> が全数再生成され、タイル数が多いとちらつく)。
+function updateGallerySelectionUI() {
+  galleryGrid.querySelectorAll('.gallery-tile').forEach(tile => {
+    const order = gallerySelectedOrder.indexOf(tile.dataset.name);
+    const isSelected = order !== -1;
+    tile.classList.toggle('selected', isSelected);
+    const cb = tile.querySelector('.gallery-checkbox');
+    if (cb) cb.checked = isSelected;
+    const badge = tile.querySelector('.gallery-order-badge');
+    if (badge) {
+      badge.textContent = isSelected ? String(order + 1) : '';
+      badge.style.display = isSelected ? '' : 'none';
+    }
+  });
+  updateGalleryToolbar();
+}
+
+function updateGalleryToolbar() {
+  const n = gallerySelectedOrder.length;
+  galleryCountEl.textContent = `${n}件選択`;
+  galleryDeleteBtn.disabled = n === 0;
+  galleryConcatBtn.disabled = n < 2;
+}
+
+gallerySelectAllBtn.addEventListener('click', () => {
+  // 既存の選択順を保ちつつ、未選択のものを表示順(新しい順)で末尾に追加する
+  const selectedSet = new Set(gallerySelectedOrder);
+  galleryItems.forEach(it => {
+    if (!selectedSet.has(it.name)) gallerySelectedOrder.push(it.name);
+  });
+  updateGallerySelectionUI();
+});
+
+gallerySelectNoneBtn.addEventListener('click', () => {
+  gallerySelectedOrder = [];
+  updateGallerySelectionUI();
+});
+
+galleryRefreshBtn.addEventListener('click', refreshGallery);
+
+galleryDeleteBtn.addEventListener('click', async () => {
+  const names = [...gallerySelectedOrder];
+  if (!names.length) return;
+  const ok = window.confirm(`${names.length}件の動画を削除します。この操作は取り消せません。よろしいですか?`);
+  if (!ok) return;
+  galleryDeleteBtn.disabled = true;
+  try {
+    const res = await fetch('/api/outputs/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+    gallerySelectedOrder = [];
+    await refreshGallery();
+  } catch (e) {
+    alert('削除に失敗しました: ' + e.message);
+  } finally {
+    updateGalleryToolbar();
+  }
+});
+
+galleryConcatBtn.addEventListener('click', async () => {
+  const names = [...gallerySelectedOrder];
+  if (names.length < 2) return;
+  galleryConcatBtn.disabled = true;
+  galleryConcatBtn.textContent = '連結中...';
+  try {
+    const res = await fetch('/api/outputs/concat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+    resultArea.innerHTML = `
+      <video controls autoplay loop src="${data.url}"></video>
+      <a class="dl-link" href="${data.url}" download>mp4をダウンロード</a>
+      <div class="result-meta">
+        <div><b>連結結果:</b> ${data.name}</div>
+        <div><b>方式:</b> ${data.method === 'concat_demuxer_copy' ? '無劣化連結(-c copy)' : '再エンコード連結'}</div>
+        <div><b>解像度:</b> ${data.width}×${data.height} / <b>長さ:</b> ${data.duration != null ? data.duration.toFixed(2) + 's' : '-'}</div>
+        <div><b>入力(連結順):</b> ${data.inputs.join(' → ')}</div>
+      </div>
+    `;
+    gallerySelectedOrder = [];
+    await refreshGallery();
+  } catch (e) {
+    alert('連結に失敗しました: ' + e.message);
+  } finally {
+    galleryConcatBtn.disabled = false;
+    galleryConcatBtn.textContent = '選択を連結';
+    updateGalleryToolbar();
+  }
+});
+
+refreshGallery();
 </script>
 </body>
 </html>

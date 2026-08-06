@@ -15,11 +15,12 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
+import core.gallery as gallery
 import core.settings as settings
 from core.llm import LLMConnectionError, VALID_MODES, enhance_prompt, get_llm_url
 from core.runner import (
@@ -512,6 +513,53 @@ def api_prompt_enhance(
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"result": result, "mode": mode, "elapsed_s": time.time() - t0}
+
+
+@app.get("/api/outputs")
+def api_outputs_list():
+    """outputs/ 直下(サブディレクトリ除く)の *.mp4 を新しい順で返す。
+
+    解像度・尺は ffprobe で取得し、mtime+size をキーにメモリキャッシュする
+    (core/gallery.py の _probe_cached)。
+    """
+    return {"items": gallery.list_outputs(OUTPUT_DIR)}
+
+
+@app.post("/api/outputs/delete")
+def api_outputs_delete(names: list[str] = Body(..., embed=True)):
+    """names (outputs/ 直下のファイル名の配列) を削除する。
+
+    パストラバーサル対策は core.gallery.safe_output_path で行う(`/`・`..`を含む名前を
+    拒否し、解決後の親ディレクトリが OUTPUT_DIR 自身であることを確認する)。
+    サブディレクトリ(outputs/ab_* 等)には安全対策の副作用としても一切触れられない。
+    """
+    try:
+        result = gallery.delete_outputs(OUTPUT_DIR, names)
+    except gallery.GalleryError as e:
+        raise HTTPException(400, str(e))
+    return result
+
+
+@app.post("/api/outputs/concat")
+def api_outputs_concat(names: list[str] = Body(..., embed=True)):
+    """names の順に動画を連結して outputs/concat_<timestamp>.mp4 を作る。
+
+    GPUを使わないため generation_lock は取らない。連結同士の同時実行だけを
+    専用ロック(core.gallery.concat_lock)で防ぎ、取得できなければ409。
+    """
+    acquired = gallery.concat_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(409, "別の連結処理が進行中です。しばらく待ってから再試行してください。")
+    try:
+        result = gallery.concat_outputs(OUTPUT_DIR, names)
+        return JSONResponse(result)
+    except gallery.GalleryError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("concat failed")
+        raise HTTPException(500, f"concat failed: {e}")
+    finally:
+        gallery.concat_lock.release()
 
 
 @app.on_event("startup")
