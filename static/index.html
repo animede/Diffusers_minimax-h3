@@ -363,17 +363,21 @@
         <div id="ref-order-line" class="hint" style="margin-top:6px;"></div>
       </div>
 
-      <div class="row" id="resolution-row">
+      <div class="row" id="size-row">
         <div>
-          <label>解像度</label>
+          <label>解像度 (幅×高さ)</label>
+          <!-- value は app.py の RESOLUTION_PRESETS のキーで、"高さx幅" の順に
+               展開される(`height, width = RESOLUTION_PRESETS[...]`)。表示ラベルは
+               利用者に馴染む「幅×高さ」で書いてあるため value と順序が逆に見える。 -->
           <select id="resolution">
             <option value="768x768">768×768 (正方形)</option>
-            <option value="768x1344">768×1344 (縦長)</option>
-            <option value="1344x768">1344×768 (横長)</option>
+            <option value="768x1344">1344×768 (横長)</option>
+            <option value="1344x768">768×1344 (縦長)</option>
+            <option value="auto">自動 (サーバ既定 / Ref2VAは16:9)</option>
           </select>
         </div>
         <div>
-          <label>秒数 (5〜15、Ref2VAは音声参照1本のみ空欄可)</label>
+          <label>秒数 (5〜15、Ref2VAは音声参照1本なら空欄可)</label>
           <input type="number" id="seconds" value="5" min="5" max="15" step="0.5">
         </div>
       </div>
@@ -433,7 +437,7 @@ const resultArea = document.getElementById('result-area');
 const serverStatusEl = document.getElementById('server-status');
 const fl2vaFields = document.getElementById('fl2va-fields');
 const ref2vaFields = document.getElementById('ref2va-fields');
-const resolutionRow = document.getElementById('resolution-row');
+const sizeRow = document.getElementById('size-row');
 const refFilesEl = document.getElementById('ref-files');
 
 let mode = 't2va';
@@ -445,11 +449,16 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     fl2vaFields.style.display = (mode === 'fl2va') ? 'block' : 'none';
     ref2vaFields.style.display = (mode === 'ref2va') ? 'block' : 'none';
     // Ref2VA references never bind the target canvas (each is prepared at its own
-    // resolution -- see packing_ref2va.py's module docstring); the 3 preset canvases
-    // here are still valid for it, but hide the row for a cleaner Ref2VA form since
-    // most Ref2VA testing wants the 16:9 default (height/width left null -> server
-    // resolves MiniMax-H3's own 16:9 canvas, per MiniMaxH3Ref2VASetupStep).
-    resolutionRow.style.display = (mode === 'ref2va') ? 'none' : 'flex';
+    // resolution -- see packing_ref2va.py's module docstring)。既定は H3 自身の 16:9
+    // (height/width を送らない = "auto")だが、/api/ref2va は height/width を任意で
+    // 受け付けるので選択欄は隠さない(以前は行ごと隠しており、同居していた「秒数」まで
+    // 消えて「音声参照1本なら空欄可」がUIから到達不能になっていた)。
+    if (mode === 'ref2va' && resolutionEl.value !== 'auto') {
+      resolutionEl.dataset.prevPreset = resolutionEl.value;
+      resolutionEl.value = 'auto';
+    } else if (mode !== 'ref2va' && resolutionEl.value === 'auto' && resolutionEl.dataset.prevPreset) {
+      resolutionEl.value = resolutionEl.dataset.prevPreset;
+    }
   });
 });
 
@@ -788,15 +797,19 @@ form.addEventListener('submit', async (ev) => {
   fd.append('num_inference_steps', stepsEl.value);
   if (seedEl.value) fd.append('seed', seedEl.value);
 
+  // "auto" はサーバ既定に任せる(t2va/fl2va は resolution を送らなければ 768x768、
+  // ref2va は height/width を送らなければ H3 自身の 16:9)。
+  const presetSelected = resolutionEl.value !== 'auto';
+
   let url = '/api/t2va';
   if (mode === 't2va') {
-    fd.append('resolution', resolutionEl.value);
+    if (presetSelected) fd.append('resolution', resolutionEl.value);
     fd.append('seconds', secondsEl.value);
     const upscaleEl = document.getElementById('upscale');
     if (upscaleEl && upscaleEl.checked) fd.append('upscale', '1');
   } else if (mode === 'fl2va') {
     url = '/api/fl2va';
-    fd.append('resolution', resolutionEl.value);
+    if (presetSelected) fd.append('resolution', resolutionEl.value);
     fd.append('seconds', secondsEl.value);
     if (imageFileEl.files[0]) fd.append('image', imageFileEl.files[0]);
     if (lastImageFileEl.files[0]) fd.append('last_image', lastImageFileEl.files[0]);
@@ -812,6 +825,13 @@ form.addEventListener('submit', async (ev) => {
     // Append order matters: this is what the server packs as reference order
     // (refItems の配列順 = UI表示の <Picture i>/<Video k>/<Audio j> の採番順)。
     refItems.forEach(it => fd.append('references', it.file));
+    // /api/ref2va はプリセット文字列ではなく height/width を受け取る。プリセットの
+    // キーは "高さx幅" の順(app.py の RESOLUTION_PRESETS と同じ規約)。
+    if (presetSelected) {
+      const [h, w] = resolutionEl.value.split('x').map(Number);
+      fd.append('height', h);
+      fd.append('width', w);
+    }
     // Seconds may be left blank for Ref2VA (server derives it from a lone
     // audio-bearing reference); only send it when the user filled it in.
     if (secondsEl.value) fd.append('seconds', secondsEl.value);
