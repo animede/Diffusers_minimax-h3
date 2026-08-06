@@ -283,6 +283,26 @@ TE-nf4(21GB)+ transformer int8(34GB)= 55GB は48GB級カードでは同時常駐
   int8の直列化保存も同様に未検証。今回はリクエストごとの固定費 ~90-100s
   (TEロード+transformerロード)をそのまま許容する設計とした)。
 
+## 16GB級の検証結果: 非対応(床は~18GB、2026-08-06確定)
+
+16GBバラスト(空き15.5GB)では **TEロード(nf4量子化)の終盤でOOM**(15.37GB使用時点で
++250MiB要求に失敗)。削除済みTE-nf4の常駐17.45GB自体が床であり、video VAE fp16は
+デコード段階の対策のためこの床を動かせない。**18GBバラストでは完走**
+(peak 17.72GB、total 302s)——つまり現アーキの実質下限は**~18GB**
+(24GB級構成 `H3_LOWVRAM=group H3_TE_PRUNE=1` がそのまま18GB級でも動く)。
+16GB突破にはTEのストリーミング実行か4bit未満の量子化が必要(未着手の別課題)。
+
+## video VAE の fp16 化 (`H3_VIDEO_VAE_FP16`、既定 `0`)
+
+`H3_VIDEO_VAE_FP16=1` で video VAE の重みだけを fp16 化する(9.70→4.85GB、デコード
+ピーク 16.29→~11.4GB)。**audio VAE は絶対に触らない**(bf16化で-20dBの既知問題)。
+- 品質: 全124フレームの平均PSNR **39.97dB**(min 39.08)で目視区別不能。デコード計算は
+  元々autocast fp16のため重みfp16化の影響が小さい
+- **実装の罠**: `AutoencoderKLMiniMaxH3._keep_in_fp32_modules` が encoder/decoder等を
+  強制fp32に戻すため、`from_pretrained(dtype=fp16)` は効かない(実機確認)。ロード後に
+  `.to(torch.float16)` を明示的に呼ぶ必要がある
+- 既定OFFでは既存基準とMD5一致(回帰ゼロ)
+
 ## 24〜32GB級VRAM対応 (`H3_LOWVRAM=group`、2026-08-05追加)
 
 `H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、

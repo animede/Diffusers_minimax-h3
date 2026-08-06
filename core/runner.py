@@ -226,6 +226,36 @@ if TE_QUANT not in ("none", "bnb-4bit"):
 # is proportionally smaller), it does not change *when* or *whether* TE is resident.
 H3_TE_PRUNE = os.environ.get("H3_TE_PRUNE", "0").strip() == "1"
 
+# EXPERIMENTAL, opt-in, probe for 16GB-class support. "0" (default) = video VAE loads
+# float32, byte-for-byte identical to pre-this-flag behaviour. "1" = the video VAE
+# (`vae`, NOT `audio_vae` -- audio_vae must stay float32 end-to-end, see module
+# docstring) is halved to float16 in place after loading, roughly halving its resident
+# size (measured ~9.70GB fp32 -> ~4.85GB fp16 for the bare `nn.Module`, i.e. before
+# accounting for the ~11GB `vae+audio_vae` pair's actual runner-measured decode-phase
+# peak of ~16.29GB, which includes activation buffers on top of the weights).
+#
+# IMPORTANT: passing `dtype=torch.float16` straight into `ModularPipeline.load_components`
+# (the naive approach) is a NO-OP for this VAE -- verified empirically, not assumed.
+# `AutoencoderKLMiniMaxH3._keep_in_fp32_modules = ["encoder", "decoder", "quant_conv",
+# "post_quant_conv"]` (autoencoder_kl_minimax_h3.py) covers essentially the entire
+# module tree, and diffusers' own `from_pretrained` -> `load_model_dict_into_meta`
+# (model_loading_utils.py) force-casts any parameter matching one of those names to
+# float32 regardless of the `dtype=` kwarg (confirmed by loading with
+# `torch_dtype=torch.float16` directly and finding every parameter still float32,
+# 9.70GB). The only way to actually shrink the weights is a manual `.to(torch.float16)`
+# call *after* `from_pretrained` returns (diffusers itself warns this "can lead to
+# inconsistent results" -- exactly why this flag defaults off and is meant to be A/B'd
+# against the fp32 baseline via PSNR before being trusted, see README).
+#
+# Decode already runs under `torch.autocast(dtype=torch.float16)` in diffusers' own
+# `MiniMaxH3VideoDecodeStep` (decoders.py) even when the weights are float32 -- so
+# halving the weights to float16 up front changes what precision the *weights*
+# themselves are stored/read at, but the compute dtype inside the autocast region was
+# already float16 either way. audio_vae is untouched by this flag; the module
+# docstring's "cast to bf16 causes ~20dB volume loss" warning is specifically about
+# audio_vae and does not apply here.
+H3_VIDEO_VAE_FP16 = os.environ.get("H3_VIDEO_VAE_FP16", "0").strip() == "1"
+
 # "fbc" (default; A/B verified 2026-08-04: threshold 0.05 gives -25% denoise time with
 # near-identical output -- PSNR 31.8-34.3dB vs no-cache, audio corr 0.979, no visible drift.
 # threshold 0.1 reaches 1.92x but composition drifts visibly; not recommended as default).
@@ -731,6 +761,14 @@ class MiniMaxH3Runner:
         # audio VAE must stay fp32 end-to-end (bf16 causes ~20dB volume loss, see
         # module docstring / handoff doc).
         self._pipe.load_components(names=["vae", "audio_vae"], dtype=torch.float32)
+        if H3_VIDEO_VAE_FP16:
+            # `dtype=torch.float16` on the load_components call above would be a no-op
+            # for this VAE (see H3_VIDEO_VAE_FP16's module comment) -- has to be a
+            # manual cast after the fp32 load. audio_vae is deliberately excluded.
+            t_cast = time.time()
+            self._pipe.vae = self._pipe.vae.to(torch.float16)
+            logger.info("video vae cast to float16 in %.2fs (H3_VIDEO_VAE_FP16=1)",
+                        time.time() - t_cast)
         if TE_QUANT == "bnb-4bit":
             # Parked on CPU by default in this mode -- moved to GPU only for the phase
             # that needs them (keyframe encode / decode). See module docstring.
@@ -1530,6 +1568,7 @@ class MiniMaxH3Runner:
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
             "te_prune": H3_TE_PRUNE,
+            "video_vae_fp16": H3_VIDEO_VAE_FP16,
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "lowvram_group": H3_LOWVRAM_GROUP,
