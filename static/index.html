@@ -621,19 +621,20 @@ let CURRENT_SETTINGS = null;
 function turboIncompatibleReason() {
   // core/settings.py の validate_instant_settings() と同じ規則: turbo は
   // lowvram(1/group) または transformer_both_resident(int8 かつ lowvram=0、両
-  // transformer 同時常駐)と未検証のため組み合わせ不可。upscale チェックボックスとの
-  // 組み合わせも同様(generate() 側で do_upscale + turbo=1 は 400)。
+  // transformer 同時常駐)と組み合わせ不可(2026-08-06のA/Bで「未検証」ではなく
+  // 「実測で不可」と確定: Int8Tensorにaten.catカーネルが無く、apply_turbo_lora()の
+  // fuse_projections()がNotImplementedErrorで失敗する)。
+  // upscale(2xアップスケール)との組み合わせは同じA/Bで動作確認済みのため許可している
+  // (8/16ステップとも成功、詳細はcore/settings.pyのvalidate_instant_settings_for_upscale
+  // 参照)。
   if (!CURRENT_SETTINGS) return null;
   const c = CURRENT_SETTINGS.constraints || {};
   const r = CURRENT_SETTINGS.reload || {};
   if (r.lowvram && r.lowvram !== '0') {
-    return `低VRAMモード(lowvram=${r.lowvram})とturboの組み合わせは未検証のため無効化しています`;
+    return `低VRAMモード(lowvram=${r.lowvram})とturboの組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています`;
   }
   if (c.transformer_both_resident) {
-    return 'transformer/transformer_ref 両方常駐(int8)とturboの組み合わせは未検証のため無効化しています';
-  }
-  if (upscaleEl && upscaleEl.checked) {
-    return '2xアップスケールとturboの組み合わせは未対応のため無効化しています(アップスケールを外すと選択できます)';
+    return 'transformer/transformer_ref 両方常駐(int8)とturboの組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています';
   }
   return null;
 }
@@ -676,7 +677,9 @@ turboEnabledEl.addEventListener('change', () => {
   }
   updateInstantHint();
 });
-if (upscaleEl) upscaleEl.addEventListener('change', updateTurboAvailability);
+// upscaleEl の change では updateTurboAvailability() を呼ばない: turbo+upscale は
+// 2026-08-06のA/Bで動作確認済みのため turboIncompatibleReason() はもう upscale の
+// 状態を見ない(常時許可)。
 
 // --- サイズ/秒数の丸めプレビュー ---
 // 丸めの権威はサーバ(app.py の round_canvas_value / seconds_to_num_frames)だが、

@@ -326,7 +326,40 @@ PRのscheduler/audio_scheduler分離+手動ループ)では4stepsでも音声破
 ランタイムデルタ(W_eff=W+BA、fuseしない)で適用。**罠: `fuse_projections()` は旧
 to_q/k/vを削除せず+12.8GBリークする**(明示deleteで対処)。AdaLNが `linear.weight` を
 直接読むためラッパーに weight/bias 等のパススルーが必要。turbo時はFBC自動無効化。
-`H3_LOWVRAM`/int8/upscale/ref2va との併用は未検証のため起動時拒否。
+
+### turbo × 他機能の組み合わせ検証(2026-08-06)
+
+デフォルトのtransformer経路(`transformer_quant=none`, `lowvram=0`)以外との組み合わせ
+は当初「未検証のため予防的に拒否」だったが、実測でA/B検証した。
+
+- **turbo × upscale(2xアップスケール hires-fix): 動作確認済み、解禁。**
+  768²→1536²・seed12345で8/16stepsとも成功。8steps: 総所要210.3s(denoise 82.6s+
+  decode 24.4s)、pass1=5/pass2=2steps(`H3_HIRES_DENOISE=0.35`既定分割)、
+  peak VRAM 88.09GB——非turbo30stepsの基準645sから大幅短縮。16steps: 総所要331.8s、
+  pass1=10/pass2=5steps、peak VRAM 88.35GB、8stepsより明確にシャープ。
+  全フレーム(先頭/中間/末尾)を目視確認し色化け・チェッカーボード崩壊なし、音声も
+  RMS/peakが正常値(無音・クリップなし)。turbo時はFBCが自動無効化されるため、
+  hires-fixのFBCブックキーピング(`_fbc_last_step_was_skip()`)はtry/exceptで安全に
+  no-op化される(懸念だった「turbo未対応のFBC呼び出し」は実害なしと確認)。
+- **turbo × transformer int8(`H3_TRANSFORMER_QUANT=int8`、`transformer_both_resident`
+  含む): 実測で不可と確定、拒否のまま維持。** `apply_turbo_lora()` の
+  `attn.fuse_projections()` が `torch.cat([to_q.weight, to_k.weight, to_v.weight])`
+  を実行するが、int8量子化された `to_q`/`to_k`/`to_v`(`H3_INT8_MODULES_TO_NOT_CONVERT`
+  はこれらをスキップしない)は torchao の `Int8Tensor` であり、`aten.cat` カーネルが
+  未実装のため `NotImplementedError: Int8Tensor dispatch: attempting to run
+  unimplemented operator/function: func=<OpOverload(op='aten.cat', overload='default')>`
+  で確実に失敗する(HTTP 500、リクエスト単位でクリーンに失敗しVRAMリークなし。
+  直後の非turbo生成は正常動作を確認)。
+- **turbo × lowvram=1: 実測で不可と確定、拒否のまま維持。** `lowvram=1` は
+  `transformer_quant=int8` を強制するため、上記と全く同じ `Int8Tensor`/`aten.cat`
+  エラーで失敗(同一エラーメッセージを実機確認)。
+- **turbo × lowvram=group: 実測で不可と確定、拒否のまま維持。** 同じ理由
+  (`lowvram=group` も `transformer_quant=int8` 前提)で同一エラー。**この失敗は
+  group offloadフックの適用順序とは無関係**(sibling project の
+  「LoRAをenable_group_offload()より前に適用する」という順序修正パターンは
+  ここでは効かない——`fuse_projections()`自体がgroup offloadフックを一切介さず
+  `torch.cat`だけで失敗するため、順序を入れ替えても直らないと判断し深追いしなかった)。
+- **ref2va: 本タスクの検証対象外のまま**(元々タスクブリーフのスコープ外)。
 
 ## 16GB級の検証結果: 非対応(床は~18GB、2026-08-06確定)
 

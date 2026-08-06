@@ -498,52 +498,71 @@ if H3_ATTN_BACKEND in ("default", "none"):
 # sigma/sigma_next pair for step N1 onward automatically.
 H3_HIRES_DENOISE = float(os.environ.get("H3_HIRES_DENOISE", "0.35"))
 
-# EXPERIMENTAL, opt-in, A/B in progress at task-write time (this env var and its wiring
-# are themselves the subject of that A/B -- see README for the writeup once done). "0"
-# (default) = the transformer is exactly the base bf16/int8 checkpoint, byte-for-byte
-# identical to pre-this-flag behaviour (the LoRA is never downloaded or applied). "1" =
-# `larryvrh/MiniMax-H3-Turbo-Lora`'s `minimax_h3_turbo_4step.safetensors` (the trained,
-# non-EMA variant -- the author's own README calls the EMA sibling "less mature") is
-# downloaded and applied to `transformer` as an unfused, run-time low-rank delta
-# (`base(x) + B(A(x))`, alpha == rank so no extra scale factor -- matches the LoRA
+# Opt-in. "0" (default) = the transformer is exactly the base bf16/int8 checkpoint,
+# byte-for-byte identical to pre-this-flag behaviour (the LoRA is never downloaded or
+# applied). "1" = `larryvrh/MiniMax-H3-Turbo-Lora`'s `minimax_h3_turbo_4step.safetensors`
+# (the trained, non-EMA variant -- the author's own README calls the EMA sibling "less
+# mature") is downloaded and applied to `transformer` as an unfused, run-time low-rank
+# delta (`base(x) + B(A(x))`, alpha == rank so no extra scale factor -- matches the LoRA
 # author's own reference `generate.py`, which this project's `_apply_turbo_lora()`
 # mirrors module-for-module, see that function's docstring for the full key-mapping
 # derivation) right after the transformer's normal load. NOT fused into the base
 # weight (`core/loaders.py`-style fuse+cast would round most of a rank-64 delta away
-# against a 66GB bf16 base, per the LoRA author's own `LoRALinear` docstring) and not
-# yet A/B'd against a fused/quantized variant -- this flag exists to let the *default*
-# transformer path (bf16, `H3_TRANSFORMER_QUANT=none`) opt in without touching
-# `transformer_ref` (ref2va is out of scope, see task brief) or the int8/lowvram
-# branches (untested combination -- rejected below with a loud error rather than
-# silently risking a wrong quantize-then-adapt order, the failure mode CLAUDE.md #47's
-# "LoRA loaded after fp8 cast raises NotImplementedError" entry warns about for a
-# sibling project's own fp8 base).
+# against a 66GB bf16 base, per the LoRA author's own `LoRALinear` docstring). This
+# flag lets the *default* transformer path (bf16, `H3_TRANSFORMER_QUANT=none`) opt in
+# without touching `transformer_ref` (ref2va is out of scope, see task brief) or the
+# int8/lowvram branches -- CONFIRMED incompatible with those (not just unverified),
+# by a follow-up task's own A/B run (2026-08-06): turbo=1 combined with any path where
+# `H3_TRANSFORMER_QUANT=int8` (i.e. `H3_LOWVRAM_ANY` or `H3_TRANSFORMER_BOTH_RESIDENT`)
+# reproducibly raises `NotImplementedError: Int8Tensor dispatch: ... aten.cat ...`
+# inside `apply_turbo_lora()`'s `fuse_projections()` call -- torchao's `Int8Tensor` (the
+# transformer's `to_q`/`to_k`/`to_v` under int8 quant; `H3_INT8_MODULES_TO_NOT_CONVERT`
+# does not skip them) has no registered `aten.cat` kernel, so `torch.cat([to_q.weight,
+# to_k.weight, to_v.weight])` fails outright, before any group-offload hook is even
+# consulted (so this is not the "wrap LoRA before enable_group_offload()" ordering fix
+# that helped a sibling project, diffusers-server CLAUDE.md #44 -- reordering cannot fix
+# a missing kernel). Confirmed identical for `H3_LOWVRAM=1` and `H3_LOWVRAM=group` (both
+# force int8), each failing loudly with a 500 and no VRAM leak or lasting corruption
+# (a follow-up plain, non-turbo generation succeeded right after on the same server) --
+# rejected below with a loud error rather than silently risking a wrong quantize-then-
+# adapt order, the failure mode CLAUDE.md #47's "LoRA loaded after fp8 cast raises
+# NotImplementedError" entry warns about for a sibling project's own fp8 base.
+#
+# turbo=1 + upscale=1 (hires-fix), by contrast, IS verified to work (same task, see
+# `core/settings.py`'s `validate_instant_settings_for_upscale()` docstring for the full
+# numbers) -- no structural conflict: `apply_instant_settings()`'s turbo wrap runs once
+# the transformer is confirmed resident and well before hires-fix's own two-pass split,
+# and hires-fix's FBC bookkeeping calls are already no-ops whenever turbo forces
+# `effective_cache` to "none".
 #
 # Turbo changes three more things, all gated on this same flag (see `generate()`):
 # the default `num_inference_steps` becomes 8 (matches the LoRA author's community-
 # verified "8 steps works, 4-7 does not" finding, itself hedged in the README as
-# possibly a ComfyUI-sampler artifact rather than a LoRA limit -- see the A/B task this
-# flag is part of); FirstBlockCache (`H3_CACHE=fbc`) is force-disabled regardless of its
-# own env var (a handful of steps leaves no redundant-computation window for FBC's
-# residual-similarity skip to safely exploit, and caching on top of an already-4-8-step
-# trajectory risks compounding drift for no measured benefit); the video/audio schedulers'
-# `shift` is left completely untouched (both already default to 12.0/3.0 --
-# `scheduler_config.json` on disk and `MiniMaxH3SetTimestepsStep`'s own docstring both
-# confirm this, and this task's own verification found the LoRA author's reference
-# sampler uses the identical two constants -- so there is nothing to reconfigure here,
-# unlike a naive port from a scheduler that defaults elsewhere).
+# possibly a ComfyUI-sampler artifact rather than a LoRA limit -- this project's own
+# verification found no audio breakage even at 4 steps, see README); FirstBlockCache
+# (`H3_CACHE=fbc`) is force-disabled regardless of its own env var (a handful of steps
+# leaves no redundant-computation window for FBC's residual-similarity skip to safely
+# exploit, and caching on top of an already-4-8-step trajectory risks compounding drift
+# for no measured benefit); the video/audio schedulers' `shift` is left completely
+# untouched (both already default to 12.0/3.0 -- `scheduler_config.json` on disk and
+# `MiniMaxH3SetTimestepsStep`'s own docstring both confirm this, and this task's own
+# verification found the LoRA author's reference sampler uses the identical two
+# constants -- so there is nothing to reconfigure here, unlike a naive port from a
+# scheduler that defaults elsewhere).
 H3_TURBO_LORA = os.environ.get("H3_TURBO_LORA", "0").strip() == "1"
 H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "larryvrh/MiniMax-H3-Turbo-Lora")
 H3_TURBO_LORA_FILE = os.environ.get("H3_TURBO_LORA_FILE", "minimax_h3_turbo_4step.safetensors")
 H3_TURBO_STEPS_DEFAULT = int(os.environ.get("H3_TURBO_STEPS_DEFAULT", "8"))
 if H3_TURBO_LORA and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
     raise RuntimeError(
-        "H3_TURBO_LORA=1 is only verified against the default transformer path "
-        "(H3_TRANSFORMER_QUANT=none, H3_LOWVRAM=0). It has not been checked against "
-        "H3_LOWVRAM (int8/group offload) or H3_TRANSFORMER_BOTH_RESIDENT (int8 "
-        "both-resident) -- refusing to silently combine an unverified quantize/offload "
-        "order with a freshly-applied LoRA delta. Drop H3_TURBO_LORA or drop the other "
-        "flag."
+        "H3_TURBO_LORA=1 is only supported against the default transformer path "
+        "(H3_TRANSFORMER_QUANT=none, H3_LOWVRAM=0). Confirmed incompatible (not just "
+        "unverified) with H3_LOWVRAM (int8/group offload) or "
+        "H3_TRANSFORMER_BOTH_RESIDENT (int8 both-resident): apply_turbo_lora()'s "
+        "fuse_projections() call does torch.cat() on the transformer's to_q/to_k/to_v "
+        "weights, and those are torchao Int8Tensor under transformer_quant=int8 -- "
+        "Int8Tensor has no aten.cat kernel, so this reproducibly raises "
+        "NotImplementedError. Drop H3_TURBO_LORA or drop the other flag."
     )
 
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.

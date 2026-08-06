@@ -115,34 +115,72 @@ def resolve_instant_settings(
 
 
 def validate_instant_settings(resolved: dict) -> None:
-    """Reject combinations that are not verified to work together, mirroring the exact
-    same rules `core/runner.py` enforces at import time for the equivalent env vars
+    """Reject combinations confirmed NOT to work together, mirroring the exact same
+    rules `core/runner.py` enforces at import time for the equivalent env vars
     (H3_TURBO_LORA vs H3_LOWVRAM_ANY/H3_TRANSFORMER_BOTH_RESIDENT, see that module's own
     comment on the `H3_TURBO_LORA` block) -- except checked per-request here, since
     turbo is now an instant (not process-wide-fixed) setting and the *current* reload
     group config can be anything by the time a turbo=True request arrives.
+
+    Actually verified (not just "unverified") by this task's own A/B run, 2026-08-06:
+    turbo=1 + (lowvram=1 or lowvram=group or transformer_both_resident, i.e. any path
+    where `H3_TRANSFORMER_QUANT=int8`) reproducibly fails with `NotImplementedError:
+    Int8Tensor dispatch: attempting to run unimplemented operator/function:
+    func=<OpOverload(op='aten.cat', overload='default')>` -- `apply_turbo_lora()`'s
+    call to `attn.fuse_projections()` (`core/runner.py`) does `torch.cat([to_q.weight,
+    to_k.weight, to_v.weight])` to build the fused `to_qkv` Linear the checkpoint's LoRA
+    targets, and torchao's `Int8Tensor` (`H3_INT8_MODULES_TO_NOT_CONVERT` does not skip
+    `to_q`/`to_k`/`to_v`, so they ARE quantized under `H3_TRANSFORMER_QUANT=int8`) has no
+    registered `aten.cat` kernel (grepped `torchao/quantization/quantize_/workflows/
+    int8/int8_tensor.py`'s `@implements(...)` list -- no `aten.cat` entry). This is not
+    an offload-hook-ordering problem (group mode's "wrap LoRA before enable_group_
+    offload()" fix that helped a sibling project, diffusers-server CLAUDE.md #44, does
+    NOT apply here): the failure happens inside `fuse_projections()` itself, before any
+    group offload hook is ever consulted, so reordering the two calls cannot help --
+    the base weights themselves are the wrong tensor subclass for `torch.cat`. Confirmed
+    identical for both `H3_LOWVRAM=1` and `H3_LOWVRAM=group` (both force
+    `H3_TRANSFORMER_QUANT=int8`, same `modules_to_not_convert` recipe as plain
+    `transformer_both_resident` int8 mode) -- one 500 response with the exact same
+    `Int8Tensor`/`aten.cat` error text from each, request rejected cleanly with no VRAM
+    leak or lasting corruption (confirmed by a follow-up plain, non-turbo generation
+    succeeding right after on the same still-running server).
     """
     import core.runner as runner
 
     if resolved["turbo"] and (runner.H3_LOWVRAM_ANY or runner.H3_TRANSFORMER_BOTH_RESIDENT):
         raise ValueError(
-            "turbo=1 is only verified against the default transformer path "
-            "(transformer_quant=none, lowvram=0). It has not been checked against "
-            "lowvram (int8/group offload) or transformer_both_resident (int8 "
-            "both-resident) -- refusing to silently combine an unverified "
-            "quantize/offload order with a freshly-applied LoRA delta. Drop turbo or "
-            "change the reload-group settings first."
+            "turbo=1 is only supported against the default transformer path "
+            "(transformer_quant=none, lowvram=0). Confirmed incompatible (not just "
+            "unverified) with lowvram (int8/group offload) or transformer_both_resident "
+            "(int8 both-resident): apply_turbo_lora()'s fuse_projections() call does "
+            "torch.cat() on the transformer's to_q/to_k/to_v weights, and those are "
+            "torchao Int8Tensor under transformer_quant=int8 -- Int8Tensor has no "
+            "aten.cat kernel, so this reproducibly raises NotImplementedError "
+            "('Int8Tensor dispatch: ... aten.cat ...'), not a silent quality "
+            "regression. Drop turbo or change the reload-group settings first."
         )
 
 
 def validate_instant_settings_for_upscale(resolved: dict, do_upscale: bool) -> None:
-    """`upscale=1` (hires-fix) has its own pre-existing incompatibility with turbo (see
-    `generate()`'s own do_upscale/H3_TURBO_LORA check) -- re-checked here against the
-    *resolved* (possibly request-overridden) turbo value, since turbo is no longer
-    necessarily equal to the process-wide H3_TURBO_LORA default.
+    """`upscale=1` (hires-fix) + turbo=1 works and is the recommended way to run
+    hires-fix: verified by this task's own A/B run, 2026-08-06 (RTX PRO 6000 96GB,
+    768->1536 hires-fix, seed=12345). 8-step turbo: 210.3s total (82.6s pass1+pass2
+    denoise + 24.4s decode + ~103s model load/preload overhead already counted in
+    total_elapsed_s), pass1=5/pass2=2 steps (`H3_HIRES_DENOISE=0.35` default split of
+    the 7 scheduler timesteps an 8-step turbo run produces), peak VRAM 88.09GB -- vs
+    the non-turbo 30-step baseline's 645s (README's own upscale=1 row). 16-step turbo:
+    331.8s, pass1=10/pass2=5, peak VRAM 88.35GB, visibly sharper than 8-step. Both
+    frame-sampled through the full clip (start/mid/end) with no checkerboard corruption
+    or color-space breakage (the exact failure mode an earlier hires-fix iteration hit
+    per `_upscale_block_state_2x`'s own docstring) and non-silent, non-clipped audio
+    (RMS/peak matched the API's own reported values via an independent wav decode).
+    `settings.py`'s no-FBC-with-turbo rule (see `resolve_instant_settings()`) already
+    covers the "FBC bookkeeping under hires-fix is turbo-unaware" concern the previous
+    version of this function's docstring raised: `effective_cache` is force-downgraded
+    to "none" before this is ever reached, so `_fbc_last_step_was_skip()`'s calls in the
+    hires-fix branch are harmless no-ops (try/except-wrapped, return 0) whenever turbo
+    is on, exactly like the non-hires-fix path.
     """
-    if do_upscale and resolved["turbo"]:
-        raise ValueError("upscale=1 (hires-fix) is not supported with turbo=1.")
 
 
 def current_settings_snapshot() -> dict:
@@ -174,11 +212,16 @@ def current_settings_snapshot() -> dict:
         },
         "constraints": {
             # Mirrors the exact incompatibilities core/runner.py enforces at import
-            # time / generate()-time, exposed so the UI can grey out turbo/upscale
-            # instead of only finding out via a 400 after clicking generate.
+            # time / generate()-time, exposed so the UI can grey out turbo instead of
+            # only finding out via a 400 after clicking generate. turbo+upscale is
+            # verified to work together (see validate_instant_settings_for_upscale's
+            # own docstring, 2026-08-06 A/B) and is no longer greyed out; the other two
+            # are confirmed (not just unverified) incompatible -- see
+            # validate_instant_settings's own docstring for why reordering cannot fix
+            # the int8/fuse_projections() conflict.
             "turbo_incompatible_with_lowvram": True,
             "turbo_incompatible_with_transformer_both_resident": True,
-            "turbo_incompatible_with_upscale": True,
+            "turbo_incompatible_with_upscale": False,
             "transformer_both_resident": runner.H3_TRANSFORMER_BOTH_RESIDENT,
         },
         "reload_eta_s": RELOAD_ETA_S,
@@ -289,16 +332,19 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
         new_transformer_both_resident = new_transformer_quant == "int8" and not new_lowvram_any
 
         # turbo (instant-group) compatibility with the *new* reload config: reject the
-        # apply outright if turbo is currently on and would become unverified-combo
-        # under the new settings, rather than silently leaving a now-invalid turbo=on
-        # state for the next request to trip over. Mirrors validate_instant_settings()'s
-        # own rule, evaluated against the *proposed* new state instead of the current one.
+        # apply outright if turbo is currently on and would become a confirmed-broken
+        # combo under the new settings (see validate_instant_settings()'s own docstring
+        # for the Int8Tensor/aten.cat root cause), rather than silently leaving a
+        # now-invalid turbo=on state for the next request to trip over. Mirrors
+        # validate_instant_settings()'s own rule, evaluated against the *proposed* new
+        # state instead of the current one.
         if runner.H3_TURBO_LORA and (new_lowvram_any or new_transformer_both_resident):
             raise ValueError(
                 "Cannot apply this reload configuration while the turbo LoRA default "
                 "(H3_TURBO_LORA env var) is on: lowvram/transformer_both_resident are "
-                "not verified together with turbo. Note this only refers to the "
-                "startup env var default, not any single request's instant turbo=1 "
+                "confirmed incompatible with turbo (Int8Tensor has no aten.cat kernel, "
+                "see validate_instant_settings()'s docstring). Note this only refers to "
+                "the startup env var default, not any single request's instant turbo=1 "
                 "override (those are validated independently, per request, by "
                 "validate_instant_settings())."
             )
