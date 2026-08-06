@@ -283,6 +283,27 @@ TE-nf4(21GB)+ transformer int8(34GB)= 55GB は48GB級カードでは同時常駐
   int8の直列化保存も同様に未検証。今回はリクエストごとの固定費 ~90-100s
   (TEロード+transformerロード)をそのまま許容する設計とした)。
 
+## Turbo LoRA (`H3_TURBO_LORA`、既定 `0`、2026-08-06)
+
+`H3_TURBO_LORA=1` で Ostris氏学習中の4/8ステップ蒸留LoRA
+(`larryvrh/MiniMax-H3-Turbo-Lora`、Apache 2.0、rank64・259 Linear対象)を適用し、
+既定ステップ数を8にする。**プレビュー版LoRA(学習途上)のため既定OFF**。完成版が
+出たら再評価する。
+
+実測(768²/5秒/seed12345): 8steps **87.7s(-46%)** で基準30steps(163.5s)に迫る品質、
+16steps 98.4sで基準同等、4steps 39.6sは柔らかめだが破綻なし。
+**コミュニティの「4〜7stepはダメ」はComfyUI標準サンプラーがデュアルスケジュール
+(video shift12/audio shift3)を扱えないことが原因の可能性が高い**——本実装(diffusers
+PRのscheduler/audio_scheduler分離+手動ループ)では4stepsでも音声破損は起きなかった。
+シフト配線は改修不要(12/3はH3基準スケジューラの既定値で、sigma格子が作者リファレンス
+実装とビット一致することを確認済み)。
+
+実装メモ: LoRAキーはComfyUI命名のfused-QKV形式のため、`attn.fuse_projections()` +
+ランタイムデルタ(W_eff=W+BA、fuseしない)で適用。**罠: `fuse_projections()` は旧
+to_q/k/vを削除せず+12.8GBリークする**(明示deleteで対処)。AdaLNが `linear.weight` を
+直接読むためラッパーに weight/bias 等のパススルーが必要。turbo時はFBC自動無効化。
+`H3_LOWVRAM`/int8/upscale/ref2va との併用は未検証のため起動時拒否。
+
 ## 16GB級の検証結果: 非対応(床は~18GB、2026-08-06確定)
 
 16GBバラスト(空き15.5GB)では **TEロード(nf4量子化)の終盤でOOM**(15.37GB使用時点で

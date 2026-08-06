@@ -498,6 +498,54 @@ if H3_ATTN_BACKEND in ("default", "none"):
 # sigma/sigma_next pair for step N1 onward automatically.
 H3_HIRES_DENOISE = float(os.environ.get("H3_HIRES_DENOISE", "0.35"))
 
+# EXPERIMENTAL, opt-in, A/B in progress at task-write time (this env var and its wiring
+# are themselves the subject of that A/B -- see README for the writeup once done). "0"
+# (default) = the transformer is exactly the base bf16/int8 checkpoint, byte-for-byte
+# identical to pre-this-flag behaviour (the LoRA is never downloaded or applied). "1" =
+# `larryvrh/MiniMax-H3-Turbo-Lora`'s `minimax_h3_turbo_4step.safetensors` (the trained,
+# non-EMA variant -- the author's own README calls the EMA sibling "less mature") is
+# downloaded and applied to `transformer` as an unfused, run-time low-rank delta
+# (`base(x) + B(A(x))`, alpha == rank so no extra scale factor -- matches the LoRA
+# author's own reference `generate.py`, which this project's `_apply_turbo_lora()`
+# mirrors module-for-module, see that function's docstring for the full key-mapping
+# derivation) right after the transformer's normal load. NOT fused into the base
+# weight (`core/loaders.py`-style fuse+cast would round most of a rank-64 delta away
+# against a 66GB bf16 base, per the LoRA author's own `LoRALinear` docstring) and not
+# yet A/B'd against a fused/quantized variant -- this flag exists to let the *default*
+# transformer path (bf16, `H3_TRANSFORMER_QUANT=none`) opt in without touching
+# `transformer_ref` (ref2va is out of scope, see task brief) or the int8/lowvram
+# branches (untested combination -- rejected below with a loud error rather than
+# silently risking a wrong quantize-then-adapt order, the failure mode CLAUDE.md #47's
+# "LoRA loaded after fp8 cast raises NotImplementedError" entry warns about for a
+# sibling project's own fp8 base).
+#
+# Turbo changes three more things, all gated on this same flag (see `generate()`):
+# the default `num_inference_steps` becomes 8 (matches the LoRA author's community-
+# verified "8 steps works, 4-7 does not" finding, itself hedged in the README as
+# possibly a ComfyUI-sampler artifact rather than a LoRA limit -- see the A/B task this
+# flag is part of); FirstBlockCache (`H3_CACHE=fbc`) is force-disabled regardless of its
+# own env var (a handful of steps leaves no redundant-computation window for FBC's
+# residual-similarity skip to safely exploit, and caching on top of an already-4-8-step
+# trajectory risks compounding drift for no measured benefit); the video/audio schedulers'
+# `shift` is left completely untouched (both already default to 12.0/3.0 --
+# `scheduler_config.json` on disk and `MiniMaxH3SetTimestepsStep`'s own docstring both
+# confirm this, and this task's own verification found the LoRA author's reference
+# sampler uses the identical two constants -- so there is nothing to reconfigure here,
+# unlike a naive port from a scheduler that defaults elsewhere).
+H3_TURBO_LORA = os.environ.get("H3_TURBO_LORA", "0").strip() == "1"
+H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "larryvrh/MiniMax-H3-Turbo-Lora")
+H3_TURBO_LORA_FILE = os.environ.get("H3_TURBO_LORA_FILE", "minimax_h3_turbo_4step.safetensors")
+H3_TURBO_STEPS_DEFAULT = int(os.environ.get("H3_TURBO_STEPS_DEFAULT", "8"))
+if H3_TURBO_LORA and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
+    raise RuntimeError(
+        "H3_TURBO_LORA=1 is only verified against the default transformer path "
+        "(H3_TRANSFORMER_QUANT=none, H3_LOWVRAM=0). It has not been checked against "
+        "H3_LOWVRAM (int8/group offload) or H3_TRANSFORMER_BOTH_RESIDENT (int8 "
+        "both-resident) -- refusing to silently combine an unverified quantize/offload "
+        "order with a freshly-applied LoRA delta. Drop H3_TURBO_LORA or drop the other "
+        "flag."
+    )
+
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
 MIN_SECONDS = 5.0
 MAX_SECONDS = 15.0
@@ -537,6 +585,246 @@ def _register_minimax_h3_block_for_fbc() -> None:
             return_encoder_hidden_states_index=None,
         ),
     )
+
+
+class _TurboLoRALinear(torch.nn.Module):
+    """`y = base(x) + B(A(x))`, applied at run time (never fused into `base`'s weight).
+
+    Verbatim port of the LoRA author's own `LoRALinear` (`generate.py` in
+    `larryvrh/MiniMax-H3-Turbo-Lora`, fetched and read as part of this task, per the
+    task brief's instruction to cross-check the reference sampler line-for-line): "Folding
+    it into the (bf16) base weight instead would round most of the update away when it is
+    small relative to the weight". `a`/`b` are the checkpoint's own `lora_A.weight`
+    (`[rank, in_features]`) / `lora_B.weight` (`[out_features, rank]`) tensors, registered as
+    buffers (not parameters -- this project only ever runs inference, no autograd needed,
+    and a buffer follows `.to(device)`/`.to(dtype)` calls on the parent module the same way a
+    parameter would). No extra scale factor: every rank in this checkpoint (64 for
+    attn/mlp, 16 for adaln_proj) is used with alpha == rank in the author's own code, i.e.
+    scale == 1 always -- reproduced by this task's own inspection of the checkpoint (no
+    `alpha` key anywhere in the safetensors file, and the reference's own `LoRALinear.forward`
+    has no scale multiply either).
+    """
+
+    def __init__(self, base: torch.nn.Linear, lora_a: torch.Tensor, lora_b: torch.Tensor):
+        super().__init__()
+        self.base = base
+        self.register_buffer("lora_a", lora_a, persistent=False)
+        self.register_buffer("lora_b", lora_b, persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + torch.nn.functional.linear(
+            torch.nn.functional.linear(x, self.lora_a), self.lora_b
+        )
+
+    # `MiniMaxH3AdaLayerNormModulation.forward()`/`MiniMaxH3AdaLayerNormOut.forward()`
+    # (transformer_minimax_h3.py) both read `self.linear.weight.dtype` directly to decide
+    # what dtype to cast their SiLU'd input to, bypassing this wrapper's own `forward()`
+    # entirely -- reproduced by this task's own verification
+    # (`scripts/probe_turbo_lora_apply.py`): `AttributeError: '_TurboLoRALinear' object
+    # has no attribute 'weight'`, the identical pitfall diffusers-server's sibling
+    # project hit with JoyAI's `PatchifyLinear` (per that project's memory notes on this
+    # exact failure mode). `.weight`/`.bias` here alias straight through to `base` so any
+    # code elsewhere that introspects a wrapped Linear's weight tensor directly (instead
+    # of calling it) keeps working unmodified.
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        return self.base.bias
+
+    @property
+    def in_features(self) -> int:
+        return self.base.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.base.out_features
+
+
+def _turbo_lora_key_map(transformer) -> dict[str, str]:
+    """Map every ComfyUI-native LoRA key prefix (e.g. `"blocks.3.attn.qkv_proj"`) this
+    checkpoint uses to the dotted attribute path of the diffusers module it targets.
+
+    Derived (not guessed) from reading `transformer_minimax_h3.py` module-by-module
+    against the actual checkpoint keys (`scripts/probe_turbo_lora_keys.py` recorded the
+    verification this task did before writing this function -- shapes, block/refiner
+    counts and the `hidden_size`/`time_embed_dim` config values were all cross-checked,
+    not assumed):
+
+    - `blocks.N.attn.qkv_proj`  -> `transformer_blocks.N.attn.to_qkv` (only valid AFTER
+      `attn.fuse_projections()` has concatenated `to_q`/`to_k`/`to_v` into `to_qkv`, in
+      that exact q,k,v order -- `AttentionModuleMixin.fuse_projections()`, read in
+      `diffusers/models/attention.py`, does `torch.cat([to_q.weight, to_k.weight,
+      to_v.weight])`, the same order the LoRA author's own `_attn()` unpacks with
+      `q, k, v = attn.qkv_proj(x).split(heads * hd, dim=-1)`).
+    - `blocks.N.attn.out_proj`  -> `transformer_blocks.N.attn.to_out.0`
+    - `blocks.N.mlp.fc1`        -> `transformer_blocks.N.ff.net.0.proj` (diffusers' own
+      `SwiGLU.proj`, the un-chunked `Linear(dim, 2*inner_dim)` -- which half of that
+      output diffusers labels "hidden"/"gate" internally does not matter for a LoRA
+      delta added to the *whole* pre-chunk output, see this task's own derivation:
+      the delta is additive in the shared pre-chunk activation space, not inside the
+      gating itself).
+    - `blocks.N.mlp.fc2`        -> `transformer_blocks.N.ff.net.2`
+    - `blocks.N.adaln_proj.linear` -> `transformer_blocks.N.adaln_proj.linear` (name is
+      unchanged -- `MiniMaxH3AdaLayerNormModulation`'s own docstring says it is "named
+      after the checkpoint's `adaln_proj`, with the modulation projection under the
+      `linear` name diffusers uses inside every AdaLN module").
+    - `token_refiner.blocks.N.*` -> `token_refiner.refiner_blocks.N.*` (same
+      attn/mlp sub-mapping as above; only blocks 0-1 exist, matching
+      `num_refiner_layers=2`).
+    - `final_layer.adaln_proj.linear` -> `norm_out.linear` (`MiniMaxH3AdaLayerNormOut`'s
+      own docstring: "Same module layout and checkpoint keys as
+      `AdaLayerNormContinuous`" -- diffusers' equivalent of the checkpoint's
+      "final_layer", exposed under the `norm_out` attribute name.
+      `final_layer.adaln_proj.linear.lora_B.weight`'s shape (10752 = 2*5376) confirmed
+      against `norm_out.linear`'s `2 * hidden_size` output width, not the per-block
+      `6 * hidden_size * 3` width).
+
+    Returns `{comfy_prefix: diffusers_dotted_path}`, one entry per checkpoint-adapted
+    Linear (518 lora_A/lora_B pairs -> 259 entries: 50 blocks x 5 + 2 token_refiner
+    blocks x 4 + 1 final_layer, i.e. 250 + 8 + 1).
+    """
+    num_layers = transformer.config.num_layers
+    num_refiner_layers = transformer.config.num_refiner_layers
+    key_map: dict[str, str] = {}
+    for i in range(num_layers):
+        key_map[f"blocks.{i}.attn.qkv_proj"] = f"transformer_blocks.{i}.attn.to_qkv"
+        key_map[f"blocks.{i}.attn.out_proj"] = f"transformer_blocks.{i}.attn.to_out.0"
+        key_map[f"blocks.{i}.mlp.fc1"] = f"transformer_blocks.{i}.ff.net.0.proj"
+        key_map[f"blocks.{i}.mlp.fc2"] = f"transformer_blocks.{i}.ff.net.2"
+        key_map[f"blocks.{i}.adaln_proj.linear"] = f"transformer_blocks.{i}.adaln_proj.linear"
+    for i in range(num_refiner_layers):
+        key_map[f"token_refiner.blocks.{i}.attn.qkv_proj"] = f"token_refiner.refiner_blocks.{i}.attn.to_qkv"
+        key_map[f"token_refiner.blocks.{i}.attn.out_proj"] = f"token_refiner.refiner_blocks.{i}.attn.to_out.0"
+        key_map[f"token_refiner.blocks.{i}.mlp.fc1"] = f"token_refiner.refiner_blocks.{i}.ff.net.0.proj"
+        key_map[f"token_refiner.blocks.{i}.mlp.fc2"] = f"token_refiner.refiner_blocks.{i}.ff.net.2"
+    key_map["final_layer.adaln_proj.linear"] = "norm_out.linear"
+    return key_map
+
+
+def _get_module_by_dotted_path(root: torch.nn.Module, path: str) -> torch.nn.Module:
+    obj = root
+    for part in path.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    return obj
+
+
+def _set_module_by_dotted_path(root: torch.nn.Module, path: str, value: torch.nn.Module) -> None:
+    *parent_parts, leaf = path.split(".")
+    parent = root
+    for part in parent_parts:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    if leaf.isdigit():
+        parent[int(leaf)] = value
+    else:
+        setattr(parent, leaf, value)
+
+
+def apply_turbo_lora(transformer, lora_path: str) -> int:
+    """Apply `larryvrh/MiniMax-H3-Turbo-Lora`'s checkpoint to `transformer` as an unfused,
+    run-time low-rank delta (see `_TurboLoRALinear`), wrapping every Linear the checkpoint
+    adapts (see `_turbo_lora_key_map`'s docstring for the full derivation).
+
+    Fuses every `MiniMaxH3Attention` submodule's Q/K/V projections into `to_qkv` first
+    (`attn.fuse_projections()`, a diffusers-native, weight-preserving op -- see
+    `AttentionModuleMixin.fuse_projections`) since the checkpoint's `qkv_proj` LoRA targets
+    the fused projection, not the three separate ones diffusers builds by default. This is
+    required for the LoRA's `attn.qkv_proj` delta to land on the same activation the
+    checkpoint's own training run saw; diffusers' unfused `to_q`/`to_k`/`to_v` triple has no
+    single matching Linear for a fused-QKV LoRA to attach to.
+
+    IMPORTANT (found by this task's own verification, not assumed from the diffusers
+    docstring): `fuse_projections()` COPIES `to_q`/`to_k`/`to_v`'s weights into a new
+    `to_qkv` Linear but does NOT delete the three originals (`unfuse_projections()` is the
+    only place that ever removes an attribute, and it only ever removes `to_qkv`, never
+    puts `to_q`/`to_k`/`to_v` back -- read in `diffusers/models/attention.py`). Left alone,
+    this leaves every attention module holding BOTH the fused and unfused weights at once
+    -- reproduced on this task's first server-integration attempt: the transformer's own
+    resident size grew from the expected ~66.3GB to 79.08GB after this function ran (an
+    extra ~12.8GB, consistent with Q+K+V's combined size roughly matching to_qkv's), which
+    then OOM'd the very next component load (TE-nf4, ~21GB) with the card almost full.
+    `del module.to_q / to_k / to_v` right after fusing reclaims that duplicate memory --
+    safe because `to_qkv`'s weight is an independent concatenated copy (`torch.cat(...)`
+    inside `fuse_projections()`, not a view), not an alias into the three originals.
+
+    Idempotent is NOT guaranteed by design: this is meant to run exactly once, right after
+    a fresh (un-adapted) transformer load -- see the `H3_TURBO_LORA` module comment and its
+    call site in `_ensure_transformer`. Calling it twice on the same module would wrap an
+    already-`_TurboLoRALinear`-wrapped module a second time (harmless numerically -- the
+    LoRA delta would just apply twice -- but wasteful and not the intended usage) and the
+    second `fuse_projections()` call would be a no-op (`fused_projections` is already True).
+
+    Returns the number of Linear layers wrapped (259 for this checkpoint: 50 blocks x 5 +
+    2 token_refiner blocks x 4 + 1 final_layer, see `_turbo_lora_key_map`'s docstring),
+    which the caller logs and can sanity-check against the checkpoint's own key count.
+    """
+    from safetensors.torch import load_file
+
+    t_fuse = time.time()
+    n_fused = 0
+    for module in transformer.modules():
+        from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
+
+        if isinstance(module, MiniMaxH3Attention):
+            module.fuse_projections()
+            # Reclaim the ~12.8GB/transformer this task's own verification found `fuse_
+            # projections()` otherwise leaves orphaned -- see the docstring's IMPORTANT
+            # paragraph. `hasattr` guards the (never expected, but cheap to check) case of
+            # a second call on an already-fused module, where these attributes are already
+            # gone.
+            for attr in ("to_q", "to_k", "to_v"):
+                if hasattr(module, attr):
+                    delattr(module, attr)
+            n_fused += 1
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info("turbo LoRA: fused Q/K/V on %d attention modules in %.2fs", n_fused, time.time() - t_fuse)
+
+    t_load = time.time()
+    lora_sd = load_file(lora_path)
+    key_map = _turbo_lora_key_map(transformer)
+    device = next(transformer.parameters()).device
+    n_wrapped = 0
+    seen_prefixes = {k.rsplit(".lora_", 1)[0] for k in lora_sd if ".lora_" in k}
+    for comfy_prefix, dotted_path in key_map.items():
+        if comfy_prefix not in seen_prefixes:
+            raise RuntimeError(
+                f"turbo LoRA checkpoint is missing expected key prefix {comfy_prefix!r} "
+                f"(mapped to transformer.{dotted_path}) -- checkpoint layout may have "
+                "changed upstream. Refusing to partially apply the adapter."
+            )
+        lora_a = lora_sd[f"{comfy_prefix}.lora_A.weight"].to(device=device, dtype=torch.bfloat16)
+        lora_b = lora_sd[f"{comfy_prefix}.lora_B.weight"].to(device=device, dtype=torch.bfloat16)
+        base_linear = _get_module_by_dotted_path(transformer, dotted_path)
+        if not isinstance(base_linear, torch.nn.Linear):
+            raise RuntimeError(
+                f"expected transformer.{dotted_path} to be an nn.Linear, got "
+                f"{type(base_linear).__name__} (turbo LoRA key {comfy_prefix!r})"
+            )
+        if lora_a.shape[1] != base_linear.in_features or lora_b.shape[0] != base_linear.out_features:
+            raise RuntimeError(
+                f"turbo LoRA shape mismatch for {comfy_prefix!r} -> transformer.{dotted_path}: "
+                f"lora_A={tuple(lora_a.shape)} lora_B={tuple(lora_b.shape)} vs "
+                f"base in_features={base_linear.in_features} out_features={base_linear.out_features}"
+            )
+        _set_module_by_dotted_path(transformer, dotted_path, _TurboLoRALinear(base_linear, lora_a, lora_b))
+        n_wrapped += 1
+        seen_prefixes.discard(comfy_prefix)
+    if seen_prefixes:
+        # Checkpoint has adapter keys this function does not know how to place -- fail
+        # loudly rather than silently apply a partial LoRA (e.g. missing the token
+        # refiner or final_layer would leave the model in an unverified state).
+        raise RuntimeError(
+            f"turbo LoRA checkpoint has {len(seen_prefixes)} key prefix(es) with no mapping "
+            f"in _turbo_lora_key_map(): {sorted(seen_prefixes)[:5]}{'...' if len(seen_prefixes) > 5 else ''}"
+        )
+    logger.info(
+        "turbo LoRA applied: %d Linear layers wrapped from %s in %.2fs",
+        n_wrapped, lora_path, time.time() - t_load,
+    )
+    return n_wrapped
 
 
 def align_num_frames(num_frames: int) -> int:
@@ -699,6 +987,9 @@ class MiniMaxH3Runner:
         # `transformer_ref` may be GPU-resident at a time; this is the single source of
         # truth callers check before a cross-variant swap.
         self._active_variant: str | None = None
+        # H3_TURBO_LORA only: cached local path of the downloaded turbo LoRA safetensors,
+        # resolved once per process by `_download_turbo_lora_if_needed()`.
+        self._turbo_lora_path: str | None = None
 
     # ------------------------------------------------------------------
     # Component lifecycle
@@ -897,14 +1188,43 @@ class MiniMaxH3Runner:
             )
         self._transformer_loaded = True
         self._active_variant = "t2va"
+        if H3_TURBO_LORA:
+            # Applied right after load, before `set_attention_backend`/FBC: LoRA wrapping
+            # only replaces Linear *modules* (`attn.to_qkv`, `ff.net.0.proj`, etc, see
+            # `apply_turbo_lora`'s docstring), it does not touch attention dispatch or
+            # cache hooks, so ordering against those two calls does not matter -- done
+            # first here only because it is the more fundamental structural change of the
+            # three. `H3_CACHE == "fbc"` is force-skipped below (not just "left at its
+            # default") regardless of the env var's own value -- see `H3_TURBO_LORA`'s
+            # module comment for why a handful of turbo steps leaves FBC no safe window.
+            self._download_turbo_lora_if_needed()
+            n = apply_turbo_lora(self._pipe.transformer, self._turbo_lora_path)
+            logger.info("H3_TURBO_LORA=1: applied turbo LoRA (%d layers wrapped), FBC force-disabled", n)
         if H3_ATTN_BACKEND:
             self._pipe.transformer.set_attention_backend(H3_ATTN_BACKEND)
             logger.info("transformer attention backend set to %r", H3_ATTN_BACKEND)
-        if H3_CACHE == "fbc":
+        if H3_CACHE == "fbc" and not H3_TURBO_LORA:
             self._enable_fbc()
         logger.info(
-            "transformer loaded to GPU in %.1fs (quant=%s). gpu=%s ram=%s",
-            time.time() - t0, H3_TRANSFORMER_QUANT, gpu_mem_gb(), ram_gb(),
+            "transformer loaded to GPU in %.1fs (quant=%s, turbo_lora=%s). gpu=%s ram=%s",
+            time.time() - t0, H3_TRANSFORMER_QUANT, H3_TURBO_LORA, gpu_mem_gb(), ram_gb(),
+        )
+
+    def _download_turbo_lora_if_needed(self):
+        """Resolve (downloading if necessary, via the normal HF cache) the turbo LoRA
+        safetensors path once per process, caching it on `self._turbo_lora_path`. Split
+        out from `_ensure_transformer` only so the download (network I/O, ~780MB) is not
+        interleaved with that method's own docstring-documented load-order reasoning.
+        """
+        if getattr(self, "_turbo_lora_path", None) is not None:
+            return
+        from huggingface_hub import hf_hub_download
+
+        t0 = time.time()
+        self._turbo_lora_path = hf_hub_download(H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE)
+        logger.info(
+            "turbo LoRA checkpoint resolved: %s (%.1fs, repo=%s file=%s)",
+            self._turbo_lora_path, time.time() - t0, H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE,
         )
 
     def _check_group_offload_ram_guard(self):
@@ -1576,8 +1896,12 @@ class MiniMaxH3Runner:
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
             "attn_backend": H3_ATTN_BACKEND or "default",
-            "cache_mode": H3_CACHE,
-            "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
+            "cache_mode": H3_CACHE if not H3_TURBO_LORA else "none (force-disabled by H3_TURBO_LORA)",
+            "cache_threshold": H3_CACHE_THRESHOLD if (H3_CACHE == "fbc" and not H3_TURBO_LORA) else None,
+            "turbo_lora": H3_TURBO_LORA,
+            "turbo_lora_repo": H3_TURBO_LORA_REPO if H3_TURBO_LORA else None,
+            "turbo_lora_path": self._turbo_lora_path,
+            "turbo_steps_default": H3_TURBO_STEPS_DEFAULT if H3_TURBO_LORA else None,
             "gpu": gpu_mem_gb(),
             "ram": ram_gb(),
         }
@@ -1838,6 +2162,13 @@ class MiniMaxH3Runner:
             # mind (see H3_LOWVRAM's module comment). Fail loudly rather than risk an
             # OOM mid-request.
             raise ValueError(f"upscale=1 (hires-fix) is not supported with H3_LOWVRAM={H3_LOWVRAM_RAW!r}.")
+        if do_upscale and H3_TURBO_LORA:
+            # Not part of this task's A/B scope (5/8/16/30-step single-pass only) and the
+            # hires-fix branch's own FBC bookkeeping (`_fbc_last_step_was_skip()` calls
+            # further down) is not guarded against H3_TURBO_LORA the way the single-pass
+            # path's is -- rather than silently skip that bookkeeping too, reject the
+            # combination until it is actually verified.
+            raise ValueError("upscale=1 (hires-fix) is not supported with H3_TURBO_LORA=1.")
 
         with self._load_lock:
             if H3_LOWVRAM:
@@ -2192,14 +2523,14 @@ class MiniMaxH3Runner:
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 step_times.append(time.time() - ts)
-                if H3_CACHE == "fbc":
+                if H3_CACHE == "fbc" and not H3_TURBO_LORA:
                     cache_skips[0] += self._fbc_last_step_was_skip()
                 if progress:
                     progress.update(step=i + 1, message=f"デノイズ中 {i + 1}/{num_inference_steps}")
                 return result
 
             denoise_step.loop_step = timed_loop_step
-            if H3_CACHE == "fbc":
+            if H3_CACHE == "fbc" and not H3_TURBO_LORA:
                 # Per-request reset: `FirstBlockCache`'s hooks are stateful (cached head-block
                 # residual/output + tail-block residuals persist on the transformer submodules
                 # between calls, see FBCSharedBlockState in first_block_cache.py). Without this
@@ -2487,8 +2818,9 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": H3_ATTN_BACKEND or "default",
-            "cache_mode": H3_CACHE,
-            "cache_threshold": H3_CACHE_THRESHOLD if H3_CACHE == "fbc" else None,
+            "cache_mode": H3_CACHE if not H3_TURBO_LORA else "none (force-disabled by H3_TURBO_LORA)",
+            "cache_threshold": H3_CACHE_THRESHOLD if (H3_CACHE == "fbc" and not H3_TURBO_LORA) else None,
+            "turbo_lora": H3_TURBO_LORA,
             "upscale": int(do_upscale),
             "hires_denoise": H3_HIRES_DENOISE if do_upscale else None,
             "pass1_steps": n1 if do_upscale else None,
@@ -2497,8 +2829,9 @@ class MiniMaxH3Runner:
             "interpolate_time_s": round(interpolate_time, 3) if interpolate_time is not None else None,
             "pass2_time_s": round(pass2_time, 2) if pass2_time is not None else None,
             # Number of denoise steps where FBC skipped the tail blocks (cache hit).
-            # Always 0 in `none` mode (the counter never increments there).
-            "cache_skipped_steps": cache_skips[0] if H3_CACHE == "fbc" else None,
+            # Always 0 in `none` mode (the counter never increments there) and always
+            # None under H3_TURBO_LORA (FBC is force-disabled, see above).
+            "cache_skipped_steps": cache_skips[0] if (H3_CACHE == "fbc" and not H3_TURBO_LORA) else None,
         }
         if progress:
             progress.update(phase="done", message="完了", result_path=str(mp4_path))

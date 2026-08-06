@@ -21,7 +21,15 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 from core.llm import LLMConnectionError, VALID_MODES, enhance_prompt, get_llm_url
-from core.runner import MAX_SECONDS, MIN_SECONDS, MiniMaxH3Reference, MiniMaxH3Runner, ProgressState
+from core.runner import (
+    H3_TURBO_LORA,
+    H3_TURBO_STEPS_DEFAULT,
+    MAX_SECONDS,
+    MIN_SECONDS,
+    MiniMaxH3Reference,
+    MiniMaxH3Runner,
+    ProgressState,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("minimax_h3.app")
@@ -46,6 +54,12 @@ RESOLUTION_PRESETS = {
     "768x1344": (768, 1344),
     "1344x768": (1344, 768),
 }
+
+# H3_TURBO_LORA=1: the turbo LoRA is community-verified at 8 steps (see core/runner.py's
+# H3_TURBO_LORA module comment) -- default `num_inference_steps` to that instead of the
+# base model's 30 so a client that does not pass the field explicitly gets a sane value
+# for whichever mode the server was launched in. Still fully overridable per-request.
+DEFAULT_NUM_INFERENCE_STEPS = H3_TURBO_STEPS_DEFAULT if H3_TURBO_LORA else 30
 
 
 @app.get("/")
@@ -143,7 +157,7 @@ def api_t2va(
     prompt: str = Form(...),
     resolution: str = Form("768x768"),
     seconds: float = Form(5.0),
-    num_inference_steps: int = Form(30),
+    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
     seed: Optional[int] = Form(None),
     upscale: int = Form(0),
 ):
@@ -165,7 +179,7 @@ def api_fl2va(
     prompt: str = Form(...),
     resolution: str = Form("768x768"),
     seconds: float = Form(5.0),
-    num_inference_steps: int = Form(30),
+    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
     seed: Optional[int] = Form(None),
     image: Optional[UploadFile] = File(None),
     last_image: Optional[UploadFile] = File(None),
