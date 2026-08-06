@@ -686,6 +686,13 @@ venv/bin/python scripts/probe_t2va.py
 - `GET /api/status`: ロード状態・VRAM/RAM
 - `GET /api/progress`: 生成中の進捗ポーリング用
 
+## コミュニティ改良の取り込み一覧
+
+ComfyUI コミュニティ等で出た改良を本アプリ(diffusers 経路)へ取り込んだ作業の記録は
+**[docs/COMMUNITY_IMPROVEMENTS.md](docs/COMMUNITY_IMPROVEMENTS.md)** にまとめてある
+(取り込んだもの / 調査の結果取り込まなかったもの / 着想を得て自前実装したもの、
+それぞれの出典・実測値・判定・踏んだ罠)。
+
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
 ### 1. diffusers PR #14355 のマージ待ち — **安易に上げないこと**
