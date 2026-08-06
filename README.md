@@ -475,6 +475,127 @@ transformer即時ロードをやめてTEと同様に遅延ロード化する(初
 この問題は起きない可能性が高い**(本タスクは94GB機でのみ検証、より多いRAM
 搭載機での追試は未実施)。
 
+## text_encoder の未使用上位レイヤー削除 (`H3_TE_PRUNE`、既定 `0`、2026-08-06追加)
+
+MiniMax-H3 の text_encoder(Qwen3-VL-32B、64層)は
+`hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]`(=50)しか読まない
+(`diffusers/modular_pipelines/minimax_h3/encoders.py`)。`H3_TE_PRUNE=1` は
+text_encoder を **51層だけ**(0〜50、`MINIMAX_H3_TEXT_ENCODER_LAYER + 1`)で構築し、
+未使用の52〜64層目 + 最終`norm` + `lm_head`(重み換算で14層分、bnb-4bit実測 ~3.6GB /
+bf16実測 ~13.6GB)を一度もロードしない。既定 `0` は完全無変更(この分岐自体が
+一切呼ばれない)。
+
+### なぜ「50層」ちょうどではなく「51層」なのか(このタスクで発見・検証したtransformers側の罠)
+
+`hidden_states[k]` の意味は transformers の `_can_record_outputs = {"hidden_states":
+Qwen3VLTextDecoderLayer}` フック機構(`output_capturing.py`)により決まる:
+`hidden_states[0]` = 埋め込み出力(layer 0 の入力を捕捉)、`hidden_states[k]`
+(k=1..num_hidden_layers) = `layers[k-1]` の出力。つまり `hidden_states[50]` =
+`layers[49]` の出力で、**layers[0..49](50層)を実行すれば十分**なはずだった。
+しかし `num_hidden_layers` を**ちょうど50**に切り詰めると、`hidden_states[50]` が
+捕捉タプルの**最後の要素**になってしまい、`Qwen3VLTextModel.forward` を包む
+`@capture_outputs(tie_last_hidden_states=True)`(既定)が「最後の要素を
+`outputs.last_hidden_state`(=最終`norm`適用後の値)で強制的に上書きする」という
+挙動を発動させる。実機検証(`scripts/probe_te_prune*.py`)で、50層ちょうどに
+切り詰めた場合の `hidden_states[50]` は本来の(64層モデルの)値と**桁違いに
+異なる**(max abs diff ~1.5e4、量子化誤差の水準ではなく完全に別の値)ことを確認した。
+これはまさに `encoders.py` 自身のガード
+(`if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER: raise ValueError(...)`)が
+警告している「ちょうど50層に切り詰めた最終隠れ状態はpost-normであり、MiniMax-H3が
+期待する値ではない」という事態そのもの(このガードのおかげで50層ちょうどの誤設定は
+`encode_prompt()` 経由なら例外で弾かれる)。**51層**(`layers[50]`は実行されるが
+その出力は読まれない、無駄な1層分の計算コストのみ)にすることで
+`hidden_states[50]` が捕捉タプルの中間に位置するようになり、上書きを回避できる。
+51層版で64層版の `hidden_states[50]` と**完全一致**(`torch.equal`、bf16・bnb-4bit
+nf4とも)することを実機確認済み。
+
+### 実装
+
+`core/runner.py` の `_text_encoder_config_kwargs()` が、text_encoder の
+`ComponentSpec`(`pretrained_model_name_or_path="MiniMaxAI/MiniMax-H3"`,
+`subfolder="text_encoder"`)と同じ場所から `Qwen3VLConfig` を個別ロードし、
+`text_config.num_hidden_layers = 51` に書き換えたオブジェクトを
+`load_components(..., config={"text_encoder": pruned_config})` として渡す。
+`PreTrainedModel.from_pretrained` は `config` が既に `PreTrainedConfig` インスタンス
+なら自前のconfig自動ロードをスキップしてそのまま使う(`modeling_utils.py`で確認)。
+チェックポイントの `layers.51-63.*` は `from_pretrained` のロードレポートに
+`UNEXPECTED` として現れ、単純に無視される(構築されないため一切のVRAM/RAMを消費
+しない)。vision tower(`model.visual`)は無変更(fl2va のキーフレーム/ref2va の
+参照画像・動画のpixel_valuesがここを通るため、削除対象から明示的に除外)。
+
+`H3_TE_QUANT`(bnb-4bit/none)・`H3_LOWVRAM`(0/1/group)のどの組み合わせとも合成可能。
+
+### 削除後TEの実測サイズ
+
+| 精度 | 削除前 | 削除後(51層) | 削減 |
+|---|---|---|---|
+| bnb-4bit nf4 | 21.02GB | **17.45GB** | -3.57GB (-17%) |
+| bf16 | 66.71GB | **53.06GB** | -13.65GB (-20%) |
+
+nf4は量子化で1層あたりのサイズがbf16の約1/4に圧縮されるため、削減の絶対量もbf16より
+小さい(相対削減率はほぼ同じ)。
+
+### MD5一致チェックの結果
+
+同一seed(768²・5秒・30steps・キツネのプロンプト、seed=12345、`H3_CACHE=none`で
+FBCの経路依存を排除)で、`H3_TE_PRUNE=0`(削除なし)と`H3_TE_PRUNE=1`(削除あり)の
+出力を比較したところ、**t2va・ref2va(画像参照1枚、vision tower経由)とも
+mp4がバイト完全一致(md5一致)**した。削除が数学的に無影響であることの実証。
+`H3_LOWVRAM=1`・`H3_LOWVRAM=group`の各モードでも、削除の有無で出力が完全一致する
+ことを確認済み(後述)。
+
+### 24GB級対応: 削除だけでは不十分だった(実機で発見・`H3_LOWVRAM_GROUP`側に追加修正)
+
+24〜32GB級対応の既存機構(`H3_LOWVRAM=group`)は、TE-nf4(削除前21GB)を
+denoise中も常駐させたままにする設計だった(group offloadされたtransformerの
+実消費が~1.4GBと小さいため、32GB級では問題にならなかった)。削除後のTE(17.45GB)は
+それでもまだ大きく、**22GB制限で実機OOMを再現した**(denoise開始直後、
+21.73GB使用中に224MB要求で失敗)。24GB制限でも同様にOOM(23.12GB使用中に
+1.16GB要求で失敗、step 1で発生)。
+
+対策として `H3_LOWVRAM_GROUP` かつ `H3_TE_PRUNE=1` の場合に限り、
+`H3_LOWVRAM=1`と同じ「denoiseループの間だけTEを強制解放し、decode窓の前後で
+リロードする」選択法を追加した(`core/runner.py`の`group_free_te_for_denoise`
+フラグ)。解放位置はlayout_step/latents_step/timesteps_stepの**後**(既存の
+`force_free_te`と同じ理由: これらのステップの出力は既にテンソルとして
+`state`に載っているため、`_execution_device`解決には以後一切影響しない)。
+`H3_TE_PRUNE=0`(既定)の`H3_LOWVRAM_GROUP`は完全無変更(このフラグは
+`H3_LOWVRAM_GROUP and H3_TE_PRUNE`の両方が真のときのみ真になる)。
+
+修正後、22GB/24GB/20GBいずれのVRAM制限でも実機で完走を確認した:
+
+| VRAM制限 | 結果 | ピークVRAM(reset後の計測) | 総所要時間 |
+|---|---|---|---|
+| 22GB(修正前、削除のみ) | **OOM**(denoise開始直後、21.73GB使用中に224MB要求) | - | - |
+| 24GB(修正前、削除のみ) | **OOM**(step 1、23.12GB使用中に1.16GB要求) | - | - |
+| 24GB(修正後、1本目) | ○ | 17.72GB | 321.7s(TE初回ロード込み) |
+| 24GB(修正後、2本目・連続) | ○ | 18.68GB | 277.7s(TE常駐のため短縮) |
+| 20GB(修正後) | ○ | 17.72GB | 320.3s |
+
+24GB×2本・20GB×1本の出力mp4は**すべてバイト完全一致**(md5一致、通常int8モード
+(`H3_LOWVRAM`未指定)の出力とも一致)。group offloadの計算内容が
+VRAM予算に関わらず数学的に同一であることの裏付け(既存の32GB/24GB検証結果と同じ
+結論)。ホストRAM/スワップは各テストの前後で増加なし(`free -h`のSwap usedは
+一貫して~7.9GB台、既存分のまま)。
+
+### `H3_LOWVRAM=1`(48GB級)でのTEロード時間短縮
+
+削除により、`H3_LOWVRAM=1`が毎リクエスト支払うTEロード固定費が短縮される
+(実機、ダミーVRAM確保で空きを~43.5GBに制限):
+
+| | TEロード時間 | TEサイズ |
+|---|---|---|
+| 削除なし | 42.3s | 21.01GB |
+| 削除あり | **35.0s**(-17%) | 17.44GB |
+
+出力mp4は削除の有無でバイト完全一致(md5一致)。
+
+### 回帰確認
+
+`H3_TE_PRUNE`未指定(既定`0`)の状態で同一条件のt2vaを実行し、この機能追加前に
+取得していた基準mp4とバイト完全一致(md5一致)することを確認した。既定動作は
+完全無変更。
+
 ## Ref2VA (オムニ参照生成、`/api/ref2va`)
 
 順序付きの参照素材(**画像最大9・動画最大3・音声最大3、合計12**。音声単独は不可)から

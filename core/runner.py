@@ -143,6 +143,13 @@ from PIL import Image
 # unlike the actual big-model loading calls in this file, which all stay lazy/on-demand.
 from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
 
+# The single source of truth for which hidden_states index MiniMax-H3 conditions on
+# (currently 50) -- imported rather than hardcoded so H3_TE_PRUNE (below) always tracks
+# whatever diffusers' own encoders.py/packing.py actually read, even if a future
+# diffusers version changes it. Same "cheap, no model loading" import as
+# MiniMaxH3Reference above.
+from diffusers.modular_pipelines.minimax_h3.packing import MINIMAX_H3_TEXT_ENCODER_LAYER
+
 logger = logging.getLogger("minimax_h3.runner")
 
 MODEL_ID = "MiniMaxAI/MiniMax-H3"
@@ -155,6 +162,69 @@ CPU = torch.device("cpu")
 TE_QUANT = os.environ.get("H3_TE_QUANT", "bnb-4bit").strip().lower()
 if TE_QUANT not in ("none", "bnb-4bit"):
     raise ValueError(f"H3_TE_QUANT must be 'none' or 'bnb-4bit', got {TE_QUANT!r}")
+
+# EXPERIMENTAL, opt-in. "0" (default) = text_encoder is built with its checkpoint's
+# native 64 decoder layers, byte-for-byte identical to pre-this-flag behaviour. "1" =
+# the text_encoder is built with only its first 51 decoder layers (the checkpoint's
+# layers.51-63, ~14 layers, plus the final `norm`/`lm_head`, are never constructed at
+# all -- their weights show up as "UNEXPECTED" in transformers' from_pretrained load
+# report and are simply skipped).
+#
+# MiniMax-H3 conditions on `hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]` (=50) of its
+# Qwen3-VL-32B conditioner and never touches the LM head (see diffusers'
+# minimax_h3/encoders.py and packing.py) -- confirmed by reading
+# transformers/models/qwen3_vl/modeling_qwen3_vl.py's `Qwen3VLTextModel.forward`
+# together with `_can_record_outputs = {"hidden_states": Qwen3VLTextDecoderLayer}`
+# and `install_output_capuring_hook`'s `capture_initial_hidden_state` semantics
+# (transformers/utils/output_capturing.py): `hidden_states[0]` is the embedding
+# output (captured as the hook firing on `layers[0]`'s own *input*, `args[0]`), and
+# `hidden_states[k]` for k=1..num_hidden_layers is the *output* of `layers[k-1]` (the
+# hook fires as a forward hook on that layer). So `hidden_states[50]` = the output of
+# `layers[49]` -- only `layers[0..49]` (50 layers) are ever executed before that value
+# is read; everything from `layers[50]` onward, plus the model's final `norm` and the
+# LM head, is dead weight for MiniMax-H3's own use of this checkpoint (confirmed this
+# is not merely an unused *module*, but genuinely never touched at forward time: the
+# decoder loop only runs `range(config.num_hidden_layers)` iterations in the first
+# place, so truncating `num_hidden_layers` means those layers are literally never
+# constructed nor executed, not just constructed-and-ignored).
+#
+# `num_hidden_layers` is set to 51 (MINIMAX_H3_TEXT_ENCODER_LAYER + 1), NOT 50 -- found
+# by this task's own verification (scripts/probe_te_prune*.py), not assumed: pruning to
+# exactly 50 layers makes `hidden_states[50]` the *last* entry of the captured tuple.
+# `Qwen3VLTextModel.forward` is wrapped in `@capture_outputs` (transformers'
+# output_capturing.py) with its default `tie_last_hidden_states=True`, which
+# unconditionally overwrites the *last* captured hidden_states entry with
+# `outputs.last_hidden_state` -- the value AFTER the model's final `self.norm(...)`
+# call. In the real 64-layer checkpoint, index 50 is nowhere near the last entry (index
+# 64), so this substitution never touches it and `hidden_states[50]` is genuinely the
+# raw (pre-norm) output of `layers[49]`, matching what MiniMax-H3 was trained to
+# condition on. Truncating to exactly 50 layers makes index 50 the *only* (and thus
+# last) entry, silently swapping it for the post-norm value instead -- reproduced by
+# this task's own probe (max abs diff ~1.5e4 against the real 64-layer model's
+# `hidden_states[50]`, i.e. not quantization noise, a genuinely different number) and
+# fixed by keeping one extra layer (51 built, `layers[50]` executes but its output is
+# simply never read) so index 50 sits mid-stack again. Verified bit-identical
+# (`torch.equal`, both bf16 and bnb-4bit nf4) against the unpruned model's
+# `hidden_states[50]` after this fix. This is exactly the failure mode
+# `MiniMaxH3TextEncoderStep.encode_prompt`'s own guard (`if num_layers <=
+# MINIMAX_H3_TEXT_ENCODER_LAYER: raise ValueError(...)`, see encoders.py) was written
+# to catch -- pruning to 50 would have raised there; 51 is the smallest value that both
+# passes that guard and sidesteps the tie_last_hidden_states substitution.
+#
+# Applied in `_load_text_encoder()` via `config=` passed straight into
+# `load_components()` (same per-component-kwarg dict shape already used for TE's
+# `BitsAndBytesConfig`/`device_map`) -- `ComponentSpec.load()` forwards any kwarg that
+# is not one of its own loading fields (pretrained_model_name_or_path/subfolder/
+# variant/revision) straight to `from_pretrained(..., **kwargs)`, and
+# `PreTrainedModel.from_pretrained` skips its own config auto-load entirely when
+# `isinstance(config, PreTrainedConfig)` is already true, using the object passed in
+# verbatim instead (confirmed by reading modeling_utils.py's `from_pretrained`).
+# Composes with `H3_TE_QUANT` (bnb-4bit or none) and every `H3_LOWVRAM`/
+# `H3_LOWVRAM_GROUP` mode without any choreography changes: this only shrinks the
+# text_encoder's own footprint (measured ~3.6GB smaller bnb-4bit nf4, ~13.6GB smaller
+# bf16 -- nf4 already compresses each pruned bf16 layer ~4x, so the absolute nf4 saving
+# is proportionally smaller), it does not change *when* or *whether* TE is resident.
+H3_TE_PRUNE = os.environ.get("H3_TE_PRUNE", "0").strip() == "1"
 
 # "fbc" (default; A/B verified 2026-08-04: threshold 0.05 gives -25% denoise time with
 # near-identical output -- PSNR 31.8-34.3dB vs no-cache, audio corr 0.979, no visible drift.
@@ -1251,6 +1321,42 @@ class MiniMaxH3Runner:
         logger.info("switched active variant -> %s in %.1fs. gpu=%s ram=%s",
                      variant, time.time() - t0, gpu_mem_gb(), ram_gb())
 
+    def _text_encoder_config_kwargs(self) -> dict:
+        """Build the `config=` per-component kwarg for `load_components(names=["text_encoder", ...])`.
+
+        `{}` (H3_TE_PRUNE=0, default): no `config` override passed at all -- `spec.load()`
+        falls back to its own auto-load-config-from-checkpoint path, byte-for-byte the
+        pre-H3_TE_PRUNE behaviour.
+
+        H3_TE_PRUNE=1: loads the checkpoint's own `Qwen3VLConfig` (same
+        pretrained_model_name_or_path/subfolder the text_encoder `ComponentSpec` itself
+        uses -- `MiniMaxAI/MiniMax-H3`, subfolder `text_encoder`, confirmed by reading
+        `self._pipe._component_specs["text_encoder"]` at task-verification time), then
+        truncates `text_config.num_hidden_layers` to `MINIMAX_H3_TEXT_ENCODER_LAYER + 1`
+        (see `H3_TE_PRUNE`'s module-level comment for why +1, not the read index itself)
+        before handing it back. `PreTrainedModel.from_pretrained` skips its own config
+        auto-load whenever `config` is already a `PreTrainedConfig` instance (verified by
+        reading modeling_utils.py), so passing this object through is enough to make
+        `Qwen3VLForConditionalGeneration.__init__` build only `layers[0:51]` -- the
+        checkpoint's `layers.51-63.*` and `lm_head.*` become "UNEXPECTED" keys in the
+        load report and are simply skipped, never materialized on GPU/CPU at all. The
+        text model's own final `norm` (unlike the layers, its construction does not
+        depend on `num_hidden_layers`) is still built and its checkpoint weight still
+        loads normally, but it is functionally dead: nothing downstream ever reads
+        `last_hidden_state` (the only thing `norm` feeds), only `hidden_states[50]`
+        (`layers[49]`'s raw output, captured before `norm` ever runs on it).
+        """
+        if not H3_TE_PRUNE:
+            return {}
+        from transformers import Qwen3VLConfig
+
+        spec = self._pipe._component_specs["text_encoder"]
+        cfg = Qwen3VLConfig.from_pretrained(
+            spec.pretrained_model_name_or_path, subfolder=spec.subfolder or None
+        )
+        cfg.text_config.num_hidden_layers = MINIMAX_H3_TEXT_ENCODER_LAYER + 1
+        return {"text_encoder": cfg}
+
     def _load_text_encoder(self, progress: ProgressState | None = None):
         """Load the text_encoder to GPU.
 
@@ -1259,13 +1365,24 @@ class MiniMaxH3Runner:
         `bnb-4bit` mode: ~18GB NF4-quantized TE, loaded once at startup and kept
         resident forever (bnb 4bit models cannot be moved between devices, so
         `device_map="cuda"` places it directly and there is nothing to cycle).
+
+        `H3_TE_PRUNE=1` (either TE_QUANT mode): the text_encoder is built with only its
+        first 51 (of 64) decoder layers -- see `H3_TE_PRUNE`'s module-level comment and
+        `_text_encoder_config_kwargs()`'s docstring for why 51 and why this is exact,
+        not an approximation. Measured savings: ~3.6GB (bnb-4bit nf4, 21.0GB -> 17.4GB)
+        or ~13.6GB (bf16, 66.7GB -> 53.1GB).
         """
         self._ensure_pipe_shell()
         if self._text_encoder_loaded:
             return
+        config_kwargs = self._text_encoder_config_kwargs()
+        prune_suffix = ", pruned to 51 layers" if H3_TE_PRUNE else ""
         if TE_QUANT == "bnb-4bit":
             if progress:
-                progress.update(phase="loading_text_encoder", message="text_encoder (Qwen3-VL-32B, NF4) をロード中...")
+                progress.update(
+                    phase="loading_text_encoder",
+                    message=f"text_encoder (Qwen3-VL-32B, NF4{prune_suffix}) をロード中...",
+                )
             t0 = time.time()
             from transformers import BitsAndBytesConfig
 
@@ -1276,30 +1393,40 @@ class MiniMaxH3Runner:
             )
             # Per-component kwargs: `load_components` broadcasts a plain (non-dict) kwarg
             # value to every named component, but tokenizer/processor do not accept
-            # `quantization_config` or `device_map`. Use the dict form (component name ->
-            # value) so only `text_encoder` gets them.
+            # `quantization_config` / `device_map` / (pruned) `config`. Use the dict form
+            # (component name -> value) so only `text_encoder` gets them -- same shape
+            # `config_kwargs` (from `_text_encoder_config_kwargs`) already uses, `{}` when
+            # H3_TE_PRUNE=0 so this is a pure no-op addition to the kwargs dict in that case.
             self._pipe.load_components(
                 names=["text_encoder", "tokenizer", "processor"],
                 dtype=torch.bfloat16,
                 quantization_config={"text_encoder": quant_config},
                 device_map={"text_encoder": "cuda"},
+                config=config_kwargs,
             )
             self._text_encoder_loaded = True
             logger.info(
-                "text_encoder (NF4) loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb()
+                "text_encoder (NF4%s) loaded to GPU in %.1fs. gpu=%s ram=%s",
+                prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
             )
             return
-        # TE (66GB) + transformer (66GB) cannot coexist in 96GB VRAM: measured 66.73GB
-        # for the TE alone (the checkpoint shards are bf16-native, not fp32). The two
-        # big models therefore cycle: TE on GPU only during prompt encoding.
+        # TE (66GB, or ~53GB pruned) + transformer (66GB) cannot coexist in 96GB VRAM:
+        # measured 66.73GB for the unpruned TE alone (the checkpoint shards are
+        # bf16-native, not fp32). The two big models therefore cycle: TE on GPU only
+        # during prompt encoding.
         self._free_transformer()
         if progress:
-            progress.update(phase="loading_text_encoder", message="text_encoder (Qwen3-VL-32B) をロード中...")
+            progress.update(phase="loading_text_encoder", message=f"text_encoder (Qwen3-VL-32B{prune_suffix}) をロード中...")
         t0 = time.time()
-        self._pipe.load_components(names=["text_encoder", "tokenizer", "processor"], dtype=torch.bfloat16)
+        self._pipe.load_components(
+            names=["text_encoder", "tokenizer", "processor"], dtype=torch.bfloat16, config=config_kwargs
+        )
         self._pipe.text_encoder.to(DEVICE)
         self._text_encoder_loaded = True
-        logger.info("text_encoder loaded to GPU in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
+        logger.info(
+            "text_encoder%s loaded to GPU in %.1fs. gpu=%s ram=%s",
+            prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
+        )
 
     def _free_text_encoder(self, force: bool = False):
         """Free the resident text_encoder.
@@ -1402,6 +1529,7 @@ class MiniMaxH3Runner:
             "vae_on_gpu": self._vae_on_gpu,
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
+            "te_prune": H3_TE_PRUNE,
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "lowvram_group": H3_LOWVRAM_GROUP,
@@ -1836,6 +1964,26 @@ class MiniMaxH3Runner:
             do_upscale or (H3_TRANSFORMER_BOTH_RESIDENT and self._transformer_ref_loaded)
         )
 
+        # H3_LOWVRAM_GROUP's normal design (see the branch below and its own module
+        # comment) keeps TE-nf4 resident straight through denoise -- correct at its
+        # original ~21GB TE size, where 32GB-class ballast testing measured this fitting
+        # with room to spare (28.67GB peak, see README). H3_TE_PRUNE shrinks TE to
+        # ~17.45GB, which sounded like it should only make this mode's headroom bigger,
+        # but this task's own 22GB/24GB ballast testing found the OPPOSITE is what
+        # matters at the 24GB-class floor this mode is meant to reach: pruned TE
+        # (17.45GB) + the group-offloaded transformer's own resident blocks + denoise
+        # activations still leaves only ~2GB of slack at a 24GB budget, and reproducibly
+        # OOMs 1 step into denoise ("Tried to allocate 1.16 GiB" with 23.12GB already in
+        # use against a 24GB ballast). Pruning alone was not enough to cross the 24GB
+        # line this mode's docs already draw at 32GB -- so H3_TE_PRUNE=1 additionally
+        # borrows H3_LOWVRAM=1's own choreography (force-free TE for the denoise loop,
+        # reload it after) for this mode specifically, verified by this task's own
+        # 24GB-ballast retest to fix the OOM (see H3_TE_PRUNE's own module comment for
+        # the full measurement table). Unpruned H3_LOWVRAM_GROUP (H3_TE_PRUNE=0, the
+        # default) is completely unaffected -- this flag is only ever True when both
+        # H3_LOWVRAM_GROUP and H3_TE_PRUNE are set.
+        group_free_te_for_denoise = H3_LOWVRAM_GROUP and H3_TE_PRUNE
+
         if H3_LOWVRAM_GROUP:
             # Transformer is already resident (loaded/confirmed in the entry section
             # above, via `_switch_to_variant` -> `_ensure_transformer` ->
@@ -1968,6 +2116,32 @@ class MiniMaxH3Runner:
             # timesteps_step have already run above and their outputs are already
             # materialized as tensors on `state`, so `_execution_device` resolution is
             # no longer touched by freeing text_encoder from here on.
+            with self._load_lock:
+                self._free_text_encoder(force=True)
+
+        if group_free_te_for_denoise:
+            # H3_LOWVRAM_GROUP + H3_TE_PRUNE only (see `group_free_te_for_denoise`'s own
+            # comment above for why this is needed at the 24GB-class floor). Safe here
+            # for the identical reason `force_free_te`'s own free (just above) is safe at
+            # this exact point: layout_step/latents_step/timesteps_step have already run,
+            # so every tensor whose creation needed `_execution_device` to resolve
+            # correctly already exists, materialized on the right device -- freeing
+            # text_encoder from here on cannot change what `_execution_device` resolves
+            # to for the remainder of this request. `vae` -- normally the very next
+            # `nn.Module` `_execution_device` would fall through to once text_encoder is
+            # gone (see the long comment earlier in this method on `text_encoder,
+            # tokenizer, processor, vae, ...` insertion order) -- does not create a
+            # device-mismatch risk here the way it did for the (rejected-much-earlier,
+            # `H3_LOWVRAM=1`-only) upscale/fl2va orderings that comment warns about: t2va
+            # never touches `vae` again until the decode section below, well after the
+            # denoise loop's own device usage is already locked in by the transformer's
+            # own `.device`, not `_execution_device`, inside `MiniMaxH3DenoiseStep`.
+            # Reloaded around the decode window exactly like every other
+            # H3_LOWVRAM_GROUP request already does unconditionally (see the decode
+            # section's own `elif H3_LOWVRAM_GROUP:` branch) -- that reload is not
+            # gated on this flag, so it fires regardless and restores the
+            # transformer(group-offloaded)+TE-nf4(pruned) steady state for the next
+            # request either way.
             with self._load_lock:
                 self._free_text_encoder(force=True)
 
