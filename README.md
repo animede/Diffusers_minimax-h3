@@ -14,8 +14,10 @@ VRAM対応表を参照)。
 > 既存の実測値は 96GB 時代のもの(VRAMバラスト検証済みなので目安としては有効)。
 > 48GB 単騎では既定モード(bf16 transformer 66.3GB)は物理的にロードできないため、
 > **起動には `H3_LOWVRAM=1`(48GB級)か `H3_LOWVRAM=group`(24-32GB級)が必須**。
-> turbo LoRA(bf16 経路専用)もこの箱では使えない。2026-08-07 以降の新規実測
-> (静止画モードのセクション)は RTX PRO 5000 48GB + `H3_LOWVRAM=1` での値。
+> turbo LoRA は当初「bf16 経路専用でこの箱では使えない」だったが、**2026-08-08 に
+> 既定 LoRA を lightx2v 版へ切り替えたことで `H3_LOWVRAM=1` でも使えるようになった**
+> (「Turbo LoRA」節の 2026-08-08 更新参照。group とは併用不可)。2026-08-07 以降の
+> 新規実測(静止画モード以降のセクション)は RTX PRO 5000 48GB + `H3_LOWVRAM=1` での値。
 
 ## 構成
 
@@ -411,12 +413,42 @@ HTML5の入力検証(stepMismatch/rangeOverflow)が**丸める前の端数入力
 フォーム送信自体をブロック**する(1024×576のような偶然valid な値だけ通り、1000×700は
 何も起きない、という分かりにくい症状になる)。丸める前提の欄には制約属性を付けないこと。
 
-## Turbo LoRA (`H3_TURBO_LORA`、既定 `0`、2026-08-06)
+## Turbo LoRA (`H3_TURBO_LORA`、既定 `0`、2026-08-06 / **2026-08-08 lightx2v 版へ切替**)
 
-`H3_TURBO_LORA=1` で Ostris氏学習中の4/8ステップ蒸留LoRA
-(`larryvrh/MiniMax-H3-Turbo-Lora`、Apache 2.0、rank64・259 Linear対象)を適用し、
-既定ステップ数を8にする。**プレビュー版LoRA(学習途上)のため既定OFF**。完成版が
-出たら再評価する。
+> **2026-08-08 更新: 既定 LoRA を lightx2v 版へ切り替え、48GB(int8/低VRAM)でも
+> turbo が使えるようになった。**
+>
+> - 既定: `H3_TURBO_LORA_REPO=lightx2v/Minimax-h3-Turbo` /
+>   `H3_TURBO_LORA_FILE=minimax_h3_fl2v_turbo_4step_v0.1.safetensors`(DMD蒸留、
+>   Apache 2.0、rank128・312 Linear対象)。既定ステップ数は形式連動
+>   (lightx2v=4 / Ostris に戻すと 8)
+> - **int8 対応の理由**: キーが diffusers ネイティブ(to_q/to_k/to_v 分離)で
+>   `fuse_projections()` 不要 → `torch.cat` を呼ばない → `Int8Tensor` 非互換を
+>   踏まない。適用関数は形式自動判別(`detect_turbo_lora_format`、comfy 署名
+>   `qkv_proj` を先に見る — Ostris 版も `token_refiner.` キーを持つため順序が重要)
+> - **適用係数**(`H3_TURBO_LORA_SCALE`、空=形式別の実測既定): lightx2v は **0.094**
+>   (Kijai 記載の 0.75 は ComfyUI の alpha 折り込み前提。生の B・A に 0.75 を掛けると
+>   30steps でも完全ノイズ化 — 強度スイープはスパイク節参照)。Ostris は 1.0 のまま
+>   (scale=1.0 は恒等なので旧挙動と bit 一致)
+> - **E2E 実測**(RTX PRO 5000 48GB + `H3_LOWVRAM=1`、768²): t2va 4steps
+>   **総所要 143s / デノイズ 29s**(非turbo 30steps は 351s)。**t2i(静止画)×turbo は
+>   デノイズ 5.0s / 総所要 94s**。本実装経路の出力はスパイク出力と **mp4 md5 完全一致**。
+>   turbo 連続2本で lowvram の再ロード後の再適用も正常、turbo=0 で通常経路(FBC 有効)
+>   へ正しく復帰
+> - **既知の性質**: turbo 時は音声レベルが非turbo比で大きめ(rms 0.018-0.042 vs
+>   0.007。白色雑音ではないが強度によっては peak が 1.0 に近づく)
+> - **併用制限**: `H3_LOWVRAM=group` とは形式を問わず併用不可(`enable_group_offload`
+>   の `cpu_param_dict` が有効化時点で固定され、後から追加する LoRA バッファが
+>   offload サイクルから欠落するリスク — 未検証のまま解禁しない)。comfy 形式
+>   (Ostris)× int8 は従来どおり不可(リポジトリ名で予備判定+適用時に実ファイルの
+>   キーで最終判定)。ref2va への適用(transformer_ref)は未検証のまま
+> - v0.1(2026-08-07 公開)のため引き続き**既定OFF**(UI/リクエストの turbo で opt-in)
+
+以下は Ostris 版 (comfy 形式) 時代の記録(bf16 経路では現在も有効):
+
+`H3_TURBO_LORA_REPO=larryvrh/MiniMax-H3-Turbo-Lora` で Ostris氏学習中の4/8ステップ
+蒸留LoRA(Apache 2.0、rank64・259 Linear対象)を適用し、既定ステップ数を8にする。
+**プレビュー版LoRA(学習途上)のため既定OFF**。完成版が出たら再評価する。
 
 実測(768²/5秒/seed12345): 8steps **87.7s(-46%)** で基準30steps(163.5s)に迫る品質、
 16steps 98.4sで基準同等、4steps 39.6sは柔らかめだが破綻なし。
@@ -1233,7 +1265,7 @@ UI は Ref2VA タブの「バッチ連続生成(1行=1場面)」チェック(静
 なお int8 レシピ(`TorchAoConfig` + `Int8WeightOnlyConfig`)は abc5e9b に既に含まれて
 おり、**マージを待たずに使える**(`H3_TRANSFORMER_QUANT=int8` として実装済み)。
 
-### 2. Turbo LoRA 完成版のリリース待ち → **lightx2v 版で解決の見込み(スパイク済み・未実装)**
+### 2. Turbo LoRA 完成版のリリース待ち → **lightx2v 版で解決(2026-08-08 本実装済み、「Turbo LoRA」節参照)**
 
 `H3_TURBO_LORA=1` の配線は完成済み(上記セクション参照)。現行LoRA(Ostris氏)は
 「デモ/プレビュー、学習途上」と明記されているため既定OFF、かつ**int8/低VRAMでは
@@ -1280,10 +1312,10 @@ int8 の除外リストに入っているため、**transformer_blocks は int8 
 token_refiner は bf16 ベース + bf16 デルタ**という混在状態になる(適用・生成とも成功
 しているので実害は観測されていない)。
 
-**本実装は未着手**。必要な作業は (1) diffusers ネイティブ用の適用関数(キーマップ不要、
-`fuse_projections` を呼ばない)、(2) `_TurboLoRALinear` への strength 係数の追加、
-(3) int8/低VRAM との併用禁止ガードの緩和(Ostris版は禁止のまま維持)、(4) ref2va
-(`transformer_ref`)への適用可否の検証。
+**2026-08-08 本実装済み**(「Turbo LoRA」節の更新参照): (1) diffusers ネイティブ用の
+適用関数 + キー形式自動判別、(2) `_TurboLoRALinear` の scale 係数(形式別既定
+1.0/0.094)、(3) 併用ガードの形式ベース化(comfy×int8 は拒否のまま、group は形式を
+問わず拒否)。(4) ref2va への適用可否のみ未検証のまま。
 
 ### 3. 未着手の改善候補(優先度順、いずれも急ぎではない)
 

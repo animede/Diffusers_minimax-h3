@@ -147,17 +147,36 @@ def validate_instant_settings(resolved: dict) -> None:
     """
     import core.runner as runner
 
-    if resolved["turbo"] and (runner.H3_LOWVRAM_ANY or runner.H3_TRANSFORMER_BOTH_RESIDENT):
+    # 2026-08-08 更新: この拒否が必要なのは **comfy 形式 (融合QKV、Ostris 版) の LoRA の
+    # ときだけ**になった。既定になった diffusers ネイティブ形式 (lightx2v 版) は
+    # fuse_projections() を呼ばないため上記の torch.cat 問題を踏まず、int8/低VRAM でも
+    # 適用できる (スパイク実測済み、README「lightx2v 版」節)。形式は
+    # `runner.turbo_lora_expected_format()` (キャッシュ済みなら実ファイルのキー、
+    # 未DLならリポジトリ名) で判定する。予備判定が外れた場合も
+    # `_apply_turbo_lora_checkpoint()` の実ファイルチェックが 400 で拒否する。
+    # group offload は LoRA の形式を問わず拒否: enable_group_offload() の
+    # cpu_param_dict は有効化時点で固定され、後から追加される _TurboLoRALinear の
+    # lora_a/lora_b バッファが offload サイクルから欠落するリスクがある (未実測の
+    # まま解禁しない。runner.py の import 時ガードと同じ理由 -- レビュー指摘)。
+    if resolved["turbo"] and runner.H3_LOWVRAM_GROUP:
         raise ValueError(
-            "turbo=1 is only supported against the default transformer path "
-            "(transformer_quant=none, lowvram=0). Confirmed incompatible (not just "
-            "unverified) with lowvram (int8/group offload) or transformer_both_resident "
-            "(int8 both-resident): apply_turbo_lora()'s fuse_projections() call does "
-            "torch.cat() on the transformer's to_q/to_k/to_v weights, and those are "
-            "torchao Int8Tensor under transformer_quant=int8 -- Int8Tensor has no "
-            "aten.cat kernel, so this reproducibly raises NotImplementedError "
-            "('Int8Tensor dispatch: ... aten.cat ...'), not a silent quality "
-            "regression. Drop turbo or change the reload-group settings first."
+            "turbo=1 と lowvram=group は併用できません (group offload の cpu_param_dict "
+            "は有効化時点で固定されるため、後から追加される LoRA バッファが offload "
+            "サイクルから欠落するリスクがある -- 未検証)。lowvram=1 なら turbo を使えます。"
+        )
+    if (
+        resolved["turbo"]
+        and (runner.H3_LOWVRAM_ANY or runner.H3_TRANSFORMER_BOTH_RESIDENT)
+        and runner.turbo_lora_expected_format() == "comfy"
+    ):
+        raise ValueError(
+            "turbo=1 with the comfy-format (fused-QKV) LoRA is only supported against "
+            "the default transformer path (transformer_quant=none, lowvram=0): "
+            "apply_turbo_lora()'s fuse_projections() call does torch.cat() on the "
+            "transformer's to_q/to_k/to_v weights, and those are torchao Int8Tensor "
+            "under transformer_quant=int8 -- Int8Tensor has no aten.cat kernel, so this "
+            "reproducibly raises NotImplementedError. Use the default diffusers-native "
+            "LoRA (lightx2v/Minimax-h3-Turbo) or change the reload-group settings."
         )
 
 
@@ -215,12 +234,15 @@ def current_settings_snapshot() -> dict:
             # time / generate()-time, exposed so the UI can grey out turbo instead of
             # only finding out via a 400 after clicking generate. turbo+upscale is
             # verified to work together (see validate_instant_settings_for_upscale's
-            # own docstring, 2026-08-06 A/B) and is no longer greyed out; the other two
-            # are confirmed (not just unverified) incompatible -- see
-            # validate_instant_settings's own docstring for why reordering cannot fix
-            # the int8/fuse_projections() conflict.
-            "turbo_incompatible_with_lowvram": True,
-            "turbo_incompatible_with_transformer_both_resident": True,
+            # own docstring, 2026-08-06 A/B) and is no longer greyed out.
+            # int8/lowvram との非互換は **comfy 形式 (融合QKV) の LoRA のときだけ**
+            # (validate_instant_settings のコメント参照) なので動的に判定する --
+            # 既定の diffusers ネイティブ LoRA (lightx2v) では False になり、UI は
+            # 低VRAMモードでも turbo を有効にできる。
+            "turbo_incompatible_with_lowvram": runner.turbo_lora_expected_format() == "comfy",
+            # group offload は LoRA 形式を問わず不可 (validate_instant_settings 参照)
+            "turbo_incompatible_with_lowvram_group": True,
+            "turbo_incompatible_with_transformer_both_resident": runner.turbo_lora_expected_format() == "comfy",
             "turbo_incompatible_with_upscale": False,
             "transformer_both_resident": runner.H3_TRANSFORMER_BOTH_RESIDENT,
         },

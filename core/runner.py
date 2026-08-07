@@ -551,19 +551,62 @@ H3_HIRES_DENOISE = float(os.environ.get("H3_HIRES_DENOISE", "0.35"))
 # constants -- so there is nothing to reconfigure here, unlike a naive port from a
 # scheduler that defaults elsewhere).
 H3_TURBO_LORA = os.environ.get("H3_TURBO_LORA", "0").strip() == "1"
-H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "larryvrh/MiniMax-H3-Turbo-Lora")
-H3_TURBO_LORA_FILE = os.environ.get("H3_TURBO_LORA_FILE", "minimax_h3_turbo_4step.safetensors")
-H3_TURBO_STEPS_DEFAULT = int(os.environ.get("H3_TURBO_STEPS_DEFAULT", "8"))
-if H3_TURBO_LORA and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
+# 既定 LoRA は 2026-08-08 に lightx2v/Minimax-h3-Turbo (DMD蒸留、Apache 2.0) へ切替。
+# キーが diffusers ネイティブ (`transformer_blocks.N.attn.to_q.lora_A.default.weight`
+# 形式、to_q/to_k/to_v 分離) なので `fuse_projections()` が不要で、**int8 量子化
+# transformer (H3_LOWVRAM/両常駐) にもそのまま適用できる** -- Ostris 版 (comfy 融合QKV
+# 形式) を int8 で阻んでいた `Int8Tensor` の `aten.cat` 非互換を踏まない
+# (README「Turbo LoRA 完成版のリリース待ち → lightx2v 版」節のスパイク実測参照)。
+# 旧 Ostris 版に戻すには REPO/FILE を larryvrh/MiniMax-H3-Turbo-Lora /
+# minimax_h3_turbo_4step.safetensors にする (bf16 経路専用のまま)。
+H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "lightx2v/Minimax-h3-Turbo")
+H3_TURBO_LORA_FILE = os.environ.get("H3_TURBO_LORA_FILE", "minimax_h3_fl2v_turbo_4step_v0.1.safetensors")
+
+# 既知の comfy (融合QKV) 形式リポジトリ。int8 との組み合わせ拒否 (import 時と
+# リクエスト時の両方) はこの形式のときだけ必要 -- diffusers ネイティブ形式は
+# fuse_projections を呼ばないため int8 でも適用できる (スパイク実測済み)。
+# 形式の確定判定はファイルのキーを見る `detect_turbo_lora_format()` (apply 時) で行い、
+# ここではダウンロード前でも判定できるようリポジトリ名で予備判定する。
+_TURBO_COMFY_REPOS = ("larryvrh/MiniMax-H3-Turbo-Lora",)
+
+# 未指定時はリポジトリの形式に連動: lightx2v 版 (diffusers ネイティブ) は 4step 蒸留
+# なので 4、Ostris 版 (comfy) はコミュニティ検証どおり 8 (「4-7 steps はダメ」)。
+# REPO だけ Ostris に戻したデプロイが黙って 4steps に落ちる事故を防ぐ (レビュー指摘)。
+H3_TURBO_STEPS_DEFAULT = int(
+    os.environ.get("H3_TURBO_STEPS_DEFAULT", "").strip()
+    or (8 if H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS else 4)
+)
+# LoRA デルタの適用係数。空 (既定) はチェックポイント形式ごとの実測既定に解決する:
+# comfy (Ostris) = 1.0 (alpha==rank で scale 1 が作者実装どおり)、diffusers ネイティブ
+# (lightx2v) = 0.094。lightx2v 版の罠 (スパイクで実測): Kijai のカードにある
+# 「strength 0.75」は ComfyUI が alpha を折り込んで適用する前提の値で、生の B・A に
+# 直接掛ける本実装では 0.75 × (alpha/rank) = 0.75 × 16/128 ≈ 0.094 が対応値。
+# 0.75 をそのまま掛けると **30 steps でも出力が完全にノイズ化する** (強度スイープの
+# 実測表は README 参照。0.094 が最良、0.10-0.15 も可)。
+H3_TURBO_LORA_SCALE_RAW = os.environ.get("H3_TURBO_LORA_SCALE", "").strip()
+
+# group offload (H3_LOWVRAM=group) と turbo は形式を問わず併用禁止: diffusers の
+# `enable_group_offload()` は有効化時点の parameters/buffers を pinned CPU 辞書
+# (`cpu_param_dict`) に固定登録するため、その後から `_TurboLoRALinear` で lora_a/lora_b
+# バッファを追加すると offload/onload サイクルで辞書に無いバッファを引いて壊れる
+# (KeyError または GPU 残留) 可能性が高い -- 未実測のまま解禁しない (レビュー指摘。
+# hooks/group_offloading.py の `_init_cpu_param_dict()` が構築時1回きりであることを確認)。
+if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
     raise RuntimeError(
-        "H3_TURBO_LORA=1 is only supported against the default transformer path "
-        "(H3_TRANSFORMER_QUANT=none, H3_LOWVRAM=0). Confirmed incompatible (not just "
-        "unverified) with H3_LOWVRAM (int8/group offload) or "
-        "H3_TRANSFORMER_BOTH_RESIDENT (int8 both-resident): apply_turbo_lora()'s "
+        "H3_TURBO_LORA=1 と H3_LOWVRAM=group は併用できません (enable_group_offload の "
+        "cpu_param_dict は有効化時点で固定されるため、後から追加される LoRA バッファが "
+        "offload サイクルから欠落するリスクがある -- 未検証)。H3_LOWVRAM=1 を使ってください。"
+    )
+if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
+    raise RuntimeError(
+        "H3_TURBO_LORA=1 with the comfy-format (fused-QKV) LoRA "
+        f"({H3_TURBO_LORA_REPO}) is only supported against the default transformer "
+        "path (H3_TRANSFORMER_QUANT=none, H3_LOWVRAM=0): apply_turbo_lora()'s "
         "fuse_projections() call does torch.cat() on the transformer's to_q/to_k/to_v "
         "weights, and those are torchao Int8Tensor under transformer_quant=int8 -- "
         "Int8Tensor has no aten.cat kernel, so this reproducibly raises "
-        "NotImplementedError. Drop H3_TURBO_LORA or drop the other flag."
+        "NotImplementedError. Use the default diffusers-native LoRA "
+        "(lightx2v/Minimax-h3-Turbo) instead, or drop the other flag."
     )
 
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
@@ -889,11 +932,15 @@ class _TurboLoRALinear(torch.nn.Module):
     has no scale multiply either).
     """
 
-    def __init__(self, base: torch.nn.Linear, lora_a: torch.Tensor, lora_b: torch.Tensor):
+    def __init__(self, base: torch.nn.Linear, lora_a: torch.Tensor, lora_b: torch.Tensor, scale: float = 1.0):
         super().__init__()
         self.base = base
         self.register_buffer("lora_a", lora_a, persistent=False)
         self.register_buffer("lora_b", lora_b, persistent=False)
+        # LoRA デルタの適用係数。Ostris 版 (comfy) は alpha==rank で常に 1.0 (既定値の
+        # まま = 従来と bit 同一の挙動)。lightx2v 版 (diffusers ネイティブ) は
+        # H3_TURBO_LORA_SCALE のモジュールコメントのとおり 0.094 が実測既定。
+        self.scale = float(scale)
         # Instant on/off toggle for the *instant-apply* settings group (turbo LoRA is
         # request-scoped, not reload-scoped -- see the task brief / core/settings.py):
         # the wrapper module itself is only ever installed once (lazily, on first
@@ -908,7 +955,9 @@ class _TurboLoRALinear(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return self.base(x)
-        return self.base(x) + torch.nn.functional.linear(
+        # scale=1.0 のとき `1.0 * delta` は IEEE 的に恒等なので、Ostris 版の従来挙動と
+        # bit 単位で同一 (回帰性を保つ)。
+        return self.base(x) + self.scale * torch.nn.functional.linear(
             torch.nn.functional.linear(x, self.lora_a), self.lora_b
         )
 
@@ -1119,6 +1168,124 @@ def apply_turbo_lora(transformer, lora_path: str) -> int:
     logger.info(
         "turbo LoRA applied: %d Linear layers wrapped from %s in %.2fs",
         n_wrapped, lora_path, time.time() - t_load,
+    )
+    return n_wrapped
+
+
+def detect_turbo_lora_format(lora_path: str) -> str:
+    """turbo LoRA チェックポイントのキー形式を判定する: "comfy" | "diffusers"。
+
+    - comfy (Ostris 版): `blocks.N.attn.qkv_proj.lora_A.weight` -- 融合QKVを対象と
+      するため適用に `fuse_projections()` (= int8 では `aten.cat` 非互換) が要る
+    - diffusers (lightx2v 版): `transformer_blocks.N.attn.to_q.lora_A.default.weight`
+      -- パスがそのままモジュールパスで、融合不要 (int8 でも適用可)
+
+    ヘッダのキーだけ読む (テンソル本体はロードしない) ので軽い。未知の形式は
+    ValueError -- 黙って誤った適用関数に流さない。
+    """
+    from safetensors import safe_open
+
+    with safe_open(lora_path, framework="pt") as f:
+        keys = list(f.keys())
+    # comfy 署名 (`qkv_proj`) を先に見ること: Ostris 版も `token_refiner.blocks.*` の
+    # キーを持つため、プレフィックスだけで diffusers 判定すると誤検出する
+    # (実ファイルで再現して修正済み)。
+    if any(".qkv_proj.lora_A." in k for k in keys):
+        return "comfy"
+    if any(".attn.to_q.lora_A." in k for k in keys):
+        return "diffusers"
+    raise ValueError(
+        f"unrecognized turbo LoRA key format in {lora_path} "
+        f"(sample keys: {keys[:3]}) -- expected comfy (qkv_proj) or diffusers-native "
+        "(transformer_blocks.*.to_q) layout."
+    )
+
+
+def turbo_lora_expected_format() -> str:
+    """設定中の turbo LoRA (H3_TURBO_LORA_REPO/FILE) の想定キー形式: "comfy"|"diffusers"。
+
+    リクエスト時バリデーション (core/settings.py) と UI のグレーアウト判定用。
+    ファイルが HF キャッシュに既にあれば実物のキーで判定し、未ダウンロードなら既知
+    リポジトリ名 (`_TURBO_COMFY_REPOS`) で予備判定する。未知リポジトリは diffusers
+    ネイティブと仮定する -- 仮定が外れて実は comfy 形式だった場合も、適用時の
+    `_apply_turbo_lora_checkpoint()` の実ファイル判定が int8 との組み合わせを 400 で
+    拒否するので、黙って壊れることはない。"""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE)
+        if isinstance(cached, str):
+            return detect_turbo_lora_format(cached)
+    except Exception:
+        logger.debug("turbo_lora_expected_format: cache probe failed", exc_info=True)
+    return "comfy" if H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS else "diffusers"
+
+
+def resolve_turbo_lora_scale(lora_format: str) -> float:
+    """適用係数を解決する: H3_TURBO_LORA_SCALE が明示されていればそれ、空なら
+    形式ごとの実測既定 (comfy=1.0 / diffusers=0.094 -- 導出と強度スイープの実測は
+    H3_TURBO_LORA_SCALE のモジュールコメントと README を参照)。"""
+    if H3_TURBO_LORA_SCALE_RAW:
+        return float(H3_TURBO_LORA_SCALE_RAW)
+    return 1.0 if lora_format == "comfy" else 0.094
+
+
+def apply_diffusers_turbo_lora(transformer, lora_path: str, scale: float) -> int:
+    """diffusers ネイティブキーの turbo LoRA (lightx2v 版) を融合なしで巻く。
+
+    `apply_turbo_lora()` (comfy 版) との違い: `fuse_projections()` も
+    `delattr(to_q/to_k/to_v)` も**呼ばない** -- キーのドット付きパスがそのまま
+    モジュールパスなのでキーマップも不要。`torch.cat` を一切呼ばないため、torchao
+    int8 量子化済み transformer にもそのまま適用できる (`Int8Tensor` の base(x) は
+    weight-only 量子化なので出力 dtype は入力活性化 (bf16) に従い、bf16 の LoRA
+    デルタとの加算に dtype 不整合は無い -- torchao 0.17.0 の int8_tensor.py で確認)。
+    2026-08-08 のスパイク (`scripts/probe_lightx2v_turbo.py`) で int8 への適用と
+    4steps の品質を実測済み。
+
+    注意: `H3_INT8_MODULES_TO_NOT_CONVERT` に `token_refiner` が入っているため、int8
+    モードでは transformer_blocks 側 (300モジュール) が int8 ベース + bf16 デルタ、
+    token_refiner 側 (12モジュール) が bf16 ベース + bf16 デルタの混在になる --
+    スパイクで生成まで通ることを確認済み (実害は観測されていない)。
+
+    既に comfy 版が適用済み (= `fused_projections` が真で to_q が無い) の transformer
+    には適用できないので、事前に検出して明確に拒否する。返り値は巻いた Linear 数
+    (このチェックポイントでは 312 = 50ブロック×6 + refiner 2ブロック×6)。
+    """
+    from safetensors.torch import load_file
+
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
+
+    for module in transformer.modules():
+        if isinstance(module, MiniMaxH3Attention) and getattr(module, "fused_projections", False):
+            raise RuntimeError(
+                "transformer の QKV が既に融合されています (comfy 版 turbo LoRA を適用済み?)。"
+                "diffusers ネイティブ LoRA は未融合の to_q/to_k/to_v を対象とするため適用できません。"
+            )
+
+    t_load = time.time()
+    lora_sd = load_file(lora_path)
+    paths = sorted({k.rsplit(".lora_", 1)[0] for k in lora_sd if ".lora_" in k})
+    device = next(transformer.parameters()).device
+    n_wrapped = 0
+    for path in paths:
+        lora_a = lora_sd[f"{path}.lora_A.default.weight"].to(device=device, dtype=torch.bfloat16)
+        lora_b = lora_sd[f"{path}.lora_B.default.weight"].to(device=device, dtype=torch.bfloat16)
+        base_linear = _get_module_by_dotted_path(transformer, path)
+        if not isinstance(base_linear, torch.nn.Linear):
+            raise RuntimeError(
+                f"expected transformer.{path} to be an nn.Linear, got {type(base_linear).__name__}"
+            )
+        if lora_a.shape[1] != base_linear.in_features or lora_b.shape[0] != base_linear.out_features:
+            raise RuntimeError(
+                f"turbo LoRA shape mismatch for {path!r}: lora_A={tuple(lora_a.shape)} "
+                f"lora_B={tuple(lora_b.shape)} vs in_features={base_linear.in_features} "
+                f"out_features={base_linear.out_features}"
+            )
+        _set_module_by_dotted_path(transformer, path, _TurboLoRALinear(base_linear, lora_a, lora_b, scale=scale))
+        n_wrapped += 1
+    logger.info(
+        "diffusers-native turbo LoRA applied: %d Linear layers wrapped (scale=%.3f) from %s in %.2fs",
+        n_wrapped, scale, lora_path, time.time() - t_load,
     )
     return n_wrapped
 
@@ -1522,8 +1689,7 @@ class MiniMaxH3Runner:
             # three. `H3_CACHE == "fbc"` is force-skipped below (not just "left at its
             # default") regardless of the env var's own value -- see `H3_TURBO_LORA`'s
             # module comment for why a handful of turbo steps leaves FBC no safe window.
-            self._download_turbo_lora_if_needed()
-            n = apply_turbo_lora(self._pipe.transformer, self._turbo_lora_path)
+            n = self._apply_turbo_lora_checkpoint(self._pipe.transformer)
             self._turbo_lora_wrapped = True
             logger.info("H3_TURBO_LORA=1: applied turbo LoRA (%d layers wrapped), FBC force-disabled", n)
         if H3_ATTN_BACKEND:
@@ -1534,6 +1700,29 @@ class MiniMaxH3Runner:
         logger.info(
             "transformer loaded to GPU in %.1fs (quant=%s, turbo_lora=%s). gpu=%s ram=%s",
             time.time() - t0, H3_TRANSFORMER_QUANT, H3_TURBO_LORA, gpu_mem_gb(), ram_gb(),
+        )
+
+    def _apply_turbo_lora_checkpoint(self, transformer) -> int:
+        """設定済みの turbo LoRA をダウンロード → キー形式を判定 → 形式に応じた適用
+        関数へディスパッチする (`_ensure_transformer` の起動時適用と
+        `_apply_turbo_setting` の遅延適用、両呼び出し元の共通化)。
+
+        comfy 形式 (Ostris 版) × int8 はここで明確に拒否する -- import 時のガードは
+        リポジトリ名の予備判定 (`_TURBO_COMFY_REPOS`) しかできないため、未知リポジトリの
+        comfy 形式チェックポイントはこの実ファイル判定が最後の砦。"""
+        self._download_turbo_lora_if_needed()
+        lora_format = detect_turbo_lora_format(self._turbo_lora_path)
+        if lora_format == "comfy":
+            if H3_TRANSFORMER_QUANT == "int8":
+                raise ValueError(
+                    "comfy形式 (融合QKV) の turbo LoRA は int8 transformer に適用できません "
+                    "(fuse_projections() の torch.cat が Int8Tensor 非対応)。既定の "
+                    "diffusers ネイティブ形式 (lightx2v/Minimax-h3-Turbo) を使うか、"
+                    "int8/低VRAM を無効にしてください。"
+                )
+            return apply_turbo_lora(transformer, self._turbo_lora_path)
+        return apply_diffusers_turbo_lora(
+            transformer, self._turbo_lora_path, resolve_turbo_lora_scale(lora_format)
         )
 
     def _download_turbo_lora_if_needed(self):
@@ -2025,8 +2214,7 @@ class MiniMaxH3Runner:
         if turbo and not getattr(self, wrapped_attr):
             if progress:
                 progress.update(message=f"turbo LoRA を {label} へ適用中...")
-            self._download_turbo_lora_if_needed()
-            n = apply_turbo_lora(transformer, self._turbo_lora_path)
+            n = self._apply_turbo_lora_checkpoint(transformer)
             setattr(self, wrapped_attr, True)
             logger.info("turbo LoRA lazily applied to %s (%d layers wrapped)", label, n)
         elif getattr(self, wrapped_attr):

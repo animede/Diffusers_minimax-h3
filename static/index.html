@@ -636,7 +636,7 @@
         </div>
         <div class="checkbox-row" id="row-turbo">
           <input type="checkbox" id="turbo-enabled">
-          <label style="margin:0;" for="turbo-enabled">Turbo LoRA(4-8ステップ推奨)</label>
+          <label style="margin:0;" for="turbo-enabled">Turbo LoRA(4ステップ推奨・lightx2v蒸留)</label>
         </div>
         <div class="hint" id="instant-hint"></div>
       </div>
@@ -777,22 +777,22 @@ let RELOAD_ETA_S = { transformer_quant: 36, te_quant: 40, te_prune: 5, lowvram: 
 let CURRENT_SETTINGS = null;
 
 function turboIncompatibleReason() {
-  // core/settings.py の validate_instant_settings() と同じ規則: turbo は
-  // lowvram(1/group) または transformer_both_resident(int8 かつ lowvram=0、両
-  // transformer 同時常駐)と組み合わせ不可(2026-08-06のA/Bで「未検証」ではなく
-  // 「実測で不可」と確定: Int8Tensorにaten.catカーネルが無く、apply_turbo_lora()の
-  // fuse_projections()がNotImplementedErrorで失敗する)。
-  // upscale(2xアップスケール)との組み合わせは同じA/Bで動作確認済みのため許可している
-  // (8/16ステップとも成功、詳細はcore/settings.pyのvalidate_instant_settings_for_upscale
-  // 参照)。
+  // core/settings.py の validate_instant_settings() と同じ規則。int8/低VRAM との
+  // 非互換は **comfy 形式 (融合QKV、Ostris版) の LoRA のときだけ**で、サーバが
+  // constraints.turbo_incompatible_with_* に動的に反映する (既定の diffusers
+  // ネイティブ LoRA = lightx2v 版は低VRAM/int8 でも適用可 -- 2026-08-08 スパイクで
+  // 実測済み、core/settings.py のコメント参照)。UI 側でモード名から独自判定はしない。
   if (!CURRENT_SETTINGS) return null;
   const c = CURRENT_SETTINGS.constraints || {};
   const r = CURRENT_SETTINGS.reload || {};
-  if (r.lowvram && r.lowvram !== '0') {
-    return `低VRAMモード(lowvram=${r.lowvram})とturboの組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています`;
+  if (c.turbo_incompatible_with_lowvram_group && r.lowvram === 'group') {
+    return 'group offload と turbo の併用は未検証のため無効化しています(LoRAバッファがoffload辞書から欠落するリスク。lowvram=1ならturboを使えます)';
   }
-  if (c.transformer_both_resident) {
-    return 'transformer/transformer_ref 両方常駐(int8)とturboの組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています';
+  if (c.turbo_incompatible_with_lowvram && r.lowvram && r.lowvram !== '0') {
+    return `低VRAMモード(lowvram=${r.lowvram})と comfy形式 turbo LoRA の組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています`;
+  }
+  if (c.turbo_incompatible_with_transformer_both_resident && c.transformer_both_resident) {
+    return 'transformer/transformer_ref 両方常駐(int8)と comfy形式 turbo LoRA の組み合わせは実測で不可のため無効化しています';
   }
   return null;
 }
