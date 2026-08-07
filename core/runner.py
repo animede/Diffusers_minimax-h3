@@ -4204,7 +4204,7 @@ class MiniMaxH3Runner:
                      json.dumps({k: v for k, v in result.items() if k != "ram"}, ensure_ascii=False))
         return result
 
-    def generate_ref2i_batch(
+    def generate_ref_batch(
         self,
         prompts: list[str],
         references: list,
@@ -4212,15 +4212,19 @@ class MiniMaxH3Runner:
         width: int | None = None,
         num_inference_steps: int = 30,
         seed: int | None = None,
+        still: bool = False,
         still_frames: int = 22,
+        seconds: float | None = None,
         progress: ProgressState | None = None,
         cache: str | None = None,
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
     ) -> dict:
-        """参照共通・プロンプト違いの参照付き静止画 N 枚を、`H3_LOWVRAM=1` の固定費を
-        バッチ全体で1回に償却して生成する (`generate_still_batch()` の ref2va 版)。
+        """参照共通・プロンプト違いの ref2va 生成 N 本を、`H3_LOWVRAM=1` の固定費を
+        バッチ全体で1回に償却して回す (`generate_still_batch()` の ref2va 版)。
+        `still=True` なら超短尺→中央フレーム PNG (ref2i、キャラ一貫の場面静止画)、
+        `still=False` なら通常尺の動画 (ref2va、`seconds` 必須・全場面共通)。
 
         位相並べ替え (generate_ref2va() の lowvram=1 choreography を位相順に再構成):
 
@@ -4231,33 +4235,47 @@ class MiniMaxH3Runner:
                                       `_execution_device` 解決の前提 -- generate_ref2va の
                                       同名コメント参照)
             denoise : [transformer_ref] 1回ロードして全場面を順に
-            decode  : [vae pair]      全場面をデコード → PNG/mp4 を場面ごとに保存
+            decode  : [vae pair]      全場面をデコード → mp4 (still なら PNG も) を
+                                      場面ごとに保存
 
         場面間の共有状態リセットは generate_still_batch() と同一
         (スケジューラ `_step_index=None` ×2 + per-scene FBC リセット。等価性は t2i_batch で
-        逐次生成との mp4/PNG md5 一致により実証済みの手法)。参照 (references) は全場面で
-        共通 -- 参照のデコード/リサイズ (setup step) と VAE エンコードは場面ごとに再実行
-        される (数秒/場面。テンソル共有より単純で、状態の別名参照バグの余地がない)。
+        逐次生成との mp4/PNG md5 一致により実証済みの手法)。スケジューラの
+        sigmas/timesteps の**値**が全場面同一であることが前提なので、尺 (still_frames /
+        seconds)・解像度・ステップ数は全場面共通 -- 変えられるのはプロンプトのみ。
+        音声参照からの尺自動導出 (単発 ref2va の seconds=None) は場面間で尺が揃う保証が
+        ないためバッチでは使えない。参照 (references) は全場面で共通 -- 参照の
+        デコード/リサイズ (setup step) と VAE エンコードは場面ごとに再実行される
+        (テンソル共有より単純で、状態の別名参照バグの余地がない)。
 
         seed は全場面共通。t2i_batch と同じく decode は場面ごとに保存しながら進むので
         途中失敗でも完了分は残る。`H3_LOWVRAM=1` 以外では呼ばない (app.py 側で逐次
-        generate_ref2va(still=True) にフォールバック)。
+        generate_ref2va() にフォールバック)。
         """
         import core.settings as settings
 
         if not H3_LOWVRAM:
             raise RuntimeError(
-                "generate_ref2i_batch() は H3_LOWVRAM=1 専用です。呼び出し側で逐次 "
-                "generate_ref2va(still=True) にフォールバックしてください。"
+                "generate_ref_batch() は H3_LOWVRAM=1 専用です。呼び出し側で逐次 "
+                "generate_ref2va() にフォールバックしてください。"
             )
         if not prompts:
             raise ValueError("prompts が空です。")
         if not references:
-            raise ValueError("ref2i_batch needs at least one reference.")
-        if still_frames not in STILL_FRAME_CHOICES:
-            raise ValueError(f"still_frames must be one of {STILL_FRAME_CHOICES}, got {still_frames}")
-        if still_frames == 5 and not H3_VAE_SMALLCLIP_FIX:
-            raise ValueError("still_frames=5 には H3_VAE_SMALLCLIP_FIX=1 (既定) が必要です。")
+            raise ValueError("ref batch needs at least one reference.")
+        if still:
+            if still_frames not in STILL_FRAME_CHOICES:
+                raise ValueError(f"still_frames must be one of {STILL_FRAME_CHOICES}, got {still_frames}")
+            if still_frames == 5 and not H3_VAE_SMALLCLIP_FIX:
+                raise ValueError("still_frames=5 には H3_VAE_SMALLCLIP_FIX=1 (既定) が必要です。")
+            batch_num_frames = still_frames
+        else:
+            if seconds is None:
+                raise ValueError(
+                    "ref2va_batch では seconds が必須です (音声参照からの尺自動導出は、"
+                    "場面間で尺が揃う保証がないためバッチでは使えません)。"
+                )
+            batch_num_frames = seconds_to_num_frames(seconds)
 
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
             MiniMaxH3PrepareLatentsStep,
@@ -4308,7 +4326,7 @@ class MiniMaxH3Runner:
             state.set("references", references)
             state.set("height", height)
             state.set("width", width)
-            state.set("num_frames", still_frames)
+            state.set("num_frames", batch_num_frames)
             state.set("generator", torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None)
             state.set("num_inference_steps", num_inference_steps)
             state.set("output_type", "pt")
@@ -4317,7 +4335,10 @@ class MiniMaxH3Runner:
             state.set("audio_latents", None)
 
             setup_step = MiniMaxH3Ref2VASetupStep()
-            with _relaxed_min_duration():
+            if still:
+                with _relaxed_min_duration():
+                    _, state = setup_step(pipe, state)
+            else:
                 _, state = setup_step(pipe, state)
 
             with torch.no_grad():
@@ -4433,27 +4454,31 @@ class MiniMaxH3Runner:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                job_stub = f"ref2i_{int(t_start)}_s{idx + 1}"
+                job_stub = f"{'ref2i' if still else 'ref2va'}_{int(t_start)}_s{idx + 1}"
                 mp4_path = self.output_dir / f"{job_stub}.mp4"
                 _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
-                still_frame_index = len(frames_uint8) // 2
-                png_path = self.output_dir / f"{job_stub}.png"
-                Image.fromarray(frames_uint8[still_frame_index]).save(png_path)
+                png_path = None
+                still_frame_index = None
+                if still:
+                    still_frame_index = len(frames_uint8) // 2
+                    png_path = self.output_dir / f"{job_stub}.png"
+                    Image.fromarray(frames_uint8[still_frame_index]).save(png_path)
 
                 results.append({
                     "prompt": scene["prompt"],
-                    "png_path": str(png_path),
-                    "png_filename": png_path.name,
+                    "png_path": str(png_path) if png_path else None,
+                    "png_filename": png_path.name if png_path else None,
                     "mp4_path": str(mp4_path),
                     "mp4_filename": mp4_path.name,
                     "still_frame_index": still_frame_index,
+                    "num_frames": len(frames_uint8),
                     "denoise_time_s": scene["denoise_time_s"],
                     "avg_step_time_s": scene["avg_step_time_s"],
                     "cache_skipped_steps": scene["cache_skipped_steps"],
                 })
         except BaseException:
             logger.exception(
-                "ref2i_batch decode failed (scene %d/%d) -- restoring steady state before re-raising",
+                "ref batch decode failed (scene %d/%d) -- restoring steady state before re-raising",
                 len(results) + 1, n_scenes,
             )
             gc.collect()
@@ -4461,7 +4486,7 @@ class MiniMaxH3Runner:
             try:
                 self._vae_to_cpu()
             except Exception:
-                logger.exception("steady-state restore after ref2i_batch decode failure also failed")
+                logger.exception("steady-state restore after ref batch decode failure also failed")
             raise
         decode_time = time.time() - t_decode
         peak_vram = torch.cuda.max_memory_allocated() / 1e9
@@ -4470,13 +4495,14 @@ class MiniMaxH3Runner:
 
         total_elapsed = time.time() - t_start
         result = {
-            "mode": "ref2i_batch",
+            "mode": "ref2i_batch" if still else "ref2va_batch",
             "num_scenes": n_scenes,
             "height": height,
             "width": width,
-            "num_frames": still_frames,
-            "still_frames": still_frames,
-            "duration_s": still_frames / FPS,
+            "num_frames": batch_num_frames,
+            "still_frames": still_frames if still else None,
+            "duration_s": batch_num_frames / FPS,
+            "seconds": seconds if not still else None,
             "num_inference_steps": num_inference_steps,
             "seed": seed,
             "encode_time_s": round(encode_time, 2),
@@ -4500,8 +4526,10 @@ class MiniMaxH3Runner:
             "scenes": results,
         }
         if progress:
-            progress.update(phase="done", message=f"完了 ({n_scenes}場面)", result_path=results[-1]["png_path"] if results else None)
-        logger.info("ref2i_batch done: %s", json.dumps({k: v for k, v in result.items() if k not in ("ram", "scenes")}, ensure_ascii=False))
+            last_path = (results[-1]["png_path"] or results[-1]["mp4_path"]) if results else None
+            progress.update(phase="done", message=f"完了 ({n_scenes}場面)", result_path=last_path)
+        logger.info("%s done: %s", result["mode"],
+                     json.dumps({k: v for k, v in result.items() if k not in ("ram", "scenes")}, ensure_ascii=False))
         return result
 
 

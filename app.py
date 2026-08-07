@@ -689,32 +689,36 @@ def api_ref2va(
             tmp_path.unlink(missing_ok=True)
 
 
-@app.post("/api/ref2i_batch")
-def api_ref2i_batch(
-    prompts: list[str] = Form(...),
-    references: list[UploadFile] = File(...),
-    frames: int = Form(22),
-    num_inference_steps: int = Form(30),
-    seed: Optional[int] = Form(None),
-    height: Optional[int] = Form(None),
-    width: Optional[int] = Form(None),
-    cache: Optional[str] = Form(None),
-    cache_threshold: Optional[float] = Form(None),
-    attn: Optional[str] = Form(None),
-    turbo: Optional[bool] = Form(None),
-):
-    """参照付き静止画のバッチ生成: 共通の references + プロンプト配列から、
-    キャラクター一貫の場面静止画を連続生成する(/api/t2i_batch の ref2va 版)。
+def _run_ref_batch(
+    prompts: list[str],
+    references: list[UploadFile],
+    still: bool,
+    frames: int,
+    seconds: Optional[float],
+    num_inference_steps: int,
+    seed: Optional[int],
+    height: Optional[int],
+    width: Optional[int],
+    cache: Optional[str],
+    cache_threshold: Optional[float],
+    attn: Optional[str],
+    turbo: Optional[bool],
+) -> JSONResponse:
+    """/api/ref2i_batch (still=True) と /api/ref2va_batch (still=False) の共通実装。
 
     `H3_LOWVRAM=1` ではモデルロード固定費をバッチ全体で1回に償却する位相並べ替え
-    (core/runner.py の generate_ref2i_batch) を使い、他モードは逐次
-    generate_ref2va(still=True) で同じレスポンス形式を返す。参照・seed・解像度・
-    フレーム数・ステップ数は全場面共通(変えられるのはプロンプトのみ)。
+    (core/runner.py の generate_ref_batch) を使い、他モードは逐次 generate_ref2va()
+    で同じレスポンス形式を返す。参照・seed・解像度・尺・ステップ数は全場面共通
+    (変えられるのはプロンプトのみ)。
     """
     global _current_progress
 
-    if frames not in STILL_FRAME_CHOICES:
+    if still and frames not in STILL_FRAME_CHOICES:
         raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
+    if not still:
+        if seconds is None:
+            raise HTTPException(400, "ref2va_batch では seconds が必須です(全場面共通の尺)")
+        seconds = max(MIN_SECONDS, min(MAX_SECONDS, float(seconds)))
     cleaned = [p.strip() for p in prompts if p and p.strip()]
     if not cleaned:
         raise HTTPException(400, "prompts が空です (空でないプロンプトを1つ以上)")
@@ -758,16 +762,19 @@ def api_ref2i_batch(
         with _progress_guard:
             _current_progress = progress
 
+        mode_label = "ref2i_batch" if still else "ref2va_batch"
         try:
             if H3_LOWVRAM:
-                result = runner.generate_ref2i_batch(
+                result = runner.generate_ref_batch(
                     prompts=cleaned,
                     references=built_references,
                     height=height,
                     width=width,
                     num_inference_steps=num_inference_steps,
                     seed=seed,
+                    still=still,
                     still_frames=frames,
+                    seconds=seconds,
                     progress=progress,
                     cache=cache,
                     cache_threshold=cache_threshold,
@@ -775,31 +782,36 @@ def api_ref2i_batch(
                     turbo=turbo,
                 )
             else:
-                # 常駐モード: 逐次 generate_ref2va(still=True) でも固定費はほぼ増えない。
+                # 常駐モード: 逐次 generate_ref2va() でも固定費はほぼ増えない。
                 t0 = time.time()
                 scenes = []
                 for idx, p in enumerate(cleaned):
                     progress.update(message=f"場面 {idx + 1}/{len(cleaned)} を生成中...")
                     r = runner.generate_ref2va(
                         prompt=p, references=built_references, height=height, width=width,
-                        seconds=None, num_inference_steps=num_inference_steps, seed=seed,
+                        seconds=seconds, num_inference_steps=num_inference_steps, seed=seed,
                         progress=progress, cache=cache, cache_threshold=cache_threshold,
-                        attn=attn, turbo=turbo, still=True, still_frames=frames,
+                        attn=attn, turbo=turbo, still=still, still_frames=frames,
                     )
                     scenes.append({
                         "prompt": p,
                         "png_path": r["png_path"], "png_filename": r["png_filename"],
                         "mp4_path": r["mp4_path"], "mp4_filename": r["mp4_filename"],
                         "still_frame_index": r["still_frame_index"],
+                        "num_frames": r["num_frames"],
                         "denoise_time_s": r["denoise_time_s"],
                         "avg_step_time_s": r["avg_step_time_s"],
                         "cache_skipped_steps": r["cache_skipped_steps"],
                     })
                 total = time.time() - t0
+                num_frames = scenes[0]["num_frames"] if scenes else (frames if still else seconds_to_num_frames(seconds))
                 result = {
-                    "mode": "ref2i_batch", "num_scenes": len(cleaned),
+                    "mode": mode_label, "num_scenes": len(cleaned),
                     "height": height, "width": width,
-                    "num_frames": frames, "still_frames": frames, "duration_s": frames / FPS,
+                    "num_frames": num_frames,
+                    "still_frames": frames if still else None,
+                    "duration_s": num_frames / FPS,
+                    "seconds": seconds if not still else None,
                     "num_inference_steps": num_inference_steps, "seed": seed,
                     "total_elapsed_s": round(total, 2),
                     "per_image_s": round(total / len(cleaned), 2),
@@ -807,20 +819,71 @@ def api_ref2i_batch(
                 }
             result["job_id"] = job_id
             for scene in result["scenes"]:
-                scene["image_url"] = f"/outputs/{scene['png_filename']}"
+                if scene.get("png_filename"):
+                    scene["image_url"] = f"/outputs/{scene['png_filename']}"
                 scene["video_url"] = f"/outputs/{scene['mp4_filename']}"
             return JSONResponse(result)
         except ValueError as e:
             raise HTTPException(400, str(e))
         except Exception as e:
-            logger.exception("ref2i_batch generation failed")
+            logger.exception("%s generation failed", mode_label)
             progress.update(phase="error", error=str(e))
-            raise HTTPException(500, f"ref2i_batch generation failed: {e}")
+            raise HTTPException(500, f"{mode_label} generation failed: {e}")
         finally:
             _generation_lock.release()
     finally:
         for tmp_path in tmp_paths:
             tmp_path.unlink(missing_ok=True)
+
+
+@app.post("/api/ref2i_batch")
+def api_ref2i_batch(
+    prompts: list[str] = Form(...),
+    references: list[UploadFile] = File(...),
+    frames: int = Form(22),
+    num_inference_steps: int = Form(30),
+    seed: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
+):
+    """参照付き静止画のバッチ生成: 共通の references + プロンプト配列から、
+    キャラクター一貫の場面静止画を連続生成する(/api/t2i_batch の ref2va 版)。
+    """
+    return _run_ref_batch(
+        prompts=prompts, references=references, still=True, frames=frames, seconds=None,
+        num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
+        cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo,
+    )
+
+
+@app.post("/api/ref2va_batch")
+def api_ref2va_batch(
+    prompts: list[str] = Form(...),
+    references: list[UploadFile] = File(...),
+    seconds: float = Form(5.0),
+    num_inference_steps: int = Form(30),
+    seed: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
+):
+    """参照付き動画のバッチ生成: 共通の references + プロンプト配列から、
+    物語の各場面の動画を連続生成する。尺 (seconds) は全場面共通で必須
+    (音声参照からの尺自動導出はバッチでは使えない)。低VRAMモードでは
+    モデルロード固定費 (~110s + 参照ビジョンエンコード) がバッチ全体で1回になる。
+    """
+    return _run_ref_batch(
+        prompts=prompts, references=references, still=False, frames=22, seconds=seconds,
+        num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
+        cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo,
+    )
 
 
 @app.post("/api/prompt/enhance")

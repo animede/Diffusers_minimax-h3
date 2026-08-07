@@ -555,9 +555,9 @@
             <option value="5">5フレーム (0.21秒・実験的)</option>
           </select>
         </div>
-        <div class="checkbox-row" id="ref2va-batch-row" style="display:none;">
+        <div class="checkbox-row" id="ref2va-batch-row">
           <input type="checkbox" id="ref2va-batch">
-          <label for="ref2va-batch" style="margin:0;">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面)</label>
+          <label for="ref2va-batch" style="margin:0;">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面。参照・seed・尺は全場面共通)</label>
         </div>
         <div class="hint" id="ref2va-still-hint" style="display:none;">
           キャラクター参照から<b>場面ごとの一貫した静止画</b>を作るモード(参照・seed・
@@ -928,7 +928,7 @@ function updateStillControls() {
   const ref2vaStill = (mode === 'ref2va') && ref2vaStillEl.checked;
   secondsColEl.style.display = (mode === 't2i' || ref2vaStill) ? 'none' : '';
   upscaleRowEl.style.display = (mode === 't2i') ? 'none' : '';
-  ref2vaBatchRowEl.style.display = ref2vaStill ? '' : 'none';
+  // バッチは静止画と独立 (動画のバッチ = /api/ref2va_batch もある)
   ref2vaStillHintEl.style.display = ref2vaStill ? '' : 'none';
   ref2vaFramesEl.style.display = ref2vaStillEl.checked ? '' : 'none';
 }
@@ -1472,16 +1472,29 @@ form.addEventListener('submit', async (ev) => {
       fd.append('height', h);
       fd.append('width', w);
     }
-    if (ref2vaStillEl.checked) {
+    const ref2vaStill = ref2vaStillEl.checked;
+    const ref2vaBatch = ref2vaBatchEl.checked;
+    if (ref2vaStill) {
       // 参照付き静止画 (ref2i): 秒数は送らない (frames が尺を決める)
       fd.append('frames', ref2vaFramesEl.value);
-      if (ref2vaBatchEl.checked) {
-        url = '/api/ref2i_batch';
-        const lines = prompt.split('\n').map(s => s.trim()).filter(Boolean);
-        lines.forEach(l => fd.append('prompts', l));
-      } else {
-        fd.append('still', '1');
+    }
+    if (ref2vaBatch) {
+      url = ref2vaStill ? '/api/ref2i_batch' : '/api/ref2va_batch';
+      const lines = prompt.split('\n').map(s => s.trim()).filter(Boolean);
+      lines.forEach(l => fd.append('prompts', l));
+      if (!ref2vaStill) {
+        // 動画バッチは尺が全場面共通で必須 (音声参照からの尺導出は使えない)
+        if (!secondsEl.value) {
+          setStatus('バッチ動画生成には秒数の指定が必要です(全場面共通)', true);
+          generateBtn.disabled = false;
+          generateBtn.textContent = '生成';
+          if (polling) { clearInterval(polling); polling = null; }
+          return;
+        }
+        fd.append('seconds', secondsEl.value);
       }
+    } else if (ref2vaStill) {
+      fd.append('still', '1');
     } else {
       // Seconds may be left blank for Ref2VA (server derives it from a lone
       // audio-bearing reference); only send it when the user filled it in.
@@ -1497,7 +1510,7 @@ form.addEventListener('submit', async (ev) => {
     }
     setStatus('完了');
     progressInner.style.width = '100%';
-    if (data.mode === 't2i_batch' || data.mode === 'ref2i_batch') renderBatchResult(data); else renderResult(data);
+    if (['t2i_batch', 'ref2i_batch', 'ref2va_batch'].includes(data.mode)) renderBatchResult(data); else renderResult(data);
     refreshGallery();
   } catch (e) {
     setStatus('エラー: ' + e.message, true);
@@ -1559,19 +1572,29 @@ function renderBatchResult(data) {
   data.scenes.forEach((s, i) => {
     const box = document.createElement('div');
     box.style.marginBottom = '12px';
-    const img = document.createElement('img');
-    img.src = s.image_url;
-    img.style.maxWidth = '100%';
-    img.style.borderRadius = '8px';
-    img.alt = `場面 ${i + 1}`;
+    // 静止画バッチは PNG、動画バッチ (ref2va_batch) は <video> を主表示にする
+    let media;
+    if (s.image_url) {
+      media = document.createElement('img');
+      media.src = s.image_url;
+      media.alt = `場面 ${i + 1}`;
+    } else {
+      media = document.createElement('video');
+      media.src = s.video_url;
+      media.controls = true;
+      media.loop = true;
+      media.muted = false;
+    }
+    media.style.maxWidth = '100%';
+    media.style.borderRadius = '8px';
     const meta = document.createElement('div');
     meta.className = 'result-meta';
-    meta.innerHTML = `<div><b>場面 ${i + 1}:</b> <a class="dl-link" href="${s.image_url}" download>PNG</a>
-      <a class="dl-link" href="${s.video_url}" download>mp4</a> / デノイズ ${s.denoise_time_s}s</div>`;
+    const pngLink = s.image_url ? `<a class="dl-link" href="${s.image_url}" download>PNG</a> ` : '';
+    meta.innerHTML = `<div><b>場面 ${i + 1}:</b> ${pngLink}<a class="dl-link" href="${s.video_url}" download>mp4</a> / デノイズ ${s.denoise_time_s}s</div>`;
     const promptLine = document.createElement('div');
     promptLine.className = 'hint';
     promptLine.textContent = s.prompt;  // プロンプトはテキストとして安全に挿入
-    box.appendChild(img);
+    box.appendChild(media);
     box.appendChild(meta);
     box.appendChild(promptLine);
     resultArea.appendChild(box);
