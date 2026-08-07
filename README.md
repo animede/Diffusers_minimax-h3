@@ -9,6 +9,14 @@ MiniMax H3 (Hailuo 3.0) の機能確認用スタンドアロンアプリ。動�
 Ubuntu 24.04。低VRAM構成については 18GB 相当までVRAMバラストで検証している(下記の
 VRAM対応表を参照)。
 
+> **環境変更 (2026-08-07 夜)**: この箱の GPU は RTX PRO 6000 Blackwell 96GB から
+> **RTX PRO 5000 Blackwell 48GB + RTX 4000 SFF Ada 20GB** の2枚構成に交換された。
+> 既存の実測値は 96GB 時代のもの(VRAMバラスト検証済みなので目安としては有効)。
+> 48GB 単騎では既定モード(bf16 transformer 66.3GB)は物理的にロードできないため、
+> **起動には `H3_LOWVRAM=1`(48GB級)か `H3_LOWVRAM=group`(24-32GB級)が必須**。
+> turbo LoRA(bf16 経路専用)もこの箱では使えない。2026-08-07 以降の新規実測
+> (静止画モードのセクション)は RTX PRO 5000 48GB + `H3_LOWVRAM=1` での値。
+
 ## 構成
 
 ```
@@ -822,6 +830,16 @@ venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 (`H3_TE_QUANT=none` の場合は旧方式: transformer/VAEを常駐させ、TEは各リクエストの
 たびにロード/解放)。ブラウザで `http://<host>:8611/` を開く。
 
+> **現在の箱 (48GB + 20GB、2026-08-07 のGPU交換後) では既定モードはロードできない**。
+> 起動は低VRAMモード必須:
+> ```bash
+> CUDA_VISIBLE_DEVICES=0 H3_LOWVRAM=1 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+> ```
+> (`CUDA_VISIBLE_DEVICES=0` は 48GB の RTX PRO 5000 を cuda:0 に固定するため。
+> 20GB の RTX 4000 SFF Ada は、バラスト検証上の床 ~18GB に対して余裕が2GBしかなく、
+> かつ sm_89 なので sm_120 向けにビルドした SageAttention も使えない — H3 用途は未検証・
+> 非推奨)
+
 ## 回帰確認プローブ (UIより先に動作確認する場合)
 
 ```bash
@@ -836,6 +854,8 @@ venv/bin/python scripts/probe_t2va.py
 - `POST /api/t2va` (multipart/form-data): `prompt`, `resolution`
   (`768x768`|`768x1344`|`1344x768`), `seconds`(5〜15), `num_inference_steps`, `seed`
 - `POST /api/fl2va`: 上記に加え `image` / `last_image`(どちらか一方以上)
+- `POST /api/t2i`: 静止画モード。`seconds` の代わりに `frames`(22既定|5)。
+  超短尺mp4と中央フレームPNGの両方を保存(「静止画モード」セクション参照)
 - `GET /api/status`: ロード状態・VRAM/RAM
 - `GET /api/progress`: 生成中の進捗ポーリング用
 
@@ -884,7 +904,8 @@ lowvram 0→1→0 も往復動作。`GET /api/settings` が現在値と選択肢
 `<video preload="metadata" src="....mp4#t=0.1">` に先頭フレームを描かせる(依存追加なし。
 Ref2VAの参照タイルと同じ手法)。
 
-- `GET /api/outputs`: **直下の *.mp4 のみ**(`outputs/ab_*` 等の検証資料は対象外)。
+- `GET /api/outputs`: **直下の *.mp4 と *.png**(静止画モードの生成物。`type` フィールド
+  "video"/"image" で区別。`outputs/ab_*` 等の検証資料は対象外)。
   尺/解像度は ffprobe で取得し mtime+size をキーにメモリキャッシュ
 - `POST /api/outputs/delete`: **パストラバーサル対策**(`/`・`\`・`..` を拒否し、
   resolve 後に `outputs/` 直下であることを検証=シンボリックリンク経由の脱出も遮断)。
@@ -893,7 +914,9 @@ Ref2VAの参照タイルと同じ手法)。
   全入力のパラメータが一致すれば `concat demuxer + -c copy`(**再エンコードなし=劣化ゼロ**)、
   不一致なら `filter_complex` で先頭動画の解像度へ揃えて再エンコード(無音入力には
   `anullsrc` を合成)。2本未満は400、連結同士の同時実行は409(GPUを使わないので
-  generation_lock は取らない)
+  generation_lock は取らない)。**PNG(静止画)は連結対象外**(ffprobe が PNG も
+  video stream として読めてしまうため、拡張子で明示的に400にする。UI側も選択に
+  PNG が混ざると連結ボタンを無効化する)
 
 **依存に関する注意**: このアプリの**生成物のmuxは PyAV**(`av.open()` で libx264+aac を
 直接書き出す、`core/runner.py` の `_mux_mp4()`)で行っており、**ffmpeg コマンドは使って
@@ -937,28 +960,69 @@ ffmpeg のシーン検出 `gt(scene,0.15)`):
 「プロンプトは末尾が最強」と同じ原理)。修正後は地の文だけが日本語になり、
 フィールド名・`[Shot n]`・タイムコード・`<d>` タグ内の台詞は英語/原語のまま維持される。
 
-## 超短尺生成プローブ: 画像生成代用の可能性 (2026-08-07、未実装・実測のみ)
+## 静止画モード (T2I、`/api/t2i`、2026-08-07 本実装)
 
-H3を「1フレーム弱の動画→静止画取り出し」で画像生成の代用にする案の実測。
-フレーム数は 17n+5 刻み(最小5=0.208秒、次が22=0.917秒)で、5秒未満は
-diffusers/アプリ両方のバリデーションが弾くため、プローブ内のmonkeypatchのみで回避して
-検証した(`scripts/probe_short_frames.py` + `_one.py`、本体コードは無変更)。
+H3を「超短尺動画→静止画取り出し」で画像生成の代用にするモード。前段の超短尺プローブ
+(下記)の結論をそのまま本実装した。価値は「**H3と画風が完全に一致する静止画**」を
+FL2VA の先頭フレームや Ref2VA の参照画像として作れること(速度は固定費支配のため
+専用T2Iモデルには勝てない)。
+
+- **API**: `POST /api/t2i` — `prompt` / `frames`(22既定 or 5)/ `resolution` or
+  `height`+`width` / `num_inference_steps` / `seed` / 即反映パラメータ
+  (cache/cache_threshold/attn/turbo)。レスポンスは超短尺 mp4 と**中央フレームの PNG**
+  (`image_url`、`t2i_<ts>.png`)の両方
+- **UI**: 「T2I (静止画)」タブ(秒数・upscale欄は非表示、フレーム数選択のみ)。
+  ギャラリーにも PNG がタイル表示される(削除可・連結不可)
+- **フレーム数**: 22 (0.917s) が既定。5 (0.208s) は実験的だが下記の VAE 修正で動く
+- **実装の3点セット**(`core/runner.py`):
+  1. `generate(still=True, still_frames=...)` — diffusers 側の最小尺5秒バリデーション
+     (`MINIMAX_H3_MIN_DURATION`)は `MiniMaxH3SetupStep` の呼び出し1回分だけ
+     `_relaxed_min_duration()` で緩和(生成は generation_lock で直列なので漏れない)
+  2. **VAE 小クリップデコード修正** (`H3_VAE_SMALLCLIP_FIX`、既定1):
+     `AutoencoderKLMiniMaxH3._decode()` は潜在1-2フレームで num_chunks=0 →
+     `torch.cat([])` で落ちる上流バグがある(プローブで実機再現)。runner 側の
+     monkeypatch で「1チャンク未満なら全トークンを単一 `_decode_clip()` で復号し、
+     `frame_pre_padding`(3) とパディング末尾を切り落とす」分岐を追加。潜在2フレーム
+     ×4 − 3 = 5ピクセルフレームで幾何が一致する。通常動画 (num_chunks>=1) は元実装へ
+     そのまま委譲するため影響なし(venv の diffusers 本体は無変更)
+  3. **decode 例外時の steady state 復元**: プローブで観測した「decode 例外 →
+     transformer drop 済みのまま復元コード未実行 → ~98.5GB 残留で後続リクエストが
+     連鎖 OOM」への対策として、`generate()`/`generate_ref2va()` の decode 部を
+     try/except 化し、例外時も `_restore_decode_steady_state()`(VAE を CPU へ・
+     モードごとの transformer/TE 再ロード)を実行してから再送出する。
+     **実機検証済み** (2026-08-07): 一回限りの失敗注入フック `H3_DEBUG_FAIL_DECODE=1`
+     (`os.environ.pop` で読むため同一プロセスの次リクエストから通常動作)で decode を
+     故意に失敗させ、500 応答後に GPU が ~2GB まで解放され、**同一プロセスの次の
+     リクエストが正常に 200 を返す**ことを確認した
+
+**実測 (2026-08-07、RTX PRO 5000 48GB + `H3_LOWVRAM=1`、768²・30steps・fbc+sage・
+seed 12345)**:
+
+| frames | デノイズ | デコード | ピークVRAM | 合計(毎リクエストの再ロード込み) | 品質(目視) |
+|---|---|---|---|---|---|
+| 22 (0.917s) | 29.0s (1.0s/step) | 1.8s | 35.0GB | 157s | 破綻なし・高品質 |
+| 5 (0.208s) | 9.1s | 0.67s | 35.2GB | 125s | 破綻なし(史上初の実デコード成功) |
+
+5フレームの音声 (0.208s) も非無音 (rms 0.055)。低VRAMモードの固定費 (~110s) が支配的
+なので、複数枚作るなら常駐モード (`H3_LOWVRAM=group` や、96GB級なら既定モード) の方が
+回転が速い。
+
+### 前段の超短尺プローブ (2026-08-07、実測記録)
+
+フレーム数は 17n+5 刻み(最小5=0.208秒、次が22=0.917秒)。プローブは monkeypatch のみで
+検証した(`scripts/probe_short_frames.py` + `_one.py`)。当時の環境は RTX PRO 6000 96GB・
+既定モード。
 
 | フレーム数 | デノイズ(30steps) | デコード | 結果 |
 |---|---|---|---|
-| 5 (0.208s) | 完走 | **失敗** | VAEチャンク分割デコードの境界バグ(潜在2フレームで num_chunks=0 → `torch.cat([])`) |
+| 5 (0.208s) | 完走 | **失敗** | VAEチャンク分割デコードの境界バグ(潜在2フレームで num_chunks=0 → `torch.cat([])`)→ **上記2で修正済み** |
 | **22 (0.917s)** | **13.5s**(124fの1/7.6) | 1.2s | **成功・品質は5秒基準と遜色なし**(目視確認済み) |
 | 124 (5s、基準) | 102.2s | 6.3s | 成功 |
 
-- 5フレームの失敗は原理限界ではなく `AutoencoderKLMiniMaxH3._decode()` の最小サイズ
-  端数処理(未修正。直せば通る可能性が高い)
 - 22フレームは学習分布外(公式下限5秒の1/5)でも品質が崩れず、音声も非無音
-- 速度は固定費(~55s)支配のため専用T2Iには勝てない。価値は「**H3と画風が完全に一致する
-  静止画**」を FL2VA の先頭フレームや Ref2VA の参照画像として作れること
 - **教訓**: プローブ中、5フレームの例外がデコード後のクリーンアップ(transformer再ロード)
-  前に発生し、~98.5GB残留で後続リクエストがOOMする連鎖を観測。静止画モードを実装する
-  場合は例外時のクリーンアップ経路が必須
-- 「静止画モード」としての実装(UI/API化、5フレームのデコーダ対処)は**未着手・判断待ち**
+  前に発生し、~98.5GB残留で後続リクエストがOOMする連鎖を観測 → 上記3のクリーンアップ
+  経路として本実装に反映済み
 
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 

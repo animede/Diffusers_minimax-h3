@@ -1,4 +1,4 @@
-"""生成済み動画ギャラリー (outputs/ 直下の *.mp4 一覧・削除・連結)。
+"""生成済み動画・静止画ギャラリー (outputs/ 直下の *.mp4/*.png 一覧・削除、*.mp4 の連結)。
 
 app.py を薄く保つため、一覧/削除/連結のロジックをここへ切り出す。GPUには一切触れない
 (ffprobe/ffmpeg をサブプロセスで呼ぶだけ)ため、core.runner の generation_lock とは
@@ -133,27 +133,34 @@ def _probe_cached(path: Path) -> dict:
 
 
 def list_outputs(output_dir: Path) -> list[dict]:
-    """outputs/ 直下(サブディレクトリ除く)の *.mp4 を新しい順で返す。"""
+    """outputs/ 直下(サブディレクトリ除く)の *.mp4 と *.png を新しい順で返す。
+
+    PNG は静止画モード (/api/t2i) の生成物。type フィールド ("video"|"image") で
+    区別する(UI はこれで <video>/<img> を出し分ける)。PNG も ffprobe で width/height
+    が取れる(PNG は1フレームの video stream として扱われる)ため同じキャッシュ経路を使う。
+    """
     entries = []
-    for path in output_dir.glob("*.mp4"):
-        if not path.is_file():
-            continue
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            continue
-        probed = _probe_cached(path)
-        entries.append({
-            "name": path.name,
-            "url": f"/outputs/{path.name}",
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-            "duration": probed.get("duration"),
-            "width": probed.get("width"),
-            "height": probed.get("height"),
-            "fps": probed.get("fps"),
-            "has_audio": probed.get("has_audio"),
-        })
+    for pattern, kind in (("*.mp4", "video"), ("*.png", "image")):
+        for path in output_dir.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            probed = _probe_cached(path)
+            entries.append({
+                "name": path.name,
+                "url": f"/outputs/{path.name}",
+                "type": kind,
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "duration": probed.get("duration") if kind == "video" else None,
+                "width": probed.get("width"),
+                "height": probed.get("height"),
+                "fps": probed.get("fps") if kind == "video" else None,
+                "has_audio": probed.get("has_audio") if kind == "video" else False,
+            })
     entries.sort(key=lambda e: e["mtime"], reverse=True)
     return entries
 
@@ -218,6 +225,10 @@ def concat_outputs(output_dir: Path, names: list[str]) -> dict:
 
     paths = []
     for name in names:
+        # 静止画 (PNG) は連結対象外。ffprobe は PNG も video stream として読めてしまう
+        # ため、拡張子で明示的に弾く(黙って1フレーム動画として混ぜない)。
+        if not name.lower().endswith(".mp4"):
+            raise GalleryError(f"連結できるのは動画 (.mp4) のみです: {name}")
         path = safe_output_path(output_dir, name)
         if not path.exists() or not path.is_file():
             raise GalleryError(f"ファイルが見つかりません: {name}")

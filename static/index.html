@@ -282,7 +282,7 @@
     aspect-ratio: 4 / 3;
     background: #000;
   }
-  .gallery-thumb-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .gallery-thumb-wrap video, .gallery-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .gallery-checkbox {
     position: absolute;
     top: 6px;
@@ -450,6 +450,7 @@
       <button class="tab-btn active" data-mode="t2va">T2VA (テキスト→動画)</button>
       <button class="tab-btn" data-mode="fl2va">FL2VA (フレーム指定)</button>
       <button class="tab-btn" data-mode="ref2va">Ref2VA (参照→動画)</button>
+      <button class="tab-btn" data-mode="t2i">T2I (静止画)</button>
     </div>
 
     <form id="gen-form">
@@ -502,6 +503,19 @@
         <div class="hint">どちらか一方でも可。両方指定すると先頭→末尾のフレーム間を生成。</div>
       </div>
 
+      <div id="t2i-fields" style="display:none;">
+        <label>フレーム数(超短尺動画を生成し、中央フレームをPNG書き出し)</label>
+        <select id="t2i-frames">
+          <option value="22">22フレーム (0.92秒・品質検証済みの既定)</option>
+          <option value="5">5フレーム (0.21秒・実験的)</option>
+        </select>
+        <div class="hint">
+          H3と<b>画風が完全に一致する静止画</b>を、FL2VAの先頭フレームやRef2VAの参照画像用に
+          作るモード。生成時間は固定費支配のため専用T2Iモデルより遅い。超短尺mp4も一緒に
+          保存され、PNGは中央フレーム(別フレームが欲しい場合はmp4から取り出せる)。
+        </div>
+      </div>
+
       <div id="ref2va-fields" style="display:none;">
         <label>参照ファイル (references, 画像最大9・動画最大3・音声最大3、計12まで)</label>
         <div class="dropzone" id="dz-ref-files">
@@ -542,7 +556,7 @@
             <option value="auto">自動 (サーバ既定 / Ref2VAは16:9)</option>
           </select>
         </div>
-        <div>
+        <div id="seconds-col">
           <label>秒数 (5〜15、Ref2VAは音声参照1本なら空欄可)</label>
           <input type="number" id="seconds" value="5" min="5" max="15" step="0.5">
         </div>
@@ -664,8 +678,8 @@
     </div>
 
     <div class="gallery-panel">
-      <h2>生成済み動画</h2>
-      <div class="gallery-hint">連結順は「チェックした順」です(ギャラリー表示順は新しい順)。</div>
+      <h2>生成済み動画・静止画</h2>
+      <div class="gallery-hint">連結順は「チェックした順」です(ギャラリー表示順は新しい順)。静止画(PNG)は連結対象外。</div>
       <div class="gallery-toolbar">
         <button type="button" id="gallery-select-all">全選択</button>
         <button type="button" id="gallery-select-none">全解除</button>
@@ -698,6 +712,10 @@ const resultArea = document.getElementById('result-area');
 const serverStatusEl = document.getElementById('server-status');
 const fl2vaFields = document.getElementById('fl2va-fields');
 const ref2vaFields = document.getElementById('ref2va-fields');
+const t2iFields = document.getElementById('t2i-fields');
+const t2iFramesEl = document.getElementById('t2i-frames');
+const secondsColEl = document.getElementById('seconds-col');
+const upscaleRowEl = document.getElementById('upscale-row');
 const sizeRow = document.getElementById('size-row');
 const customSizeRow = document.getElementById('custom-size-row');
 const customWidthEl = document.getElementById('custom-width');
@@ -857,6 +875,10 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     mode = btn.dataset.mode;
     fl2vaFields.style.display = (mode === 'fl2va') ? 'block' : 'none';
     ref2vaFields.style.display = (mode === 'ref2va') ? 'block' : 'none';
+    t2iFields.style.display = (mode === 't2i') ? 'block' : 'none';
+    // 静止画モードはフレーム数選択が尺を決める(秒数不使用)。upscale も未検証のため隠す。
+    secondsColEl.style.display = (mode === 't2i') ? 'none' : '';
+    upscaleRowEl.style.display = (mode === 't2i') ? 'none' : '';
     // Ref2VA references never bind the target canvas (each is prepared at its own
     // resolution -- see packing_ref2va.py's module docstring)。既定は H3 自身の 16:9
     // (height/width を送らない = "auto")だが、/api/ref2va は height/width を任意で
@@ -1132,7 +1154,9 @@ enhanceBtn.addEventListener('click', async () => {
     fd.append('text', text);
     fd.append('mode', enhanceModeEl.value);
     fd.append('seconds', secondsEl.value || '10');
-    fd.append('task', mode); // t2va/fl2va/ref2va タブ (h3-official モードのみ使用)
+    // t2va/fl2va/ref2va タブ (h3-official モードのみ使用)。T2I タブは超短尺の t2va
+    // なので t2va のプロンプト形式をそのまま使う。
+    fd.append('task', mode === 't2i' ? 't2va' : mode);
     fd.append('lang', enhanceLangEl.value || 'en');
     const res = await fetch('/api/prompt/enhance', { method: 'POST', body: fd });
     const data = await res.json();
@@ -1368,6 +1392,10 @@ form.addEventListener('submit', async (ev) => {
     appendSize();
     fd.append('seconds', secondsEl.value);
     if (upscaleEl && upscaleEl.checked) fd.append('upscale', '1');
+  } else if (mode === 't2i') {
+    url = '/api/t2i';
+    appendSize();
+    fd.append('frames', t2iFramesEl.value);
   } else if (mode === 'fl2va') {
     url = '/api/fl2va';
     appendSize();
@@ -1429,13 +1457,19 @@ function renderResult(data) {
     );
     refsLine = `<div><b>参照:</b> ${parts.join(' → ')}</div>`;
   }
-  resultArea.innerHTML = `
+  // 静止画モード (t2i) は PNG を主表示にし、元の超短尺 mp4 も確認用に併置する
+  const mediaHtml = data.image_url ? `
+    <img src="${data.image_url}" alt="生成された静止画" style="max-width:100%;border-radius:8px;">
+    <a class="dl-link" href="${data.image_url}" download>PNGをダウンロード</a>
+    <a class="dl-link" href="${data.video_url}" download>元の超短尺mp4</a>` : `
     <video controls autoplay loop src="${data.video_url}"></video>
-    <a class="dl-link" href="${data.video_url}" download>mp4をダウンロード</a>
+    <a class="dl-link" href="${data.video_url}" download>mp4をダウンロード</a>`;
+  resultArea.innerHTML = `
+    ${mediaHtml}
     <div class="result-meta">
       <div><b>モード:</b> ${data.mode}</div>
       ${refsLine}
-      <div><b>解像度:</b> ${data.width}×${data.height} / <b>長さ:</b> ${data.duration_s.toFixed(2)}s (${data.num_frames}フレーム)</div>
+      <div><b>解像度:</b> ${data.width}×${data.height} / <b>長さ:</b> ${data.duration_s.toFixed(2)}s (${data.num_frames}フレーム${data.still_frame_index != null ? `、PNGは中央フレーム #${data.still_frame_index}` : ''})</div>
       <div><b>ステップ:</b> ${data.num_inference_steps} / <b>seed:</b> ${data.seed ?? '(random)'}</div>
       <div><b>デノイズ時間:</b> ${data.denoise_time_s}s (avg ${data.avg_step_time_s}s/step) / <b>デコード:</b> ${data.decode_time_s}s</div>
       <div><b>合計時間:</b> ${data.total_elapsed_s}s / <b>ピークVRAM:</b> ${data.peak_vram_gb}GB</div>
@@ -1516,13 +1550,22 @@ function renderGallery() {
     cb.addEventListener('click', (e) => e.stopPropagation());
     cb.addEventListener('change', () => toggleGallerySelection(item.name));
 
-    const video = document.createElement('video');
-    video.src = item.url + '#t=0.1';
-    video.muted = true;
-    video.preload = 'metadata';
-    video.playsInline = true;
+    // 静止画 (type=image、t2i の PNG) は <img>、動画は <video> でサムネイル表示
+    let thumb;
+    if (item.type === 'image') {
+      thumb = document.createElement('img');
+      thumb.src = item.url;
+      thumb.alt = item.name;
+      thumb.loading = 'lazy';
+    } else {
+      thumb = document.createElement('video');
+      thumb.src = item.url + '#t=0.1';
+      thumb.muted = true;
+      thumb.preload = 'metadata';
+      thumb.playsInline = true;
+    }
 
-    thumbWrap.appendChild(video);
+    thumbWrap.appendChild(thumb);
     thumbWrap.appendChild(cb);
 
     // バッジは常に作っておき、選択状態は表示/非表示と文字だけで切り替える
@@ -1537,9 +1580,10 @@ function renderGallery() {
     const info = document.createElement('div');
     info.className = 'gallery-info';
     const resLine = (item.width && item.height) ? `${item.width}×${item.height}` : '解像度不明';
+    const headLine = item.type === 'image' ? '静止画' : fmtDuration(item.duration);
     info.innerHTML = `
       <div class="name" title="${item.name}">${item.name}</div>
-      <div>${fmtDuration(item.duration)} / ${resLine} / ${fmtBytes(item.size)}</div>
+      <div>${headLine} / ${resLine} / ${fmtBytes(item.size)}</div>
     `;
 
     tile.appendChild(thumbWrap);
@@ -1583,7 +1627,10 @@ function updateGalleryToolbar() {
   const n = gallerySelectedOrder.length;
   galleryCountEl.textContent = `${n}件選択`;
   galleryDeleteBtn.disabled = n === 0;
-  galleryConcatBtn.disabled = n < 2;
+  // 静止画 (PNG) は連結不可(サーバ側 concat_outputs も mp4 以外を 400 で弾く)
+  const hasImage = gallerySelectedOrder.some(name => name.toLowerCase().endsWith('.png'));
+  galleryConcatBtn.disabled = n < 2 || hasImage;
+  galleryConcatBtn.title = hasImage ? '静止画(PNG)は連結できません' : '';
 }
 
 gallerySelectAllBtn.addEventListener('click', () => {
@@ -1605,7 +1652,7 @@ galleryRefreshBtn.addEventListener('click', refreshGallery);
 galleryDeleteBtn.addEventListener('click', async () => {
   const names = [...gallerySelectedOrder];
   if (!names.length) return;
-  const ok = window.confirm(`${names.length}件の動画を削除します。この操作は取り消せません。よろしいですか?`);
+  const ok = window.confirm(`${names.length}件のファイルを削除します。この操作は取り消せません。よろしいですか?`);
   if (!ok) return;
   galleryDeleteBtn.disabled = true;
   try {

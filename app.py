@@ -37,6 +37,7 @@ from core.runner import (
     H3_TURBO_STEPS_DEFAULT,
     MAX_SECONDS,
     MIN_SECONDS,
+    STILL_FRAME_CHOICES,
     MiniMaxH3Reference,
     MiniMaxH3Runner,
     ProgressState,
@@ -123,6 +124,7 @@ def api_status():
             "fps": FPS,
             "frame_step": 17,   # num_frames は 17n + 5 (align_num_frames)
             "frame_offset": 5,
+            "still_frame_choices": list(STILL_FRAME_CHOICES),  # /api/t2i の frames の選択肢
         },
     }
 
@@ -211,7 +213,10 @@ def _run_generation(
     cache_threshold: Optional[float] = None,
     attn: Optional[str] = None,
     turbo: Optional[bool] = None,
+    still_frames: Optional[int] = None,
 ) -> dict:
+    """still_frames を指定すると静止画モード (t2i): seconds は無視され、超短尺動画から
+    中央フレームの PNG を書き出す(core/runner.py の generate(still=True) 参照)。"""
     global _current_progress
 
     # height/width を明示指定した場合はプリセットより優先し、H3の規則へ丸める
@@ -229,10 +234,12 @@ def _run_generation(
     # 秒数もモデルの許容範囲へ丸める(エラーにしない)。実際のフレーム数は
     # seconds_to_num_frames() が 17n+5 へ切り上げるため、生成尺は要求秒数より
     # わずかに長くなることがある(レスポンスの num_frames / duration_s が実値)。
-    seconds = max(MIN_SECONDS, min(MAX_SECONDS, float(seconds)))
+    # 静止画モード (still_frames 指定時) は seconds を使わないため丸めもしない。
+    if still_frames is None:
+        seconds = max(MIN_SECONDS, min(MAX_SECONDS, float(seconds)))
 
-    if not (MIN_SECONDS <= seconds <= MAX_SECONDS):
-        raise HTTPException(400, f"seconds must be between {MIN_SECONDS} and {MAX_SECONDS}, got {seconds}")
+        if not (MIN_SECONDS <= seconds <= MAX_SECONDS):
+            raise HTTPException(400, f"seconds must be between {MIN_SECONDS} and {MAX_SECONDS}, got {seconds}")
 
     if not prompt or not prompt.strip():
         raise HTTPException(400, "prompt is required")
@@ -262,9 +269,13 @@ def _run_generation(
             cache_threshold=cache_threshold,
             attn=attn,
             turbo=turbo,
+            still=still_frames is not None,
+            still_frames=still_frames if still_frames is not None else 22,
         )
         result["job_id"] = job_id
         result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
+        if result.get("png_filename"):
+            result["image_url"] = f"/outputs/{result['png_filename']}"
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -311,6 +322,51 @@ def api_t2va(
         cache_threshold=cache_threshold,
         attn=attn,
         turbo=turbo,
+    )
+    return JSONResponse(result)
+
+
+@app.post("/api/t2i")
+def api_t2i(
+    prompt: str = Form(...),
+    resolution: str = Form("768x768"),
+    frames: int = Form(22),
+    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    seed: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
+):
+    """静止画生成 (t2i): 超短尺動画を生成して中央フレームを PNG として書き出す。
+
+    frames は 22 (0.917秒、品質検証済みの既定) か 5 (0.208秒、実験的・要
+    H3_VAE_SMALLCLIP_FIX=1)。速度は固定費 (~55s〜、低VRAMモードではモデル再ロード分
+    さらに増える) 支配のため専用 T2I モデルには勝てないが、H3 と画風が完全に一致する
+    静止画を FL2VA の先頭フレームや Ref2VA の参照画像として作れるのが価値
+    (README「静止画モード」参照)。レスポンスには mp4 (超短尺の元動画) と
+    png (image_url) の両方が入る。height/width 指定時は resolution より優先。
+    cache/cache_threshold/attn/turbo は他エンドポイントと同じ即反映パラメータ。
+    """
+    if frames not in STILL_FRAME_CHOICES:
+        raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
+    result = _run_generation(
+        prompt=prompt,
+        resolution=resolution,
+        seconds=0.0,  # still モードでは未使用 (still_frames が尺を決める)
+        num_inference_steps=num_inference_steps,
+        seed=seed,
+        image=None,
+        last_image=None,
+        height=height,
+        width=width,
+        cache=cache,
+        cache_threshold=cache_threshold,
+        attn=attn,
+        turbo=turbo,
+        still_frames=frames,
     )
     return JSONResponse(result)
 
@@ -539,7 +595,8 @@ def api_prompt_enhance(
 
 @app.get("/api/outputs")
 def api_outputs_list():
-    """outputs/ 直下(サブディレクトリ除く)の *.mp4 を新しい順で返す。
+    """outputs/ 直下(サブディレクトリ除く)の *.mp4 と *.png (静止画モードの生成物) を
+    新しい順で返す。type フィールド ("video"|"image") で区別する。
 
     解像度・尺は ffprobe で取得し、mtime+size をキーにメモリキャッシュする
     (core/gallery.py の _probe_cached)。

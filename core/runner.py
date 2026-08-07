@@ -109,6 +109,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -569,6 +570,103 @@ if H3_TURBO_LORA and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
 MIN_SECONDS = 5.0
 MAX_SECONDS = 15.0
 FPS = 24
+
+# 静止画モード (`generate(still=True)`) のフレーム数の選択肢。値は align_num_frames の
+# 17n+5 制約を満たす最小の2つ: 22 (0.917s) は 2026-08-07 の超短尺プローブ
+# (scripts/probe_short_frames*.py) で品質が5秒基準と遜色ないことを目視確認済みの既定値。
+# 5 (0.208s) は学習分布からさらに外れる実験値で、デコードには下の
+# `_patch_vae_smallclip_decode()` (H3_VAE_SMALLCLIP_FIX) が必須(潜在2フレームは
+# 上流の `AutoencoderKLMiniMaxH3._decode()` のチャンク境界処理で num_chunks=0 になり
+# `torch.cat([])` で落ちる)。
+STILL_FRAME_CHOICES = (22, 5)
+
+# Opt-out ("1" default). "1" = `AutoencoderKLMiniMaxH3._decode()` に「潜在フレームが
+# 1チャンク未満 (num_chunks==0、潜在1-2フレーム)なら全トークンを単一の `_decode_clip()`
+# で復号する」分岐を monkeypatch で追加する(下の `_patch_vae_smallclip_decode()`)。
+# 通常の動画 (num_chunks>=1) はパッチ後も従来の実装へそのまま委譲されるため
+# byte-for-byte 影響なし。"0" は静止画モードの frames=5 が上流バグそのままで落ちる
+# 状態に戻すためのトグル(例外時クリーンアップの実機検証にも使った)。
+H3_VAE_SMALLCLIP_FIX = os.environ.get("H3_VAE_SMALLCLIP_FIX", "1").strip() == "1"
+
+
+def _patch_vae_smallclip_decode() -> None:
+    """`AutoencoderKLMiniMaxH3._decode()` の潜在1-2フレーム境界バグを runner 側から直す。
+
+    上流 (PR #14355 abc5e9b) の `_decode()` はチャンク数を
+    `num_chunks = (num_tokens + pad_tokens) // tokens_chunk_size - int(token_drop > 0)`
+    で計算する。5ピクセルフレーム動画の潜在は2フレーム (= `tokens_chunk_size(5)` から
+    `token_drop(3)` を引いた値ぴったり) なので num_chunks が 0 になり、チャンクループが
+    一度も回らず `torch.cat([])` が ValueError を投げる -- 2026-08-07 の超短尺プローブで
+    実機再現した既知バグ(README「超短尺生成プローブ」参照)。
+
+    この関数はクラスメソッドを wrap し、num_chunks>=1 の通常経路は元実装へそのまま
+    委譲、num_chunks==0 のときだけ「(必要ならパディングした)全トークンを単一の
+    `_decode_clip()` で復号し、`frame_pre_padding` とパディング由来の末尾フレームを
+    切り落とす」経路を通す。これは元実装のチャンク0本目の処理 (`clip[:, :,
+    frame_start:...]` -> `chunk[:, :, self.frame_pre_padding:]`) をチャンク分割なしに
+    そのまま適用したもの: 潜在2フレーム x temporal_ratio(4) = 8フレーム -
+    frame_pre_padding(3) = 5ピクセルフレーム、で幾何が一致する。パディングした
+    潜在フレームは全て非チャンク末尾トークン (パディング後も2トークンしかなく、
+    チャンク末尾 = index 4 に届かない) なので、末尾トリムは一律
+    `pad_tokens * temporal_ratio` でよい(元実装の intra_tail 分岐が効く条件に入らない)。
+
+    venv の diffusers 本体は変更しない(このプロジェクトの決まり)。idempotent:
+    パッチ済みならフラグを見て何もしない。`_decode` の `@apply_forward_hook` は元の
+    束縛関数越しに通常経路では従来どおり効く。小クリップ経路は accelerate フックを
+    通らないが、この runner は VAE を手動で移動しており accelerate フックを付けない
+    ため実害はない。
+    """
+    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3
+
+    orig_decode = AutoencoderKLMiniMaxH3._decode
+    if getattr(orig_decode, "_h3_smallclip_patched", False):
+        return
+
+    def _decode_with_smallclip_fix(self, z: torch.Tensor) -> torch.Tensor:
+        tokens_chunk_size = self.tokens_chunk_size
+        token_drop = self.config.token_drop
+        num_tokens = z.shape[2] + token_drop
+        pad_tokens = (-num_tokens) % tokens_chunk_size
+        num_chunks = (num_tokens + pad_tokens) // tokens_chunk_size - int(token_drop > 0)
+        if num_chunks >= 1:
+            return orig_decode(self, z)
+
+        temporal_ratio = self.temporal_compression_ratio
+        if pad_tokens > 0:
+            z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+        dec = self._decode_clip(z)
+        dec = dec[:, :, self.frame_pre_padding :]
+        if pad_tokens > 0:
+            dec = dec[:, :, : -(pad_tokens * temporal_ratio)]
+        return dec
+
+    _decode_with_smallclip_fix._h3_smallclip_patched = True
+    AutoencoderKLMiniMaxH3._decode = _decode_with_smallclip_fix
+    logger.info("patched AutoencoderKLMiniMaxH3._decode with small-clip (num_chunks==0) fix")
+
+
+if H3_VAE_SMALLCLIP_FIX:
+    _patch_vae_smallclip_decode()
+
+
+@contextmanager
+def _relaxed_min_duration():
+    """静止画モードの間だけ diffusers 側の最小尺バリデーション (5.0s) を緩和する。
+
+    `MINIMAX_H3_MIN_DURATION` の実際の消費箇所は before_encoder.py のみ(packing.py は
+    定義しているだけ)だが、超短尺プローブで実証済みの手順そのままに両モジュールを
+    patch する。生成は app.py の generation_lock で直列化されているため、この一時的な
+    書き換えが並行リクエストへ漏れることはない。scope は `MiniMaxH3SetupStep` の呼び出し
+    1回分だけに絞る(それ以外のブロックはこの定数を読まない)。"""
+    from diffusers.modular_pipelines.minimax_h3 import before_encoder, packing
+
+    saved = (before_encoder.MINIMAX_H3_MIN_DURATION, packing.MINIMAX_H3_MIN_DURATION)
+    before_encoder.MINIMAX_H3_MIN_DURATION = 0.01
+    packing.MINIMAX_H3_MIN_DURATION = 0.01
+    try:
+        yield
+    finally:
+        before_encoder.MINIMAX_H3_MIN_DURATION, packing.MINIMAX_H3_MIN_DURATION = saved
 
 
 def _register_minimax_h3_block_for_fbc() -> None:
@@ -2355,9 +2453,17 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
+        still: bool = False,
+        still_frames: int = 22,
     ) -> dict:
         """
         Runs T2VA (image=None, last_image=None) or FL2VA (either/both given).
+
+        `still=True` は静止画モード (t2i): `seconds` を無視して `still_frames`
+        (STILL_FRAME_CHOICES のいずれか) の超短尺動画を生成し、中央フレームを PNG
+        (`t2i_<ts>.png`) として書き出す。超短尺 mp4 も従来どおり保存する。diffusers 側の
+        最小尺 5 秒バリデーションは setup step の間だけ `_relaxed_min_duration()` で
+        緩和する。fl2va (image/last_image) および upscale との併用は未検証のため拒否。
 
         `upscale=1` enables two-pass hires-fix: pass 1 denoises `round(num_inference_steps
         * (1 - H3_HIRES_DENOISE))` steps at the requested (height, width), the video latent's
@@ -2401,7 +2507,21 @@ class MiniMaxH3Runner:
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
-        num_frames = seconds_to_num_frames(seconds)
+        if still:
+            if still_frames not in STILL_FRAME_CHOICES:
+                raise ValueError(f"still_frames must be one of {STILL_FRAME_CHOICES}, got {still_frames}")
+            if image is not None or last_image is not None:
+                raise ValueError("still=True (t2i) はテキストからの生成専用です (image/last_image は併用不可)。")
+            if upscale:
+                raise ValueError("still=True (t2i) と upscale=1 (hires-fix) の併用は未検証のため拒否します。")
+            if still_frames == 5 and not H3_VAE_SMALLCLIP_FIX:
+                raise ValueError(
+                    "still_frames=5 には H3_VAE_SMALLCLIP_FIX=1 (既定) が必要です "
+                    "(潜在2フレームのデコードは上流のチャンク境界バグで落ちるため)。"
+                )
+            num_frames = still_frames
+        else:
+            num_frames = seconds_to_num_frames(seconds)
         do_upscale = bool(upscale)
         if do_upscale and (image is not None or last_image is not None):
             # Scope of this task's hires-fix is t2va only. fl2va's keyframe conditioning
@@ -2510,7 +2630,13 @@ class MiniMaxH3Runner:
 
         # --- setup (canvas / frame count / keyframe prep) ---
         setup_step = MiniMaxH3SetupStep()
-        _, state = setup_step(pipe, state)
+        if still:
+            # 超短尺 (5秒未満) は setup step の duration バリデーションが弾くため、
+            # この1呼び出しの間だけ緩和する(_relaxed_min_duration の docstring 参照)。
+            with _relaxed_min_duration():
+                _, state = setup_step(pipe, state)
+        else:
+            _, state = setup_step(pipe, state)
         # The setup step's *outputs* (num_frames after alignment, prepared keyframes,
         # latent geometry) live in the PipelineState -- get_block_state only maps
         # declared inputs, so read outputs via state.get().
@@ -2984,6 +3110,45 @@ class MiniMaxH3Runner:
         # right before the next request needs it" shape `force_free_te`'s own reload
         # already uses elsewhere in this file) is the fix -- same bounded "short window"
         # pattern as every other TE/transformer cycle in this file, not a new pattern.
+        def _restore_decode_steady_state():
+            # bnb-4bit mode: park the VAEs back on CPU, then reload the transformer that
+            # was dropped for the decode window, restoring the transformer+TE-nf4 steady
+            # state this mode keeps between requests. No-op in `none` mode (nothing was
+            # dropped for decode in that mode). 正常系だけでなく decode 例外時にも呼ぶ
+            # (下の try/except): 超短尺プローブ (2026-08-07) で「decode 例外 →
+            # transformer drop 済み・復元未実行のまま残留 → 後続リクエストが連鎖 OOM」を
+            # 実機再現したため、復元は例外経路でも必須(README「超短尺生成プローブ」)。
+            self._vae_to_cpu()
+            if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
+                with self._load_lock:
+                    self._ensure_transformer(progress)
+                    if force_free_te:
+                        # Restore the bnb-4bit steady state (transformer + TE-nf4 both
+                        # resident) for the *next* request -- this request force-freed TE-nf4
+                        # after encoding to make room for pass 2's activations (see above).
+                        # Reloaded after the transformer so the transformer's own reload above
+                        # (which needs headroom too, right after decode's own VAE trip) is not
+                        # competing with a simultaneous TE reload for VRAM.
+                        self._load_text_encoder(progress)
+            elif H3_LOWVRAM_GROUP:
+                # The transformer was never touched around decode in this mode (see the
+                # decode section's own comment), only TE-nf4 was force-freed there to make
+                # room for the vae pair -- reload it now to restore the
+                # transformer(group-offloaded)+TE-nf4 steady state this mode keeps between
+                # requests (unlike `H3_LOWVRAM=1` just below, this mode's transformer is
+                # cheap enough to always keep ready, so there is no reason to leave TE
+                # unloaded between requests either -- the *next* request needs TE first
+                # regardless of which big model "waits", and reloading it now means the next
+                # request does not pay TE's ~15-40s reload cost on its own critical path).
+                with self._load_lock:
+                    self._load_text_encoder(progress)
+            # H3_LOWVRAM: deliberately do NOT reload the transformer here. This mode's
+            # steady state between requests is "nothing big resident" (see the H3_LOWVRAM
+            # module comment) -- the *next* request needs TE first, not transformer, so
+            # preloading it now would just be evicted again at that request's own encode
+            # phase for no benefit, and would leave a 34GB resident model sitting idle
+            # between requests on a card that cannot spare it.
+
         if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_GROUP:
             self._free_transformer()
         elif H3_LOWVRAM_GROUP:
@@ -2991,75 +3156,73 @@ class MiniMaxH3Runner:
                 self._free_text_encoder(force=True)
         self._vae_to_gpu()
         t_decode = time.time()
-        video_decode_step = MiniMaxH3VideoDecodeStep()
-        _, state = video_decode_step(pipe, state)
-        audio_decode_step = MiniMaxH3AudioDecodeStep()
-        _, state = audio_decode_step(pipe, state)
-        decode_time = time.time() - t_decode
+        try:
+            # デバッグ専用・一回限り: decode 失敗時のクリーンアップ経路 (下の except) を
+            # 実機 E2E で通すための人為的な失敗注入。`pop` なので同一プロセスの次の
+            # リクエストからは通常動作に戻る(= 「失敗 → 次リクエストが正常に通る」の
+            # 復旧シナリオをサーバ再起動なしで検証できる)。通常運用では未設定。
+            if os.environ.pop("H3_DEBUG_FAIL_DECODE", None) == "1":
+                raise RuntimeError("H3_DEBUG_FAIL_DECODE=1: intentional decode failure (one-shot, cleanup-path test)")
+            video_decode_step = MiniMaxH3VideoDecodeStep()
+            _, state = video_decode_step(pipe, state)
+            audio_decode_step = MiniMaxH3AudioDecodeStep()
+            _, state = audio_decode_step(pipe, state)
+            decode_time = time.time() - t_decode
 
-        videos = state.get("videos")
-        audio = state.get("audio")
-        sampling_rate = state.get("sampling_rate")
+            videos = state.get("videos")
+            audio = state.get("audio")
+            sampling_rate = state.get("sampling_rate")
 
-        video_tensor = videos[0] if isinstance(videos, list) else videos
-        if video_tensor.dim() == 5:
-            video_tensor = video_tensor[0]
-        frames_uint8 = (
-            (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
-        )
-        audio_np = audio[0].float().cpu().numpy()
-        rms = float(np.sqrt(np.mean(audio_np**2)))
-        peak = float(np.max(np.abs(audio_np)))
+            video_tensor = videos[0] if isinstance(videos, list) else videos
+            if video_tensor.dim() == 5:
+                video_tensor = video_tensor[0]
+            frames_uint8 = (
+                (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+            )
+            audio_np = audio[0].float().cpu().numpy()
+            rms = float(np.sqrt(np.mean(audio_np**2)))
+            peak = float(np.max(np.abs(audio_np)))
 
-        peak_vram = torch.cuda.max_memory_allocated() / 1e9
+            peak_vram = torch.cuda.max_memory_allocated() / 1e9
 
-        # free the big activation buffers before muxing (CPU-bound, no need to hold onto GPU tensors)
-        del video_tensor, videos, audio
-        gc.collect()
-        torch.cuda.empty_cache()
+            # free the big activation buffers before muxing (CPU-bound, no need to hold onto GPU tensors)
+            del video_tensor, videos, audio
+            gc.collect()
+            torch.cuda.empty_cache()
+        except BaseException:
+            logger.exception(
+                "decode failed -- freeing partial buffers and restoring the steady state "
+                "before re-raising (so the next request does not inherit a corrupted resident set)"
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                _restore_decode_steady_state()
+            except Exception:
+                # 復元自体の失敗で元の decode 例外を潰さない(原因情報は元例外側にある)。
+                logger.exception("steady-state restore after decode failure also failed")
+            raise
 
-        # bnb-4bit mode: decode is done and frames/audio are already off-GPU (numpy
-        # above) -- park the VAEs back on CPU, then reload the transformer that was
-        # dropped for the decode window, restoring the transformer+TE-nf4 steady state
-        # this mode keeps between requests. No-op in `none` mode (nothing was dropped
-        # for decode in that mode).
-        self._vae_to_cpu()
-        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
-            with self._load_lock:
-                self._ensure_transformer(progress)
-                if force_free_te:
-                    # Restore the bnb-4bit steady state (transformer + TE-nf4 both
-                    # resident) for the *next* request -- this request force-freed TE-nf4
-                    # after encoding to make room for pass 2's activations (see above).
-                    # Reloaded after the transformer so the transformer's own reload above
-                    # (which needs headroom too, right after decode's own VAE trip) is not
-                    # competing with a simultaneous TE reload for VRAM.
-                    self._load_text_encoder(progress)
-        elif H3_LOWVRAM_GROUP:
-            # The transformer was never touched around decode in this mode (see the
-            # decode section's own comment), only TE-nf4 was force-freed there to make
-            # room for the vae pair -- reload it now to restore the
-            # transformer(group-offloaded)+TE-nf4 steady state this mode keeps between
-            # requests (unlike `H3_LOWVRAM=1` just below, this mode's transformer is
-            # cheap enough to always keep ready, so there is no reason to leave TE
-            # unloaded between requests either -- the *next* request needs TE first
-            # regardless of which big model "waits", and reloading it now means the next
-            # request does not pay TE's ~15-40s reload cost on its own critical path).
-            with self._load_lock:
-                self._load_text_encoder(progress)
-        # H3_LOWVRAM: deliberately do NOT reload the transformer here. This mode's
-        # steady state between requests is "nothing big resident" (see the H3_LOWVRAM
-        # module comment) -- the *next* request needs TE first, not transformer, so
-        # preloading it now would just be evicted again at that request's own encode
-        # phase for no benefit, and would leave a 34GB resident model sitting idle
-        # between requests on a card that cannot spare it.
+        _restore_decode_steady_state()
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
-        mode = "fl2va" if (image is not None or last_image is not None) else "t2va"
+        if still:
+            mode = "t2i"
+        else:
+            mode = "fl2va" if (image is not None or last_image is not None) else "t2va"
         job_stub = f"{mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
         _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+
+        # 静止画モード: 中央フレームを PNG として書き出す(超短尺 mp4 も上で保存済み。
+        # 別フレームを選び直したいときは mp4 から取り出せる)。
+        png_path = None
+        still_frame_index = None
+        if still:
+            still_frame_index = len(frames_uint8) // 2
+            png_path = self.output_dir / f"{job_stub}.png"
+            Image.fromarray(frames_uint8[still_frame_index]).save(png_path)
 
         result = {
             "prompt": prompt,
@@ -3080,6 +3243,11 @@ class MiniMaxH3Runner:
             "audio_sampling_rate": sampling_rate,
             "mp4_path": str(mp4_path),
             "mp4_filename": mp4_path.name,
+            "still": int(still),
+            "still_frames": still_frames if still else None,
+            "still_frame_index": still_frame_index,
+            "png_path": str(png_path) if png_path else None,
+            "png_filename": png_path.name if png_path else None,
             "total_elapsed_s": round(time.time() - t_start, 2),
             "mode": mode,
             "te_quant": TE_QUANT,
@@ -3110,7 +3278,7 @@ class MiniMaxH3Runner:
             "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
         }
         if progress:
-            progress.update(phase="done", message="完了", result_path=str(mp4_path))
+            progress.update(phase="done", message="完了", result_path=str(png_path) if png_path else str(mp4_path))
         logger.info("generation done: %s", json.dumps({k: v for k, v in result.items() if k != "ram"}, ensure_ascii=False))
         return result
 
@@ -3553,6 +3721,51 @@ class MiniMaxH3Runner:
         # above) in the non-group-mode branches, but H3_LOWVRAM_GROUP always has
         # `force_free_te=False` (transformer_ref's tiny footprint never needed it
         # before denoise) -- so it has to be freed here, at decode, instead.
+        def _restore_decode_steady_state_ref():
+            # generate() の `_restore_decode_steady_state()` と同じ役割の ref2va 版。
+            # 正常系と decode 例外時の両方から呼ぶ(例外時に復元しないと後続リクエストが
+            # 不整合な常駐セットを引き継いで連鎖 OOM する -- generate() 側の同名 closure の
+            # コメント参照)。
+            self._vae_to_cpu()
+            if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
+                with self._load_lock:
+                    self._ensure_transformer_ref(progress)
+                    if force_free_te:
+                        # Restore the bnb-4bit steady state (transformer_ref + TE-nf4 both
+                        # resident) for the *next* request -- this request force-freed TE-nf4
+                        # before denoise to make room for the reference-lengthened sequence's
+                        # attention activations (see above). Reloaded after transformer_ref so
+                        # the two big reloads are not competing for VRAM at the same time,
+                        # mirroring generate()'s own force_free_te reload ordering.
+                        self._load_text_encoder(progress)
+                    if H3_TRANSFORMER_BOTH_RESIDENT:
+                        # Restore the int8 both-resident steady state (`transformer` +
+                        # `transformer_ref` + TE-nf4 all resident) for the *next* request.
+                        # `transformer` (t2va's) was freed at this method's entry to make
+                        # room for the reference VAE-encode step and has stayed freed
+                        # through denoise/decode since (see the entry-section comment).
+                        # Now that decode's own vae-pair trip is done (`_vae_to_cpu()` just
+                        # above), there is headroom again: transformer_ref(34) + TE-nf4(21)
+                        # = 55GB resident, +34GB for this reload = 89GB, the same steady
+                        # state `generate()`'s own t2va path settles into. Reloaded last
+                        # (after transformer_ref/TE, whichever of those needed restoring)
+                        # so it is not competing with them for VRAM during their own
+                        # reloads.
+                        self._ensure_transformer(progress)
+            elif H3_LOWVRAM_GROUP:
+                # `transformer_ref` was force-freed unconditionally at this method's entry
+                # (see the entry-section comment) and is not reloaded here -- ref2va never
+                # keeps a cross-request transformer_ref steady state in this mode (matches
+                # plain bnb-4bit's own non-both-resident choice). TE-nf4 is reloaded though,
+                # for the same reasoning as generate()'s own t2va decode tail: the next
+                # request (t2va or ref2va) needs TE first regardless, so restoring it now
+                # avoids paying its reload cost on that request's own critical path.
+                with self._load_lock:
+                    self._load_text_encoder(progress)
+            # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
+            # "nothing big resident between requests" reasoning as generate()'s own
+            # lowvram decode tail.
+
         if TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
             self._free_transformer_ref()
         elif H3_LOWVRAM_GROUP:
@@ -3560,71 +3773,48 @@ class MiniMaxH3Runner:
                 self._free_text_encoder(force=True)
         self._vae_to_gpu()
         t_decode = time.time()
-        video_decode_step = MiniMaxH3VideoDecodeStep()
-        _, state = video_decode_step(pipe, state)
-        audio_decode_step = MiniMaxH3AudioDecodeStep()
-        _, state = audio_decode_step(pipe, state)
-        decode_time = time.time() - t_decode
+        try:
+            video_decode_step = MiniMaxH3VideoDecodeStep()
+            _, state = video_decode_step(pipe, state)
+            audio_decode_step = MiniMaxH3AudioDecodeStep()
+            _, state = audio_decode_step(pipe, state)
+            decode_time = time.time() - t_decode
 
-        videos = state.get("videos")
-        audio = state.get("audio")
-        sampling_rate = state.get("sampling_rate")
+            videos = state.get("videos")
+            audio = state.get("audio")
+            sampling_rate = state.get("sampling_rate")
 
-        video_tensor = videos[0] if isinstance(videos, list) else videos
-        if video_tensor.dim() == 5:
-            video_tensor = video_tensor[0]
-        frames_uint8 = (
-            (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
-        )
-        audio_np = audio[0].float().cpu().numpy()
-        rms = float(np.sqrt(np.mean(audio_np**2)))
-        peak = float(np.max(np.abs(audio_np)))
+            video_tensor = videos[0] if isinstance(videos, list) else videos
+            if video_tensor.dim() == 5:
+                video_tensor = video_tensor[0]
+            frames_uint8 = (
+                (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+            )
+            audio_np = audio[0].float().cpu().numpy()
+            rms = float(np.sqrt(np.mean(audio_np**2)))
+            peak = float(np.max(np.abs(audio_np)))
 
-        peak_vram = torch.cuda.max_memory_allocated() / 1e9
+            peak_vram = torch.cuda.max_memory_allocated() / 1e9
 
-        del video_tensor, videos, audio
-        gc.collect()
-        torch.cuda.empty_cache()
+            del video_tensor, videos, audio
+            gc.collect()
+            torch.cuda.empty_cache()
+        except BaseException:
+            logger.exception(
+                "ref2va decode failed -- freeing partial buffers and restoring the steady "
+                "state before re-raising (so the next request does not inherit a corrupted "
+                "resident set)"
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                _restore_decode_steady_state_ref()
+            except Exception:
+                # 復元自体の失敗で元の decode 例外を潰さない(原因情報は元例外側にある)。
+                logger.exception("steady-state restore after ref2va decode failure also failed")
+            raise
 
-        self._vae_to_cpu()
-        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
-            with self._load_lock:
-                self._ensure_transformer_ref(progress)
-                if force_free_te:
-                    # Restore the bnb-4bit steady state (transformer_ref + TE-nf4 both
-                    # resident) for the *next* request -- this request force-freed TE-nf4
-                    # before denoise to make room for the reference-lengthened sequence's
-                    # attention activations (see above). Reloaded after transformer_ref so
-                    # the two big reloads are not competing for VRAM at the same time,
-                    # mirroring generate()'s own force_free_te reload ordering.
-                    self._load_text_encoder(progress)
-                if H3_TRANSFORMER_BOTH_RESIDENT:
-                    # Restore the int8 both-resident steady state (`transformer` +
-                    # `transformer_ref` + TE-nf4 all resident) for the *next* request.
-                    # `transformer` (t2va's) was freed at this method's entry to make
-                    # room for the reference VAE-encode step and has stayed freed
-                    # through denoise/decode since (see the entry-section comment).
-                    # Now that decode's own vae-pair trip is done (`_vae_to_cpu()` just
-                    # above), there is headroom again: transformer_ref(34) + TE-nf4(21)
-                    # = 55GB resident, +34GB for this reload = 89GB, the same steady
-                    # state `generate()`'s own t2va path settles into. Reloaded last
-                    # (after transformer_ref/TE, whichever of those needed restoring)
-                    # so it is not competing with them for VRAM during their own
-                    # reloads.
-                    self._ensure_transformer(progress)
-        elif H3_LOWVRAM_GROUP:
-            # `transformer_ref` was force-freed unconditionally at this method's entry
-            # (see the entry-section comment) and is not reloaded here -- ref2va never
-            # keeps a cross-request transformer_ref steady state in this mode (matches
-            # plain bnb-4bit's own non-both-resident choice). TE-nf4 is reloaded though,
-            # for the same reasoning as generate()'s own t2va decode tail: the next
-            # request (t2va or ref2va) needs TE first regardless, so restoring it now
-            # avoids paying its reload cost on that request's own critical path.
-            with self._load_lock:
-                self._load_text_encoder(progress)
-        # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
-        # "nothing big resident between requests" reasoning as generate()'s own
-        # lowvram decode tail.
+        _restore_decode_steady_state_ref()
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
