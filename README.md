@@ -1233,11 +1233,57 @@ UI は Ref2VA タブの「バッチ連続生成(1行=1場面)」チェック(静
 なお int8 レシピ(`TorchAoConfig` + `Int8WeightOnlyConfig`)は abc5e9b に既に含まれて
 おり、**マージを待たずに使える**(`H3_TRANSFORMER_QUANT=int8` として実装済み)。
 
-### 2. Turbo LoRA 完成版のリリース待ち
+### 2. Turbo LoRA 完成版のリリース待ち → **lightx2v 版で解決の見込み(スパイク済み・未実装)**
 
-`H3_TURBO_LORA=1` の配線は完成済み(上記セクション参照)。現行LoRAは作者(Ostris氏)が
-「デモ/プレビュー、学習途上」と明記しているため既定OFF。**完成版が出たら、
-LoRAファイルの差し替えと同一seed A/Bだけで既定化を判断できる**状態にしてある。
+`H3_TURBO_LORA=1` の配線は完成済み(上記セクション参照)。現行LoRA(Ostris氏)は
+「デモ/プレビュー、学習途上」と明記されているため既定OFF、かつ**int8/低VRAMでは
+使用不可**(融合QKV前提 → `Int8Tensor` に `aten.cat` が無い)だった。
+
+2026-08-08、代替候補 **[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo)**
+(`minimax_h3_fl2v_turbo_4step_v0.1.safetensors`、1.38GB、Apache 2.0、DMD蒸留。
+Kijai/MiniMax-H3_comfy はこれのComfyUIリパック)をスパイクし、
+**48GB(int8)でも動くこと・4stepsで実用品質になることを実測で確認した**
+(`scripts/probe_lightx2v_turbo.py`、本体コードは無変更)。
+
+**決定的な違い: キーが diffusers ネイティブ**。safetensors ヘッダを直接読んで確認した
+ところ、キーは `transformer_blocks.N.attn.to_q.lora_A.default.weight` のように
+**to_q/to_k/to_v が分離**しており(rank 128、312モジュール = 50ブロック×6 +
+token_refiner 2ブロック×6、attn と ff のみで adaln/final_layer は含まない)、
+**`fuse_projections()` が不要**。`torch.cat` を一切呼ばないので、Ostris版を阻んでいた
+int8 非互換の主因を踏まない。実際 int8 の transformer に**312モジュール全てを0.6秒で
+適用でき、例外は出なかった**。`ff.net.0.proj` の `lora_B` は `(28672, 128)` で
+diffusers の SwiGLU(ゲート込み `dim_out*2`)と完全一致し、このLoRAが diffusers の
+モジュール構成そのものに対して学習されたことを裏付ける。
+
+**罠(最重要): strength は Kijai 記載の 0.75 ではなく ~0.094**。生の `B·A` に直接
+掛ける本実装の経路では、0.75 は**強すぎて 30 steps でも出力が完全にノイズ化する**
+(ステップ数の問題ではないことを 30steps で実証)。ComfyUI 側は alpha を折り込んで
+適用するため、`0.75 × (alpha/rank) = 0.75 × 16/128 ≈ 0.094` が対応値、という仮説が
+実測と一致した。
+
+| strength | 4steps の結果 | 音声 rms / peak |
+|---|---|---|
+| 0.75(Kijaiの記載値をそのまま) | **完全にノイズ**(30stepsでも同じ) | 0.083 / 0.43 |
+| 0.15 | 良好(背景がやや軟らかい) | 0.069 / 0.79 |
+| 0.10 | 良好 | 0.065 / **1.05(クリップ)** |
+| **0.094**(= 0.75 × 16/128) | **最良**(毛並み・松葉までシャープ) | 0.039 / 0.70 |
+
+**速度(RTX PRO 5000 48GB + `H3_LOWVRAM=1`、768²・5秒・seed 12345・同一プロンプト)**:
+デノイズ **197.7s → 26.1s(7.6倍)**、総所要 **351.4s → 135.2s(2.6倍)**。総所要の
+短縮率が小さいのは低VRAMモードのロード固定費(~110s)が残るため — バッチ経路と
+組み合わせればここも償却できる。時間方向の整合性も4フレーム抜き出しで確認済み(破綻なし)。
+
+**残る懸念**: 音声が基準比で**約5倍大きい**(基準 rms 0.0073 → 0.039)。スペクトル平坦度は
+0.24 と基準(0.34)より低く**白色雑音ではない**(構造がある)が、強度によっては peak が
+1.0 を超えてクリップする。実装するならレベル面の確認が要る。また `token_refiner` は
+int8 の除外リストに入っているため、**transformer_blocks は int8 ベース + bf16 デルタ、
+token_refiner は bf16 ベース + bf16 デルタ**という混在状態になる(適用・生成とも成功
+しているので実害は観測されていない)。
+
+**本実装は未着手**。必要な作業は (1) diffusers ネイティブ用の適用関数(キーマップ不要、
+`fuse_projections` を呼ばない)、(2) `_TurboLoRALinear` への strength 係数の追加、
+(3) int8/低VRAM との併用禁止ガードの緩和(Ostris版は禁止のまま維持)、(4) ref2va
+(`transformer_ref`)への適用可否の検証。
 
 ### 3. 未着手の改善候補(優先度順、いずれも急ぎではない)
 
