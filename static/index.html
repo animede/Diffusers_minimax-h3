@@ -509,10 +509,16 @@
           <option value="22">22フレーム (0.92秒・品質検証済みの既定)</option>
           <option value="5">5フレーム (0.21秒・実験的)</option>
         </select>
+        <div class="checkbox-row" style="margin-top:8px;">
+          <input type="checkbox" id="t2i-batch">
+          <label for="t2i-batch" style="margin:0;">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面)</label>
+        </div>
         <div class="hint">
           H3と<b>画風が完全に一致する静止画</b>を、FL2VAの先頭フレームやRef2VAの参照画像用に
           作るモード。生成時間は固定費支配のため専用T2Iモデルより遅い。超短尺mp4も一緒に
           保存され、PNGは中央フレーム(別フレームが欲しい場合はmp4から取り出せる)。
+          バッチはモデルロードを全場面で1回に償却する(低VRAMモードで特に有効。
+          seed・解像度・ステップは全場面共通)。
         </div>
       </div>
 
@@ -714,6 +720,7 @@ const fl2vaFields = document.getElementById('fl2va-fields');
 const ref2vaFields = document.getElementById('ref2va-fields');
 const t2iFields = document.getElementById('t2i-fields');
 const t2iFramesEl = document.getElementById('t2i-frames');
+const t2iBatchEl = document.getElementById('t2i-batch');
 const secondsColEl = document.getElementById('seconds-col');
 const upscaleRowEl = document.getElementById('upscale-row');
 const sizeRow = document.getElementById('size-row');
@@ -1393,9 +1400,16 @@ form.addEventListener('submit', async (ev) => {
     fd.append('seconds', secondsEl.value);
     if (upscaleEl && upscaleEl.checked) fd.append('upscale', '1');
   } else if (mode === 't2i') {
-    url = '/api/t2i';
     appendSize();
     fd.append('frames', t2iFramesEl.value);
+    if (t2iBatchEl.checked) {
+      // バッチ: プロンプト欄の1行=1場面として /api/t2i_batch へ (prompts を行数分 append)
+      url = '/api/t2i_batch';
+      const lines = prompt.split('\n').map(s => s.trim()).filter(Boolean);
+      lines.forEach(l => fd.append('prompts', l));
+    } else {
+      url = '/api/t2i';
+    }
   } else if (mode === 'fl2va') {
     url = '/api/fl2va';
     appendSize();
@@ -1437,7 +1451,7 @@ form.addEventListener('submit', async (ev) => {
     }
     setStatus('完了');
     progressInner.style.width = '100%';
-    renderResult(data);
+    if (data.mode === 't2i_batch') renderBatchResult(data); else renderResult(data);
     refreshGallery();
   } catch (e) {
     setStatus('エラー: ' + e.message, true);
@@ -1484,6 +1498,38 @@ function renderResult(data) {
   `;
   // プロンプトはテキストとして安全に挿入(HTMLエスケープ回避)
   resultArea.querySelector('.used-prompt-body').textContent = data.prompt || promptEl.value;
+}
+
+function renderBatchResult(data) {
+  const head = document.createElement('div');
+  head.className = 'result-meta';
+  head.innerHTML = `
+    <div><b>モード:</b> t2i_batch (${data.num_scenes}場面) / <b>1枚あたり:</b> ${data.per_image_s}s / <b>合計:</b> ${data.total_elapsed_s}s</div>
+    <div><b>解像度:</b> ${data.width}×${data.height} / <b>フレーム数:</b> ${data.num_frames} / <b>ステップ:</b> ${data.num_inference_steps} / <b>seed:</b> ${data.seed ?? '(random)'}</div>
+    ${data.encode_time_s != null ? `<div><b>位相内訳:</b> エンコード ${data.encode_time_s}s / デノイズ ${data.denoise_time_s}s / デコード ${data.decode_time_s}s / ピークVRAM ${data.peak_vram_gb}GB</div>` : ''}
+  `;
+  resultArea.innerHTML = '';
+  resultArea.appendChild(head);
+  data.scenes.forEach((s, i) => {
+    const box = document.createElement('div');
+    box.style.marginBottom = '12px';
+    const img = document.createElement('img');
+    img.src = s.image_url;
+    img.style.maxWidth = '100%';
+    img.style.borderRadius = '8px';
+    img.alt = `場面 ${i + 1}`;
+    const meta = document.createElement('div');
+    meta.className = 'result-meta';
+    meta.innerHTML = `<div><b>場面 ${i + 1}:</b> <a class="dl-link" href="${s.image_url}" download>PNG</a>
+      <a class="dl-link" href="${s.video_url}" download>mp4</a> / デノイズ ${s.denoise_time_s}s</div>`;
+    const promptLine = document.createElement('div');
+    promptLine.className = 'hint';
+    promptLine.textContent = s.prompt;  // プロンプトはテキストとして安全に挿入
+    box.appendChild(img);
+    box.appendChild(meta);
+    box.appendChild(promptLine);
+    resultArea.appendChild(box);
+  });
 }
 
 // ============================================================================

@@ -33,6 +33,7 @@ from core.llm import (
 )
 from core.runner import (
     FPS,
+    H3_LOWVRAM,
     H3_TURBO_LORA,
     H3_TURBO_STEPS_DEFAULT,
     MAX_SECONDS,
@@ -369,6 +370,124 @@ def api_t2i(
         still_frames=frames,
     )
     return JSONResponse(result)
+
+
+# 1バッチの場面数上限。場面ごとに増えるGPU/RAM負担は潜在+prompt_embedsのみ(数十MB/場面)
+# なので技術的にはもっと積めるが、1リクエストが長くなりすぎるとHTTPタイムアウトや
+# 途中失敗時の損失が大きくなるため、物語用途に十分な数で切る。
+STILL_BATCH_MAX = 24
+
+
+@app.post("/api/t2i_batch")
+def api_t2i_batch(
+    prompts: list[str] = Form(...),
+    resolution: str = Form("768x768"),
+    frames: int = Form(22),
+    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    seed: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
+):
+    """静止画のバッチ生成: プロンプト配列 (multipart で `prompts` を複数回送る) から
+    場面ごとの PNG を連続生成する(物語の場面画像用)。
+
+    `H3_LOWVRAM=1` ではモデルロードの固定費 (~120s) をバッチ全体で1回に償却する
+    位相並べ替え (core/runner.py の generate_still_batch) を使う。それ以外のモードは
+    大モデルが常駐していて位相並べ替えの利得がないため、逐次 generate() で同じ
+    レスポンス形式を返す。seed は全場面共通(手動で同一 seed を N 回叩くのと同じ)。
+    解像度・フレーム数・ステップ数も全場面共通で、変えられるのはプロンプトのみ。
+    """
+    if frames not in STILL_FRAME_CHOICES:
+        raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
+    cleaned = [p.strip() for p in prompts if p and p.strip()]
+    if not cleaned:
+        raise HTTPException(400, "prompts が空です (空でないプロンプトを1つ以上)")
+    if len(cleaned) > STILL_BATCH_MAX:
+        raise HTTPException(400, f"prompts は最大 {STILL_BATCH_MAX} 場面です: {len(cleaned)}")
+    if (height is None) != (width is None):
+        raise HTTPException(400, "height と width は両方指定してください(片方だけの指定は不可)")
+    if height is not None:
+        height = round_canvas_value(height)
+        width = round_canvas_value(width)
+    else:
+        if resolution not in RESOLUTION_PRESETS:
+            raise HTTPException(400, f"unknown resolution preset: {resolution}")
+        height, width = RESOLUTION_PRESETS[resolution]
+
+    acquired = _generation_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
+
+    global _current_progress
+    job_id = uuid.uuid4().hex[:12]
+    progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
+    with _progress_guard:
+        _current_progress = progress
+
+    try:
+        if H3_LOWVRAM:
+            result = runner.generate_still_batch(
+                prompts=cleaned,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                seed=seed,
+                still_frames=frames,
+                progress=progress,
+                cache=cache,
+                cache_threshold=cache_threshold,
+                attn=attn,
+                turbo=turbo,
+            )
+        else:
+            # 常駐モード (bnb-4bit 既定 / group / none): 逐次 generate() でも固定費は
+            # ほぼ増えないので、同じレスポンス形式に詰め替えて返す。
+            t0 = time.time()
+            scenes = []
+            for idx, p in enumerate(cleaned):
+                progress.update(message=f"場面 {idx + 1}/{len(cleaned)} を生成中...")
+                r = runner.generate(
+                    prompt=p, height=height, width=width, seconds=0.0,
+                    num_inference_steps=num_inference_steps, seed=seed,
+                    progress=progress, cache=cache, cache_threshold=cache_threshold,
+                    attn=attn, turbo=turbo, still=True, still_frames=frames,
+                )
+                scenes.append({
+                    "prompt": p,
+                    "png_path": r["png_path"], "png_filename": r["png_filename"],
+                    "mp4_path": r["mp4_path"], "mp4_filename": r["mp4_filename"],
+                    "still_frame_index": r["still_frame_index"],
+                    "denoise_time_s": r["denoise_time_s"],
+                    "avg_step_time_s": r["avg_step_time_s"],
+                    "cache_skipped_steps": r["cache_skipped_steps"],
+                })
+            total = time.time() - t0
+            result = {
+                "mode": "t2i_batch", "num_scenes": len(cleaned),
+                "height": height, "width": width,
+                "num_frames": frames, "still_frames": frames, "duration_s": frames / FPS,
+                "num_inference_steps": num_inference_steps, "seed": seed,
+                "total_elapsed_s": round(total, 2),
+                "per_image_s": round(total / len(cleaned), 2),
+                "scenes": scenes,
+            }
+        result["job_id"] = job_id
+        for scene in result["scenes"]:
+            scene["image_url"] = f"/outputs/{scene['png_filename']}"
+            scene["video_url"] = f"/outputs/{scene['mp4_filename']}"
+        return JSONResponse(result)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("t2i_batch generation failed")
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(500, f"t2i_batch generation failed: {e}")
+    finally:
+        _generation_lock.release()
 
 
 @app.post("/api/fl2va")
