@@ -968,14 +968,32 @@ H3公式ガイドの形式へ整形する。クラウド版Hailuo AIの内部プ
 
 - 接続先: 環境変数 `H3_LLM_URL`(既定 `http://127.0.0.1:64650`)。接続不可時は502
   (生成機能には影響しない)
-- `POST /api/prompt/enhance` {text, mode, seconds}
+- `POST /api/prompt/enhance` {text, mode, seconds, task, lang}
 - モード(UIの「LLM強化」ボタン+モード選択):
   - `storyboard`(既定): マルチショットのCUTタイムコード形式へ展開(総尺=seconds、2〜3カット、
-    ハードカット・被写体同一性維持・カット毎の音指示。焦点距離は35/50/65/100mmに制限)
+    ハードカット・被写体同一性維持・カット毎の音指示。焦点距離は35/50/65/100mmに制限)。
+    これはH3公式ドキュメントの記法ではなく本アプリの独自案(下記 `h3-official` 参照)
   - `brief`: 公式ブリーフ形式(シーン→被写体→アクション→カメラ→音→終わり方)の単一ショット詳細化
+  - `h3-official`(2026-08-07追加): MiniMax公式スキル `h3-prompt-writing`
+    (`MiniMax-AI/MiniMax-H3` リポジトリの `skills/h3-prompt-writing/`)のフィールド構造・
+    記法へ厳密準拠。`task`(UIの現在のタブ = t2va/fl2va/ref2va)で参照ガイドを切替える:
+    t2va/fl2va は `references/base-en.txt` の3フィールド形式
+    (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`、
+    `[Shot N] At MM:SS.SS` のカット記法・`<d>[言語] ...</d>` の台詞逐語保持)、ref2va は
+    `references/ref-en.txt` の6フィールド形式(`subject_definitions` / `summary` /
+    `retention_analysis` / `detailed_description` / `overall_soundscape` /
+    `non_diegetic_music`)。出力は公式既定の英語(`lang=en`)、`lang=ja` で書き換え本文のみ
+    日本語化も可能(フィールド名・`[Shot n]`等のラベル・タイムコード記法・`<d>`内の台詞は
+    公式ルールどおり英語/原語のまま)。リファレンス本文は本リポジトリに同梱しない
+    (ライセンス表記が無いリポジトリのため)。`venv/bin/python scripts/fetch_h3_skill.py`
+    で `skills_cache/`(.gitignore 済み)へ事前取得しておく必要があり、未取得時は
+    400+取得コマンド案内のエラーになる。システムプロンプトはSKILL.md+参照ガイド全文を
+    要約せず投入(約18.8KB=t2va/fl2va、約26.6KB=ref2va)。
   - `translate`: 過剰創作なしの英訳(CUT構造は保持)
 - 強化結果はプロンプト欄を置き換え(編集可)、「元に戻す」で1世代復元。生成結果には
   使用プロンプト全文を折りたたみ表示(強化あり/なし・モード間の比較評価用)
 - UIに手書き用「プロンプトガイド」チートシート(公式ブリーフ構造・CUT記法・実測カット精度±1秒)を同梱
-- 実LLM検証済み(gemma4-31B Q4_K_M): 3モードとも形式に従うことを確認(storyboardは
-  タイムコード合計・焦点距離制限も遵守、応答11〜17秒)
+- 実LLM検証済み(gemma4-31B Q4_K_M): 3モード(brief/storyboard/translate)とも形式に従う
+  ことを確認(storyboardはタイムコード合計・焦点距離制限も遵守、応答11〜17秒)。
+  `h3-official` は2026-08-07追加時点でLLMサーバ未接続のため生成A/Bのみ実施(下記参照)、
+  LLM経由での実応答確認は別途必要

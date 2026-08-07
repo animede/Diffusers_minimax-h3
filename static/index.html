@@ -460,12 +460,17 @@
         <select id="enhance-mode" title="強化モード">
           <option value="storyboard">ストーリーボード(カット割り)</option>
           <option value="brief">ブリーフ詳細化(単一ショット)</option>
+          <option value="h3-official">公式仕様(h3-prompt-writing)</option>
           <option value="translate">英訳のみ</option>
+        </select>
+        <select id="enhance-lang" title="出力言語" style="display:none;">
+          <option value="en">英語(公式既定)</option>
+          <option value="ja">日本語</option>
         </select>
         <button type="button" class="llm-btn" id="enhance-btn">LLM強化</button>
         <button type="button" class="llm-btn" id="undo-btn" style="display:none;">元に戻す</button>
       </div>
-      <div class="hint">LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。</div>
+      <div class="hint" id="enhance-hint">LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。</div>
 
       <details class="guide">
         <summary>プロンプトガイド(手書き用チートシート)</summary>
@@ -1096,9 +1101,26 @@ refDropzoneEl.addEventListener('drop', (e) => {
 
 // --- LLMプロンプト強化 ---
 const enhanceModeEl = document.getElementById('enhance-mode');
+const enhanceLangEl = document.getElementById('enhance-lang');
+const enhanceHintEl = document.getElementById('enhance-hint');
 const enhanceBtn = document.getElementById('enhance-btn');
 const undoBtn = document.getElementById('undo-btn');
 let promptBackup = null;
+
+const ENHANCE_HINTS = {
+  'storyboard': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
+  'brief': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
+  'translate': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
+  'h3-official': 'MiniMax公式 h3-prompt-writing スキル(SKILL.md + references)のフィールド構造・記法に厳密準拠します。現在選択中のタブ(T2VA/FL2VA/Ref2VA)を task として送ります。skills_cache/ 未取得の場合は scripts/fetch_h3_skill.py の実行を促すエラーになります。',
+};
+
+function updateEnhanceModeUI() {
+  const isOfficial = enhanceModeEl.value === 'h3-official';
+  enhanceLangEl.style.display = isOfficial ? '' : 'none';
+  enhanceHintEl.textContent = ENHANCE_HINTS[enhanceModeEl.value] || ENHANCE_HINTS['storyboard'];
+}
+enhanceModeEl.addEventListener('change', updateEnhanceModeUI);
+updateEnhanceModeUI();
 
 enhanceBtn.addEventListener('click', async () => {
   const text = promptEl.value.trim();
@@ -1110,6 +1132,8 @@ enhanceBtn.addEventListener('click', async () => {
     fd.append('text', text);
     fd.append('mode', enhanceModeEl.value);
     fd.append('seconds', secondsEl.value || '10');
+    fd.append('task', mode); // t2va/fl2va/ref2va タブ (h3-official モードのみ使用)
+    fd.append('lang', enhanceLangEl.value || 'en');
     const res = await fetch('/api/prompt/enhance', { method: 'POST', body: fd });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || JSON.stringify(data));

@@ -22,7 +22,15 @@ from PIL import Image
 
 import core.gallery as gallery
 import core.settings as settings
-from core.llm import LLMConnectionError, VALID_MODES, enhance_prompt, get_llm_url
+from core.llm import (
+    H3SkillNotFetchedError,
+    LLMConnectionError,
+    VALID_H3_OFFICIAL_LANGS,
+    VALID_H3_OFFICIAL_TASKS,
+    VALID_MODES,
+    enhance_prompt,
+    get_llm_url,
+)
 from core.runner import (
     FPS,
     H3_TURBO_LORA,
@@ -495,24 +503,38 @@ def api_prompt_enhance(
     text: str = Form(...),
     mode: str = Form("storyboard"),
     seconds: float = Form(10.0),
+    task: str = Form("t2va"),
+    lang: str = Form("en"),
 ):
     """ローカルLLM(H3_LLM_URL)でプロンプトをH3向けに整形する。
 
     GPU生成ロックとは無関係(生成中でも呼べる)。mode: brief(公式ブリーフ詳細化)/
-    storyboard(マルチショットのCUTタイムコード形式、seconds に整合)/ translate(英訳のみ)。
+    storyboard(マルチショットのCUTタイムコード形式、seconds に整合)/ translate(英訳のみ)/
+    h3-official(MiniMax公式 h3-prompt-writing スキルのフィールド構造・記法に厳密準拠)。
+    task と lang は mode="h3-official" のときのみ使用する。
+    task: t2va/fl2va(base-en.txt の3フィールド形式)/ ref2va(ref-en.txt の6フィールド形式)。
+    lang: en(既定、公式どおり英語)/ ja(書き換え本文を日本語にするが、フィールド名・記法・
+    <d>タグ内の台詞は公式ルールどおり原語/英語のまま)。
     """
     if not text or not text.strip():
         raise HTTPException(400, "text is required")
     if mode not in VALID_MODES:
         raise HTTPException(400, f"mode は {VALID_MODES} のいずれかです: {mode!r}")
+    if mode == "h3-official":
+        if task not in VALID_H3_OFFICIAL_TASKS:
+            raise HTTPException(400, f"task は {VALID_H3_OFFICIAL_TASKS} のいずれかです: {task!r}")
+        if lang not in VALID_H3_OFFICIAL_LANGS:
+            raise HTTPException(400, f"lang は {VALID_H3_OFFICIAL_LANGS} のいずれかです: {lang!r}")
     t0 = time.time()
     try:
-        result = enhance_prompt(text.strip(), mode, seconds=seconds)
+        result = enhance_prompt(text.strip(), mode, seconds=seconds, task=task, lang=lang)
     except LLMConnectionError as e:
         raise HTTPException(502, f"LLMサーバに接続できません(H3_LLM_URL={get_llm_url()}): {e}")
+    except H3SkillNotFetchedError as e:
+        raise HTTPException(400, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"result": result, "mode": mode, "elapsed_s": time.time() - t0}
+    return {"result": result, "mode": mode, "task": task, "lang": lang, "elapsed_s": time.time() - t0}
 
 
 @app.get("/api/outputs")
