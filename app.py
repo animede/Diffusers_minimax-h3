@@ -578,6 +578,8 @@ def api_ref2va(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    still: int = Form(0),
+    frames: int = Form(22),
 ):
     """ref2va: 画像最大9・動画最大3・音声最大3(計12参照)からの動画+音声生成。
 
@@ -589,6 +591,11 @@ def api_ref2va(
 
     cache/cache_threshold/attn/turbo は即反映(再ロード不要)の任意パラメータ
     (transformer_ref へ適用される)。
+
+    still=1 は参照付き静止画モード (ref2i): seconds を無視して frames (22既定|5) の
+    超短尺を生成し、中央フレームPNGを書き出す(レスポンスに image_url が付く)。
+    キャラクター参照から場面ごとの一貫した静止画を作る用途(README
+    「スパイク: Ref2VA×超短尺」参照)。
     """
     global _current_progress
 
@@ -596,6 +603,8 @@ def api_ref2va(
         raise HTTPException(400, "prompt is required")
     if not references:
         raise HTTPException(400, "references is required (at least one image/video/audio file)")
+    if still and frames not in STILL_FRAME_CHOICES:
+        raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
     if (height is None) != (width is None):
         raise HTTPException(400, "height と width は両方指定するか、両方省略してください")
     # 32の倍数でない値はエラーにせず丸める(t2va/fl2va と同じ方針。省略時はサーバが
@@ -604,7 +613,10 @@ def api_ref2va(
         height = round_canvas_value(height)
         width = round_canvas_value(width)
     # 秒数も許容範囲へ丸める(省略時は音声参照1本からサーバが導出する)。
-    if seconds is not None:
+    # 静止画モードでは seconds は使わない (frames が尺を決める)。
+    if still:
+        seconds = None
+    elif seconds is not None:
         seconds = max(MIN_SECONDS, min(MAX_SECONDS, float(seconds)))
 
     # Each upload is spooled to a real temp file: MiniMaxH3Reference(image=path) /
@@ -656,9 +668,13 @@ def api_ref2va(
                 cache_threshold=cache_threshold,
                 attn=attn,
                 turbo=turbo,
+                still=bool(still),
+                still_frames=frames,
             )
             result["job_id"] = job_id
             result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
+            if result.get("png_filename"):
+                result["image_url"] = f"/outputs/{result['png_filename']}"
             return JSONResponse(result)
         except ValueError as e:
             raise HTTPException(400, str(e))
@@ -666,6 +682,140 @@ def api_ref2va(
             logger.exception("ref2va generation failed")
             progress.update(phase="error", error=str(e))
             raise HTTPException(500, f"ref2va generation failed: {e}")
+        finally:
+            _generation_lock.release()
+    finally:
+        for tmp_path in tmp_paths:
+            tmp_path.unlink(missing_ok=True)
+
+
+@app.post("/api/ref2i_batch")
+def api_ref2i_batch(
+    prompts: list[str] = Form(...),
+    references: list[UploadFile] = File(...),
+    frames: int = Form(22),
+    num_inference_steps: int = Form(30),
+    seed: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    cache: Optional[str] = Form(None),
+    cache_threshold: Optional[float] = Form(None),
+    attn: Optional[str] = Form(None),
+    turbo: Optional[bool] = Form(None),
+):
+    """参照付き静止画のバッチ生成: 共通の references + プロンプト配列から、
+    キャラクター一貫の場面静止画を連続生成する(/api/t2i_batch の ref2va 版)。
+
+    `H3_LOWVRAM=1` ではモデルロード固定費をバッチ全体で1回に償却する位相並べ替え
+    (core/runner.py の generate_ref2i_batch) を使い、他モードは逐次
+    generate_ref2va(still=True) で同じレスポンス形式を返す。参照・seed・解像度・
+    フレーム数・ステップ数は全場面共通(変えられるのはプロンプトのみ)。
+    """
+    global _current_progress
+
+    if frames not in STILL_FRAME_CHOICES:
+        raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
+    cleaned = [p.strip() for p in prompts if p and p.strip()]
+    if not cleaned:
+        raise HTTPException(400, "prompts が空です (空でないプロンプトを1つ以上)")
+    if len(cleaned) > STILL_BATCH_MAX:
+        raise HTTPException(400, f"prompts は最大 {STILL_BATCH_MAX} 場面です: {len(cleaned)}")
+    if not references:
+        raise HTTPException(400, "references is required (at least one image/video/audio file)")
+    if (height is None) != (width is None):
+        raise HTTPException(400, "height と width は両方指定するか、両方省略してください")
+    if height is not None:
+        height = round_canvas_value(height)
+        width = round_canvas_value(width)
+
+    # 参照のスプールと構築は /api/ref2va と同じ手順 (tmp ファイル → MiniMaxH3Reference)。
+    tmp_paths: list[Path] = []
+    built_references = []
+    try:
+        for upload in references:
+            kind = _detect_reference_kind(upload)
+            suffix = Path(upload.filename or "").suffix or {"image": ".png", "video": ".mp4", "audio": ".wav"}[kind]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir="/tmp") as tmp:
+                tmp.write(upload.file.read())
+                tmp_path = Path(tmp.name)
+            tmp_paths.append(tmp_path)
+            try:
+                if kind == "image":
+                    built_references.append(MiniMaxH3Reference(image=str(tmp_path)))
+                elif kind == "video":
+                    built_references.append(MiniMaxH3Reference(video=str(tmp_path)))
+                else:
+                    built_references.append(MiniMaxH3Reference(audio=str(tmp_path)))
+            except Exception as e:
+                raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
+
+        acquired = _generation_lock.acquire(blocking=False)
+        if not acquired:
+            raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
+
+        job_id = uuid.uuid4().hex[:12]
+        progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
+        with _progress_guard:
+            _current_progress = progress
+
+        try:
+            if H3_LOWVRAM:
+                result = runner.generate_ref2i_batch(
+                    prompts=cleaned,
+                    references=built_references,
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    seed=seed,
+                    still_frames=frames,
+                    progress=progress,
+                    cache=cache,
+                    cache_threshold=cache_threshold,
+                    attn=attn,
+                    turbo=turbo,
+                )
+            else:
+                # 常駐モード: 逐次 generate_ref2va(still=True) でも固定費はほぼ増えない。
+                t0 = time.time()
+                scenes = []
+                for idx, p in enumerate(cleaned):
+                    progress.update(message=f"場面 {idx + 1}/{len(cleaned)} を生成中...")
+                    r = runner.generate_ref2va(
+                        prompt=p, references=built_references, height=height, width=width,
+                        seconds=None, num_inference_steps=num_inference_steps, seed=seed,
+                        progress=progress, cache=cache, cache_threshold=cache_threshold,
+                        attn=attn, turbo=turbo, still=True, still_frames=frames,
+                    )
+                    scenes.append({
+                        "prompt": p,
+                        "png_path": r["png_path"], "png_filename": r["png_filename"],
+                        "mp4_path": r["mp4_path"], "mp4_filename": r["mp4_filename"],
+                        "still_frame_index": r["still_frame_index"],
+                        "denoise_time_s": r["denoise_time_s"],
+                        "avg_step_time_s": r["avg_step_time_s"],
+                        "cache_skipped_steps": r["cache_skipped_steps"],
+                    })
+                total = time.time() - t0
+                result = {
+                    "mode": "ref2i_batch", "num_scenes": len(cleaned),
+                    "height": height, "width": width,
+                    "num_frames": frames, "still_frames": frames, "duration_s": frames / FPS,
+                    "num_inference_steps": num_inference_steps, "seed": seed,
+                    "total_elapsed_s": round(total, 2),
+                    "per_image_s": round(total / len(cleaned), 2),
+                    "scenes": scenes,
+                }
+            result["job_id"] = job_id
+            for scene in result["scenes"]:
+                scene["image_url"] = f"/outputs/{scene['png_filename']}"
+                scene["video_url"] = f"/outputs/{scene['mp4_filename']}"
+            return JSONResponse(result)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            logger.exception("ref2i_batch generation failed")
+            progress.update(phase="error", error=str(e))
+            raise HTTPException(500, f"ref2i_batch generation failed: {e}")
         finally:
             _generation_lock.release()
     finally:

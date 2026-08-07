@@ -546,6 +546,24 @@
           </div>
         </div>
         <div id="ref-order-line" class="hint" style="margin-top:6px;"></div>
+
+        <div class="checkbox-row" style="margin-top:8px;">
+          <input type="checkbox" id="ref2va-still">
+          <label for="ref2va-still" style="margin:0;">静止画 (超短尺→中央フレームPNG)</label>
+          <select id="ref2va-frames" style="width:auto;">
+            <option value="22">22フレーム (0.92秒・検証済み)</option>
+            <option value="5">5フレーム (0.21秒・実験的)</option>
+          </select>
+        </div>
+        <div class="checkbox-row" id="ref2va-batch-row" style="display:none;">
+          <input type="checkbox" id="ref2va-batch">
+          <label for="ref2va-batch" style="margin:0;">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面)</label>
+        </div>
+        <div class="hint" id="ref2va-still-hint" style="display:none;">
+          キャラクター参照から<b>場面ごとの一貫した静止画</b>を作るモード(参照・seed・
+          解像度は全場面共通)。秒数は使いません。作った静止画は FL2VA の先頭フレームや
+          次の Ref2VA の参照に回せます。
+        </div>
       </div>
 
       <div class="row" id="size-row">
@@ -721,6 +739,11 @@ const ref2vaFields = document.getElementById('ref2va-fields');
 const t2iFields = document.getElementById('t2i-fields');
 const t2iFramesEl = document.getElementById('t2i-frames');
 const t2iBatchEl = document.getElementById('t2i-batch');
+const ref2vaStillEl = document.getElementById('ref2va-still');
+const ref2vaFramesEl = document.getElementById('ref2va-frames');
+const ref2vaBatchRowEl = document.getElementById('ref2va-batch-row');
+const ref2vaBatchEl = document.getElementById('ref2va-batch');
+const ref2vaStillHintEl = document.getElementById('ref2va-still-hint');
 const secondsColEl = document.getElementById('seconds-col');
 const upscaleRowEl = document.getElementById('upscale-row');
 const sizeRow = document.getElementById('size-row');
@@ -883,9 +906,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     fl2vaFields.style.display = (mode === 'fl2va') ? 'block' : 'none';
     ref2vaFields.style.display = (mode === 'ref2va') ? 'block' : 'none';
     t2iFields.style.display = (mode === 't2i') ? 'block' : 'none';
-    // 静止画モードはフレーム数選択が尺を決める(秒数不使用)。upscale も未検証のため隠す。
-    secondsColEl.style.display = (mode === 't2i') ? 'none' : '';
-    upscaleRowEl.style.display = (mode === 't2i') ? 'none' : '';
+    updateStillControls();
     // Ref2VA references never bind the target canvas (each is prepared at its own
     // resolution -- see packing_ref2va.py's module docstring)。既定は H3 自身の 16:9
     // (height/width を送らない = "auto")だが、/api/ref2va は height/width を任意で
@@ -900,6 +921,19 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     updateCustomSizeVisibility();
   });
 });
+
+// 静止画系の表示制御: T2I タブと「Ref2VA + 静止画チェック」は秒数を使わない
+// (フレーム数が尺を決める)。upscale は T2I では未検証のため隠す。
+function updateStillControls() {
+  const ref2vaStill = (mode === 'ref2va') && ref2vaStillEl.checked;
+  secondsColEl.style.display = (mode === 't2i' || ref2vaStill) ? 'none' : '';
+  upscaleRowEl.style.display = (mode === 't2i') ? 'none' : '';
+  ref2vaBatchRowEl.style.display = ref2vaStill ? '' : 'none';
+  ref2vaStillHintEl.style.display = ref2vaStill ? '' : 'none';
+  ref2vaFramesEl.style.display = ref2vaStillEl.checked ? '' : 'none';
+}
+ref2vaStillEl.addEventListener('change', updateStillControls);
+updateStillControls();
 
 function _refKindLabel(file) {
   const ct = (file.type || '').toLowerCase();
@@ -1438,9 +1472,21 @@ form.addEventListener('submit', async (ev) => {
       fd.append('height', h);
       fd.append('width', w);
     }
-    // Seconds may be left blank for Ref2VA (server derives it from a lone
-    // audio-bearing reference); only send it when the user filled it in.
-    if (secondsEl.value) fd.append('seconds', secondsEl.value);
+    if (ref2vaStillEl.checked) {
+      // 参照付き静止画 (ref2i): 秒数は送らない (frames が尺を決める)
+      fd.append('frames', ref2vaFramesEl.value);
+      if (ref2vaBatchEl.checked) {
+        url = '/api/ref2i_batch';
+        const lines = prompt.split('\n').map(s => s.trim()).filter(Boolean);
+        lines.forEach(l => fd.append('prompts', l));
+      } else {
+        fd.append('still', '1');
+      }
+    } else {
+      // Seconds may be left blank for Ref2VA (server derives it from a lone
+      // audio-bearing reference); only send it when the user filled it in.
+      if (secondsEl.value) fd.append('seconds', secondsEl.value);
+    }
   }
 
   try {
@@ -1451,7 +1497,7 @@ form.addEventListener('submit', async (ev) => {
     }
     setStatus('完了');
     progressInner.style.width = '100%';
-    if (data.mode === 't2i_batch') renderBatchResult(data); else renderResult(data);
+    if (data.mode === 't2i_batch' || data.mode === 'ref2i_batch') renderBatchResult(data); else renderResult(data);
     refreshGallery();
   } catch (e) {
     setStatus('エラー: ' + e.message, true);

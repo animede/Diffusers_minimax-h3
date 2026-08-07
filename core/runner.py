@@ -3597,10 +3597,20 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
+        still: bool = False,
+        still_frames: int = 22,
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
         `MiniMaxH3Reference` images/videos/audio clips (up to 9/3/3, 12 total).
+
+        `still=True` は参照付き静止画モード (ref2i): `seconds` を無視して `still_frames`
+        (STILL_FRAME_CHOICES) の超短尺を生成し、中央フレームを PNG に書き出す。
+        キャラクター参照から場面ごとの一貫した静止画を作る用途
+        (2026-08-07 のスパイク `scripts/probe_ref2va_short.py` で品質成立を実証済み。
+        README「スパイク: Ref2VA×超短尺」参照)。generate() の still と同じ3点セット
+        (setup step の間だけの尺ゲート緩和・VAE 小クリップ修正・既存の decode 例外
+        クリーンアップ) で動く。
 
         `seconds=None` is only valid when `references` carries exactly one audio-bearing
         reference (a lone audio reference, or a video reference with a soundtrack) -- the
@@ -3660,7 +3670,19 @@ class MiniMaxH3Runner:
                 "An audio reference has to be paired with at least one image or video reference and cannot be "
                 "used on its own."
             )
-        num_frames = None if seconds is None else seconds_to_num_frames(seconds)
+        if still:
+            if still_frames not in STILL_FRAME_CHOICES:
+                raise ValueError(f"still_frames must be one of {STILL_FRAME_CHOICES}, got {still_frames}")
+            if still_frames == 5 and not H3_VAE_SMALLCLIP_FIX:
+                raise ValueError(
+                    "still_frames=5 には H3_VAE_SMALLCLIP_FIX=1 (既定) が必要です "
+                    "(潜在2フレームのデコードは上流のチャンク境界バグで落ちるため)。"
+                )
+            # 音声参照からの尺自動導出 (seconds=None 時の Ref2VASetupStep の挙動) と
+            # 静止画の固定超短尺は両立しない -- 静止画では常に still_frames が尺を決める。
+            num_frames = still_frames
+        else:
+            num_frames = None if seconds is None else seconds_to_num_frames(seconds)
 
         with self._load_lock:
             # Free `transformer` (t2va's, if resident) now, but do NOT load
@@ -3755,7 +3777,13 @@ class MiniMaxH3Runner:
         # resolution -- see packing_ref2va.py's module docstring), and the frame count is
         # resolved from a lone audio-bearing reference when `num_frames` was left None.
         setup_step = MiniMaxH3Ref2VASetupStep()
-        _, state = setup_step(pipe, state)
+        if still:
+            # 超短尺 (5秒未満) は setup step の duration バリデーションが弾くため、
+            # generate() の still と同じくこの1呼び出しの間だけ緩和する。
+            with _relaxed_min_duration():
+                _, state = setup_step(pipe, state)
+        else:
+            _, state = setup_step(pipe, state)
         actual_num_frames = state.get("num_frames")
 
         # --- text encode (references' vision blocks + prompt; still has TE on GPU) ---
@@ -4116,9 +4144,18 @@ class MiniMaxH3Runner:
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
-        job_stub = f"ref2va_{int(t_start)}"
+        ref_mode = "ref2i" if still else "ref2va"
+        job_stub = f"{ref_mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
         _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+
+        # 参照付き静止画モード: 中央フレームを PNG として書き出す (generate() の still と同じ)
+        png_path = None
+        still_frame_index = None
+        if still:
+            still_frame_index = len(frames_uint8) // 2
+            png_path = self.output_dir / f"{job_stub}.png"
+            Image.fromarray(frames_uint8[still_frame_index]).save(png_path)
 
         result = {
             "prompt": prompt,
@@ -4139,8 +4176,13 @@ class MiniMaxH3Runner:
             "audio_sampling_rate": sampling_rate,
             "mp4_path": str(mp4_path),
             "mp4_filename": mp4_path.name,
+            "still": int(still),
+            "still_frames": still_frames if still else None,
+            "still_frame_index": still_frame_index,
+            "png_path": str(png_path) if png_path else None,
+            "png_filename": png_path.name if png_path else None,
             "total_elapsed_s": round(time.time() - t_start, 2),
-            "mode": "ref2va",
+            "mode": ref_mode,
             "te_quant": TE_QUANT,
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
@@ -4157,9 +4199,309 @@ class MiniMaxH3Runner:
             ],
         }
         if progress:
-            progress.update(phase="done", message="完了", result_path=str(mp4_path))
+            progress.update(phase="done", message="完了", result_path=str(png_path) if png_path else str(mp4_path))
         logger.info("ref2va generation done: %s",
                      json.dumps({k: v for k, v in result.items() if k != "ram"}, ensure_ascii=False))
+        return result
+
+    def generate_ref2i_batch(
+        self,
+        prompts: list[str],
+        references: list,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int = 30,
+        seed: int | None = None,
+        still_frames: int = 22,
+        progress: ProgressState | None = None,
+        cache: str | None = None,
+        cache_threshold: float | None = None,
+        attn: str | None = None,
+        turbo: bool | None = None,
+    ) -> dict:
+        """参照共通・プロンプト違いの参照付き静止画 N 枚を、`H3_LOWVRAM=1` の固定費を
+        バッチ全体で1回に償却して生成する (`generate_still_batch()` の ref2va 版)。
+
+        位相並べ替え (generate_ref2va() の lowvram=1 choreography を位相順に再構成):
+
+            entry   : [nothing big resident]  (transformer/transformer_ref とも解放)
+            encode  : [TE-nf4]        全場面の setup + テキスト/参照ビジョンエンコード
+            ref-enc : [TE-nf4 + vae]  VAE を1回だけ GPU に上げ、全場面の参照VAEエンコード
+            layout  : [TE-nf4]        全場面の layout/latents/timesteps (TE 常駐が
+                                      `_execution_device` 解決の前提 -- generate_ref2va の
+                                      同名コメント参照)
+            denoise : [transformer_ref] 1回ロードして全場面を順に
+            decode  : [vae pair]      全場面をデコード → PNG/mp4 を場面ごとに保存
+
+        場面間の共有状態リセットは generate_still_batch() と同一
+        (スケジューラ `_step_index=None` ×2 + per-scene FBC リセット。等価性は t2i_batch で
+        逐次生成との mp4/PNG md5 一致により実証済みの手法)。参照 (references) は全場面で
+        共通 -- 参照のデコード/リサイズ (setup step) と VAE エンコードは場面ごとに再実行
+        される (数秒/場面。テンソル共有より単純で、状態の別名参照バグの余地がない)。
+
+        seed は全場面共通。t2i_batch と同じく decode は場面ごとに保存しながら進むので
+        途中失敗でも完了分は残る。`H3_LOWVRAM=1` 以外では呼ばない (app.py 側で逐次
+        generate_ref2va(still=True) にフォールバック)。
+        """
+        import core.settings as settings
+
+        if not H3_LOWVRAM:
+            raise RuntimeError(
+                "generate_ref2i_batch() は H3_LOWVRAM=1 専用です。呼び出し側で逐次 "
+                "generate_ref2va(still=True) にフォールバックしてください。"
+            )
+        if not prompts:
+            raise ValueError("prompts が空です。")
+        if not references:
+            raise ValueError("ref2i_batch needs at least one reference.")
+        if still_frames not in STILL_FRAME_CHOICES:
+            raise ValueError(f"still_frames must be one of {STILL_FRAME_CHOICES}, got {still_frames}")
+        if still_frames == 5 and not H3_VAE_SMALLCLIP_FIX:
+            raise ValueError("still_frames=5 には H3_VAE_SMALLCLIP_FIX=1 (既定) が必要です。")
+
+        from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3PrepareLatentsStep,
+            MiniMaxH3Ref2VAPrepareLayoutStep,
+            MiniMaxH3SetTimestepsStep,
+        )
+        from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+        from diffusers.modular_pipelines.minimax_h3.decoders import (
+            MiniMaxH3AudioDecodeStep,
+            MiniMaxH3VideoDecodeStep,
+        )
+        from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3Ref2VADenoiseStep
+        from diffusers.modular_pipelines.minimax_h3.encoders import (
+            MiniMaxH3Ref2VAReferenceEncoderStep,
+            MiniMaxH3Ref2VATextEncoderStep,
+        )
+        from diffusers.modular_pipelines.minimax_h3.packing_ref2va import reference_kind
+        from diffusers.modular_pipelines.modular_pipeline import PipelineState
+
+        kinds = [reference_kind(index, entry) for index, entry in enumerate(references)]
+        if set(kinds) == {"audio"}:
+            raise ValueError("An audio reference has to be paired with at least one image or video reference.")
+
+        instant = settings.resolve_instant_settings(cache, cache_threshold, attn, turbo)
+        t_start = time.time()
+        n_scenes = len(prompts)
+
+        # --- entry: generate_ref2va() の lowvram entry と同一 (何も常駐させない) ---
+        with self._load_lock:
+            self._free_transformer()
+            self._free_transformer_ref()
+            self._ensure_vaes(progress)
+            self._load_text_encoder(progress)
+            # TE ロード後に sync すること (generate_ref2va の H3_LOWVRAM バグ修正コメント参照:
+            # 先に sync すると _pipe_ref.text_encoder が None のまま取り残される)。
+            self._sync_shared_components_to_ref()
+        torch.cuda.reset_peak_memory_stats()
+        pipe = self._pipe_ref
+
+        # --- encode 位相 (TE 常駐): 全場面の setup + テキスト/参照ビジョンエンコード ---
+        t_encode = time.time()
+        scenes: list[dict] = []
+        for idx, prompt in enumerate(prompts):
+            if progress:
+                progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
+            state = PipelineState()
+            state.set("prompt", prompt)
+            state.set("references", references)
+            state.set("height", height)
+            state.set("width", width)
+            state.set("num_frames", still_frames)
+            state.set("generator", torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None)
+            state.set("num_inference_steps", num_inference_steps)
+            state.set("output_type", "pt")
+            state.set("attention_kwargs", None)
+            state.set("latents", None)
+            state.set("audio_latents", None)
+
+            setup_step = MiniMaxH3Ref2VASetupStep()
+            with _relaxed_min_duration():
+                _, state = setup_step(pipe, state)
+
+            with torch.no_grad():
+                prompt_embeds, text_token_tags = MiniMaxH3Ref2VATextEncoderStep.encode_prompt(
+                    pipe, prompt, state.get("prepared_references"), device=DEVICE, dtype=torch.bfloat16
+                )
+            state.set("prompt_embeds", prompt_embeds)
+            state.set("text_token_tags", text_token_tags)
+            scenes.append({"prompt": prompt, "state": state})
+
+        # --- 参照VAEエンコード位相: VAE を1回だけ GPU へ (TE は常駐のまま --
+        # 単発 generate_ref2va の lowvram 分岐と同じ同居構成で、48GB 級なら
+        # TE(21GB)+vae(11GB) は問題なく収まることを単発実測で確認済み) ---
+        self._vae_to_gpu()
+        for idx, scene in enumerate(scenes):
+            if progress:
+                progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} の参照をVAEエンコード中...")
+            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
+            _, scene["state"] = reference_encoder_step(pipe, scene["state"])
+        self._vae_to_cpu()
+
+        # --- layout/latents/timesteps 位相 (TE まだ常駐 = `_execution_device` が正しく解決) ---
+        for scene in scenes:
+            state = scene["state"]
+            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+            _, state = layout_step(pipe, state)
+            latents_step = MiniMaxH3PrepareLatentsStep()
+            _, state = latents_step(pipe, state)
+            timesteps_step = MiniMaxH3SetTimestepsStep()
+            _, state = timesteps_step(pipe, state)
+            scene["state"] = state
+        encode_time = time.time() - t_encode
+
+        # --- TE を解放して transformer_ref を1回だけロード ---
+        with self._load_lock:
+            self._free_text_encoder(force=True)
+            self._ensure_transformer_ref(progress)
+        self.apply_instant_settings(self._pipe_ref.transformer_ref, instant, is_ref=True, progress=progress)
+
+        # --- denoise 位相: 全場面を順に ---
+        t_denoise = time.time()
+        total_steps_all = num_inference_steps * n_scenes
+        for idx, scene in enumerate(scenes):
+            state = scene["state"]
+            # 場面間のスケジューラリセット (generate_still_batch の docstring 参照)。
+            # scheduler/audio_scheduler は _sync_shared_components_to_ref で _pipe と
+            # 同一オブジェクトを共有しているため、pipe(_ref) 側から触れば足りる。
+            pipe.scheduler._step_index = None
+            pipe.audio_scheduler._step_index = None
+
+            step_times: list[float] = []
+            cache_skips = [0]
+            denoise_step = MiniMaxH3Ref2VADenoiseStep()
+            orig_loop_step = denoise_step.loop_step
+
+            def timed_loop_step(components, bstate, i, t, _idx=idx, _step_times=step_times, _skips=cache_skips):
+                ts = time.time()
+                result = orig_loop_step(components, bstate, i=i, t=t)
+                _step_times.append(time.time() - ts)
+                if instant["effective_cache"] == "fbc":
+                    _skips[0] += self._fbc_last_step_was_skip_ref()
+                if progress:
+                    progress.update(
+                        phase="denoising",
+                        step=_idx * num_inference_steps + i + 1,
+                        total_steps=total_steps_all,
+                        message=f"場面 {_idx + 1}/{n_scenes} をデノイズ中 {i + 1}/{num_inference_steps}",
+                    )
+                return result
+
+            denoise_step.loop_step = timed_loop_step
+            if instant["effective_cache"] == "fbc":
+                self._pipe_ref.transformer_ref._reset_stateful_cache()
+                with self._pipe_ref.transformer_ref.cache_context("h3"):
+                    _, state = denoise_step(pipe, state)
+            else:
+                _, state = denoise_step(pipe, state)
+            scene["state"] = state
+            scene["denoise_time_s"] = round(sum(step_times), 2)
+            scene["avg_step_time_s"] = round(sum(step_times) / len(step_times), 3) if step_times else None
+            scene["cache_skipped_steps"] = cache_skips[0] if instant["effective_cache"] == "fbc" else None
+
+        denoise_time = time.time() - t_denoise
+
+        # --- decode 位相: transformer_ref を落として VAE で全場面をデコード ---
+        if progress:
+            progress.update(phase="decoding", message="全場面をデコード中...")
+        self._free_transformer_ref()
+        self._vae_to_gpu()
+        t_decode = time.time()
+        results: list[dict] = []
+        try:
+            for idx, scene in enumerate(scenes):
+                if progress:
+                    progress.update(phase="decoding", message=f"場面 {idx + 1}/{n_scenes} をデコード中...")
+                state = scene["state"]
+                video_decode_step = MiniMaxH3VideoDecodeStep()
+                _, state = video_decode_step(pipe, state)
+                audio_decode_step = MiniMaxH3AudioDecodeStep()
+                _, state = audio_decode_step(pipe, state)
+
+                videos = state.get("videos")
+                audio = state.get("audio")
+                sampling_rate = state.get("sampling_rate")
+                video_tensor = videos[0] if isinstance(videos, list) else videos
+                if video_tensor.dim() == 5:
+                    video_tensor = video_tensor[0]
+                frames_uint8 = (
+                    (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+                )
+                audio_np = audio[0].float().cpu().numpy()
+                del video_tensor, videos, audio
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                job_stub = f"ref2i_{int(t_start)}_s{idx + 1}"
+                mp4_path = self.output_dir / f"{job_stub}.mp4"
+                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+                still_frame_index = len(frames_uint8) // 2
+                png_path = self.output_dir / f"{job_stub}.png"
+                Image.fromarray(frames_uint8[still_frame_index]).save(png_path)
+
+                results.append({
+                    "prompt": scene["prompt"],
+                    "png_path": str(png_path),
+                    "png_filename": png_path.name,
+                    "mp4_path": str(mp4_path),
+                    "mp4_filename": mp4_path.name,
+                    "still_frame_index": still_frame_index,
+                    "denoise_time_s": scene["denoise_time_s"],
+                    "avg_step_time_s": scene["avg_step_time_s"],
+                    "cache_skipped_steps": scene["cache_skipped_steps"],
+                })
+        except BaseException:
+            logger.exception(
+                "ref2i_batch decode failed (scene %d/%d) -- restoring steady state before re-raising",
+                len(results) + 1, n_scenes,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                self._vae_to_cpu()
+            except Exception:
+                logger.exception("steady-state restore after ref2i_batch decode failure also failed")
+            raise
+        decode_time = time.time() - t_decode
+        peak_vram = torch.cuda.max_memory_allocated() / 1e9
+        self._vae_to_cpu()
+        # lowvram=1: 何も再ロードしない (generate_ref2va の decode 後と同じ定常状態)
+
+        total_elapsed = time.time() - t_start
+        result = {
+            "mode": "ref2i_batch",
+            "num_scenes": n_scenes,
+            "height": height,
+            "width": width,
+            "num_frames": still_frames,
+            "still_frames": still_frames,
+            "duration_s": still_frames / FPS,
+            "num_inference_steps": num_inference_steps,
+            "seed": seed,
+            "encode_time_s": round(encode_time, 2),
+            "denoise_time_s": round(denoise_time, 2),
+            "decode_time_s": round(decode_time, 2),
+            "peak_vram_gb": round(peak_vram, 2),
+            "ram": ram_gb(),
+            "total_elapsed_s": round(total_elapsed, 2),
+            "per_image_s": round(total_elapsed / n_scenes, 2),
+            "te_quant": TE_QUANT,
+            "transformer_quant": H3_TRANSFORMER_QUANT,
+            "lowvram": H3_LOWVRAM_RAW,
+            "attn_backend": instant["attn"],
+            "cache": instant["effective_cache"],
+            "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
+            "turbo": instant["turbo"],
+            "references_summary": [
+                {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
+                for index, kind in enumerate(kinds)
+            ],
+            "scenes": results,
+        }
+        if progress:
+            progress.update(phase="done", message=f"完了 ({n_scenes}場面)", result_path=results[-1]["png_path"] if results else None)
+        logger.info("ref2i_batch done: %s", json.dumps({k: v for k, v in result.items() if k not in ("ram", "scenes")}, ensure_ascii=False))
         return result
 
 
