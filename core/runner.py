@@ -649,6 +649,173 @@ if H3_VAE_SMALLCLIP_FIX:
     _patch_vae_smallclip_decode()
 
 
+# 既定 ON: ref2va バッチ (`generate_ref_batch`) の参照プレフィックス KV キャッシュ共有。
+# バッチは「参照共通・プロンプト違い」が入力仕様なので、参照ラベル+ビジョン
+# (~4104トークン、~65s/場面) の Qwen3-VL エンコードを場面ごとに繰り返すのは純粋な重複 --
+# プレフィックスを1回だけ `use_cache=True` で通し、場面ごとにプロンプト末尾
+# (14-33トークン、~0.2s) だけをキャッシュ継続する。"0" でいつでも従来経路 (場面ごとの
+# encode_prompt フル計算) に戻せる。
+#
+# 精度 (scripts/probe_ref_prefix_cache.py で実測済み):
+# - プレフィックス部分の hidden_states[50] はフル計算と**ビット一致** (因果LMで参照が
+#   前置・プロンプトは末尾 verbatim のため。packing_ref2va.build_ref2va_presentation で確認)
+# - プロンプト末尾部分は相対RMS ~1.5% の丸め差が残る (カーネル/GEMM のタイル経路が
+#   系列長で変わるため。eager 固定でも同水準 = sdpa 固有ではなく実行経路差そのもの)。
+#   これがロジックバグでないことはネガティブコントロールで確定: わざと位置オフセットを
+#   壊した継続は相対RMS 27-30% (20倍) に跳ねる -- 1.5% は「正しい計算の丸めノイズ」の水準
+# - つまりバッチ出力は従来経路とビット一致しない (sage/FBC と同種の epsilon 級ドリフト)。
+#   ビット再現が要る対照実験では H3_REF_PREFIX_CACHE=0 を使うこと
+H3_REF_PREFIX_CACHE = os.environ.get("H3_REF_PREFIX_CACHE", "1").strip() == "1"
+
+
+def _encode_ref_prompts_shared_prefix(
+    pipe,
+    prompts: list[str],
+    prepared_references,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    r"""参照プレフィックスを1回だけ KV キャッシュ化し、場面 (プロンプト) ごとにプロンプト
+    末尾だけを継続エンコードする (`MiniMaxH3Ref2VATextEncoderStep.encode_prompt` の
+    バッチ特化版。H3_REF_PREFIX_CACHE のモジュールコメントに実測精度、
+    scripts/probe_ref_prefix_cache.py に検証手順)。
+
+    設計はプローブをそのまま踏襲する:
+      1. `build_ref2va_presentation(tokenizer, "", ...)` (プロンプト空文字) のトークン列は、
+         任意のプロンプト付きフル系列の先頭と完全一致する (プロンプトは常に最後に
+         `emit(text(prompt))` されるだけ -- packing_ref2va で確認、トークン単位の一致も
+         プローブで実測)。これをプレフィックスとして1回だけ `use_cache=True` で通す
+      2. 場面ごとにプロンプト末尾のみを `past_key_values=cache` で継続する。
+         `attention_mask`/`mm_token_type_ids`/`pixel_values` 系は全て None
+         (`image_grid_thw` を渡すと `model.rope_deltas` が再計算・上書きされる罠がある)
+      3. 継続のたびに `DynamicCache.crop(prefix_len)` でプレフィックスに切り戻す (直列運用)
+
+    重要な制約: プレフィックス呼び出しは `model.rope_deltas` (Qwen3VLModel の
+    **インスタンス状態**) を書き換え、継続呼び出しはそれを読む。この関数は
+    「プレフィックス→全場面の継続」を1回の呼び出し内で完結させるので安全だが、
+    呼び出し側はこの関数の実行中に他の text_encoder 呼び出しを挟んではならない。
+
+    H3_TE_PRUNE (51層 TE) でも成立する (encode_prompt と同じ num_layers ガードを行い、
+    DynamicCache はレイヤー数に自動追従する)。返り値は `prompts` と同順の
+    `(prompt_embeds, text_token_tags)` で、encode_prompt と同じ形・dtype 規約。
+    """
+    import numpy as np
+    from diffusers.modular_pipelines.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
+    from diffusers.modular_pipelines.minimax_h3.packing_ref2va import (
+        build_ref2va_presentation,
+        sample_reference_video_frames,
+    )
+    from transformers.cache_utils import DynamicCache
+
+    components = pipe
+
+    num_layers = components.text_encoder.config.text_config.num_hidden_layers
+    if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
+        raise ValueError(
+            f"MiniMax-H3 conditions on `hidden_states[{MINIMAX_H3_TEXT_ENCODER_LAYER}]` of its Qwen3-VL "
+            f"conditioner, which needs more than {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
+            f"`text_encoder` has {num_layers}."
+        )
+
+    # --- encode_prompt と同一の画像/動画参照の前処理 (encoders.py を丸ごと踏襲) ---
+    merge_size = components.processor.image_processor.merge_size**2
+
+    pixel_values, image_grid_thw, image_token_counts = None, None, []
+    images = [reference.image for reference in prepared_references if reference.kind == "image"]
+    if images:
+        vision = components.processor.image_processor(images=images, return_tensors="pt")
+        pixel_values, image_grid_thw = vision["pixel_values"], vision["image_grid_thw"]
+        image_token_counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
+
+    pixel_values_videos, video_grid_thw, video_block_token_counts = None, None, []
+    videos = [reference for reference in prepared_references if reference.kind == "video"]
+    if videos:
+        # `block_timestamps` の書き戻しは必須: 直後の `build_ref2va_presentation` が
+        # 動画ラベルの timestamp 文字列を作るのに読む (encode_prompt と同一の順序)。
+        sampled = [sample_reference_video_frames(reference.frames) for reference in videos]
+        for reference, (_, block_timestamps) in zip(videos, sampled):
+            reference.block_timestamps = block_timestamps
+        vision = components.processor.video_processor(
+            videos=[np.stack(frames) for frames, _ in sampled], do_sample_frames=False, return_tensors="pt"
+        )
+        pixel_values_videos, video_grid_thw = vision["pixel_values_videos"], vision["video_grid_thw"]
+        video_block_token_counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
+        for reference, grid in zip(videos, video_grid_thw):
+            if int(grid[0]) != len(reference.block_timestamps):
+                raise ValueError(
+                    f"The processor merged a reference video into {int(grid[0])} vision blocks, but MiniMax-H3 "
+                    f"labels {len(reference.block_timestamps)} of them."
+                )
+
+    prefix_ids, prefix_tags = build_ref2va_presentation(
+        components.tokenizer, "", prepared_references, image_token_counts, video_block_token_counts
+    )
+    prefix_input = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+    mm_token_type_ids = torch.tensor(
+        components.processor.create_mm_token_type_ids([prefix_ids]), dtype=torch.long, device=device
+    )
+
+    # encode_prompt と同じ CPU オフロードフックの手動発火 (`.model(...)` を直接呼ぶため)。
+    model = components.text_encoder.model
+    hook = getattr(components.text_encoder, "_hf_hook", None)
+    if hook is not None and hasattr(hook, "pre_forward"):
+        hook.pre_forward(components.text_encoder)
+
+    t_prefix = time.time()
+    cache = DynamicCache(config=model.config)
+    with torch.no_grad():
+        prefix_out = model(
+            input_ids=prefix_input,
+            attention_mask=torch.ones_like(prefix_input),
+            mm_token_type_ids=mm_token_type_ids,
+            pixel_values=None if pixel_values is None else pixel_values.to(device, components.text_encoder.dtype),
+            image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(device),
+            pixel_values_videos=(
+                None if pixel_values_videos is None else pixel_values_videos.to(device, components.text_encoder.dtype)
+            ),
+            video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(device),
+            past_key_values=cache,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+    prefix_hidden = prefix_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(device=device, dtype=dtype)
+    prefix_len = cache.get_seq_length()
+    logger.info(
+        "shared-prefix encode: prefix %d tokens in %.1fs, continuing %d scene prompt(s)",
+        prefix_len, time.time() - t_prefix, len(prompts),
+    )
+
+    results: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for prompt in prompts:
+        suffix_ids = components.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        suffix_input = torch.tensor([suffix_ids], dtype=torch.long, device=device)
+        with torch.no_grad():
+            suffix_out = model(
+                input_ids=suffix_input,
+                attention_mask=None,
+                mm_token_type_ids=None,
+                pixel_values=None,
+                image_grid_thw=None,
+                pixel_values_videos=None,
+                video_grid_thw=None,
+                past_key_values=cache,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+        suffix_hidden = suffix_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(device=device, dtype=dtype)
+        cache.crop(prefix_len)
+
+        prompt_embeds = torch.cat([prefix_hidden, suffix_hidden], dim=1)
+        # プロンプトはビジョンブロックを含まない純テキストの末尾セグメントなので、
+        # suffix のタグは全て MINIMAX_H3_TEXT_TAG。
+        text_token_tags = torch.tensor(
+            list(prefix_tags) + [MINIMAX_H3_TEXT_TAG] * len(suffix_ids), dtype=torch.long
+        )
+        results.append((prompt_embeds, text_token_tags))
+
+    return results
+
+
 @contextmanager
 def _relaxed_min_duration():
     """静止画モードの間だけ diffusers 側の最小尺バリデーション (5.0s) を緩和する。
@@ -4340,14 +4507,36 @@ class MiniMaxH3Runner:
                     _, state = setup_step(pipe, state)
             else:
                 _, state = setup_step(pipe, state)
-
-            with torch.no_grad():
-                prompt_embeds, text_token_tags = MiniMaxH3Ref2VATextEncoderStep.encode_prompt(
-                    pipe, prompt, state.get("prepared_references"), device=DEVICE, dtype=torch.bfloat16
-                )
-            state.set("prompt_embeds", prompt_embeds)
-            state.set("text_token_tags", text_token_tags)
             scenes.append({"prompt": prompt, "state": state})
+
+        # --- テキストエンコード: 共有プレフィックス (H3_REF_PREFIX_CACHE=1、既定) か
+        # 従来の場面ごとフル計算か。共有方式は参照ラベル+ビジョン (~4104トークン、
+        # ~65s/場面) の Qwen3-VL 前方計算を1回にまとめ、場面ごとにはプロンプト末尾
+        # (14-33トークン、~0.2s) だけを KV キャッシュ継続する -- 実測精度と検証手順は
+        # H3_REF_PREFIX_CACHE のモジュールコメントと scripts/probe_ref_prefix_cache.py。
+        # setup は場面ごとに再実行済みだが prepared_references はプロンプト非依存
+        # (デコード/リサイズのみ) なので、先頭場面のものを代表としてプレフィックスに使う。
+        if H3_REF_PREFIX_CACHE:
+            if progress:
+                progress.update(phase="encoding", message="参照プレフィックスをエンコード中 (全場面で共有)...")
+            encoded = _encode_ref_prompts_shared_prefix(
+                pipe, prompts, scenes[0]["state"].get("prepared_references"),
+                device=DEVICE, dtype=torch.bfloat16,
+            )
+            for scene, (prompt_embeds, text_token_tags) in zip(scenes, encoded):
+                scene["state"].set("prompt_embeds", prompt_embeds)
+                scene["state"].set("text_token_tags", text_token_tags)
+        else:
+            for idx, scene in enumerate(scenes):
+                if progress:
+                    progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
+                with torch.no_grad():
+                    prompt_embeds, text_token_tags = MiniMaxH3Ref2VATextEncoderStep.encode_prompt(
+                        pipe, scene["prompt"], scene["state"].get("prepared_references"),
+                        device=DEVICE, dtype=torch.bfloat16,
+                    )
+                scene["state"].set("prompt_embeds", prompt_embeds)
+                scene["state"].set("text_token_tags", text_token_tags)
 
         # --- 参照VAEエンコード位相: VAE を1回だけ GPU へ (TE は常駐のまま --
         # 単発 generate_ref2va の lowvram 分岐と同じ同居構成で、48GB 級なら
