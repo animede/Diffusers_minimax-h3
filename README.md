@@ -78,11 +78,12 @@ venv/bin/pip install torchao==0.17.0
 ```
 
 > **重要: diffusers はコミット固定のまま使うこと。**
-> MiniMax-H3 は PR #14355 でのみ提供されており、2026-08-06 時点で **未マージ(draft)**。
-> 本アプリは Modular のブロック(`MiniMaxH3SetTimestepsStep` / `MiniMaxH3LoopDenoiser` 等)を
-> 自前で呼び、`get_block_state()` / `state.get(...)` / `row_timestep_plan` といった
-> state 契約に強く依存している。PR には 8/5 に **state contract の refactor** が入っており、
-> 最新版へ上げると動かなくなる公算が高い。詳細は末尾「今後の外部イベント待ち」を参照。
+> PR #14355 は **2026-08-05 にマージ済み**だが、本アプリは未追従。Modular のブロック
+> (`MiniMaxH3SetTimestepsStep` / `MiniMaxH3LoopDenoiser` 等)を自前で呼び、
+> `get_block_state()` / `state.get(...)` / `row_timestep_plan` といった state 契約に
+> 強く依存しており、マージ版では **packing.py/packing_ref2va.py の削除を含む大規模
+> リファクタ**が入っているため、上げると ImportError で起動すらしない(2026-08-09 に
+> 影響調査済み)。詳細は末尾「今後の外部イベント待ち」の §1 を参照。
 
 ### SageAttention(任意、既定で有効)
 
@@ -1471,25 +1472,55 @@ turboなし 30steps は t2i で 51.1s(上記実測)— 素の 157s に対し、3
 
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
-### 1. diffusers PR #14355 のマージ待ち — **安易に上げないこと**
+### 1. diffusers PR #14355 — **2026-08-05 にマージ済み。追従は未実施(影響調査済み、2026-08-09)**
 
-本アプリは PR #14355(`Add MiniMax-H3`)のブランチに依存する。2026-08-06時点で
-**open / draft / 未マージ**(mergeable_state: unstable)。venvは
-`refs/pull/14355/head` の **abc5e9b(2026-08-02)にピン留め**されている
-(`pip` の `direct_url.json` で確認可)。
+PR #14355 は **2026-08-05 17:00Z にマージされた**(merge commit `f53d552`、PR最終
+head は `f37ab93`)。venv は引き続き **abc5e9b(2026-08-02)にピン留め**されており
+(`pip` の `direct_url.json` で確認可)、abc5e9b は f37ab93 の祖先なので SHA 直指定の
+再インストール手順(冒頭のセットアップ節)は今後も機能する。H3 を含む安定版リリースは
+まだ無い(最新 v0.39.0 は 7/3、H3 は次の v0.40.0 から)。
 
-**上げると壊れる可能性が高い**: 8/4〜8/5にPRへ4コミット追加されており、特に
-`8ab3662`(Minimax h3 follow up: review & refactor、#14371)と
-`99ced1b`(Fix the H3 fast tests against **the refactored state contract**)が入っている。
-本アプリの `core/runner.py` は Modular のブロック(`MiniMaxH3SetTimestepsStep`、
-`MiniMaxH3LoopDenoiser` 等)を**自前で呼び**、`get_block_state()`/`set_block_state()`・
-`state.get(...)`・`row_timestep_plan` といった state 契約に強く依存しているため、
-この refactor に追従するには相応の改修が要る。**現構成は全機能をA/B実測済みなので、
-マージされるまでは据え置きが安全**。追従する際は「まず t2va の同一seed MD5一致」で
-回帰を確認すること(本リポジトリの各機能はこの手法で等価性を検証してある)。
+**abc5e9b → f37ab93 の差分は 27コミット・70ファイル**で、懸念どおり
+`8ab3662`(review & refactor、#14371)による大規模リファクタを含む。2026-08-09 に
+runner.py の全 diffusers 接点(import 15モジュール・シンボル約40個)をマージ版ソースと
+突き合わせた影響調査の結果:
+
+**即死する箇所(ImportError、6 import サイト)**:
+- `packing.py` / `packing_ref2va.py` は**削除**された。runner が import している
+  `MINIMAX_H3_TEXT_ENCODER_LAYER`(→ `components.text_encoder_layer` プロパティ化、既定50)、
+  `MINIMAX_H3_TEXT_TAG`(→ modular_pipeline.py へ移動)、`MINIMAX_H3_KEYFRAME_NOISE_AUG` /
+  `MINIMAX_H3_MIN_DURATION`(→ `components.keyframe_noise_aug` / `.min_duration`
+  プロパティ化 — **「モジュール定数の monkeypatch」方式が通用しなくなる**)、
+  `build_packed_sequence` / `build_row_timesteps` / `patchify_video_latents`
+  (→ before_denoise.py へ移動)、`unpatchify_video_tokens`(**代替なし** —
+  hires 経路が使うので自前実装の持ち込みが要る)、`build_ref2va_presentation` /
+  `reference_kind` / `sample_reference_video_frames`(**代替なし** — references.py の
+  クラス階層 `MiniMaxH3ImageReference/VideoReference/AudioReference` に再設計された)
+- `MiniMaxH3SetupStep` → 消滅(`MiniMaxH3ResizeStep` に再編)、
+  `MiniMaxH3AutoKeyframeVaeEncoderStep` → `MiniMaxH3KeyframeVaeEncoderStep` /
+  `MiniMaxH3AutoVaeEncoderStep` に再編、
+  `MiniMaxH3TextEncoderStep.encode_prompt`(staticmethod)→ モジュール関数
+  `get_qwen3vl_prompt_embeds` に変更(シグネチャも変更)、
+  `MiniMaxH3Ref2VABlocks` → **公開APIから消滅**(単一の `MiniMaxH3Blocks` +
+  `MiniMaxH3AutoDenoiseStep` の条件分岐に統合 — pipe/pipe_ref の2シェル設計に影響)
+
+**生き残った箇所**: 主要ステップ類(`MiniMaxH3SetTimestepsStep` / `MiniMaxH3LoopDenoiser` /
+`MiniMaxH3DenoiseStep` / decode 2種 / Ref2VA 系 denoise・encoder)は同名で存続。
+`row_timestep_plan` の state キーも存続。decoders.py の latents 正規化
+(`latents * latents_std + latents_mean`、H3_TE_DEVICE 実装が依存)も同形で存続。
+
+**追従の作業量見積もり: 中〜大**。t2i/t2va 経路だけなら「中」(改名追従+プロパティ
+パッチ方式への変更+unpatchify 自前化+encode_prompt 署名追従)。ref2va+KVプレフィックス
+キャッシュ(旧 presentation builder の内部を丸ごと踏襲している)は references.py ベースの
+再設計に付き合う必要があり「大」。さらに scheduling_minimax_h3 の書き換え(36+/41-)と
+「padded-layout attention mask の廃止」により、**同一seed MD5 が一致しない可能性が高い**
+— 回帰確認は MD5 前提ではなく PSNR+目視評価へのフォールバックを覚悟すること。
+
+**当面の方針**: 現構成(abc5e9b、全機能A/B実測済み)を据え置き。追従するなら
+最小差分の f37ab93 を対象に、(1) t2i/t2va 経路 → (2) ref2va 経路の2段階で。
 
 なお int8 レシピ(`TorchAoConfig` + `Int8WeightOnlyConfig`)は abc5e9b に既に含まれて
-おり、**マージを待たずに使える**(`H3_TRANSFORMER_QUANT=int8` として実装済み)。
+おり、マージを待たずに使えている(`H3_TRANSFORMER_QUANT=int8` として実装済み)。
 
 ### 2. Turbo LoRA 完成版のリリース待ち → **lightx2v 版で解決(2026-08-08 本実装済み、「Turbo LoRA」節参照)**
 
