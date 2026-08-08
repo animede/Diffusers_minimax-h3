@@ -1509,12 +1509,36 @@ runner.py の全 diffusers 接点(import 15モジュール・シンボル約40�
 `row_timestep_plan` の state キーも存続。decoders.py の latents 正規化
 (`latents * latents_std + latents_mean`、H3_TE_DEVICE 実装が依存)も同形で存続。
 
-**追従の作業量見積もり: 中〜大**。t2i/t2va 経路だけなら「中」(改名追従+プロパティ
-パッチ方式への変更+unpatchify 自前化+encode_prompt 署名追従)。ref2va+KVプレフィックス
-キャッシュ(旧 presentation builder の内部を丸ごと踏襲している)は references.py ベースの
-再設計に付き合う必要があり「大」。さらに scheduling_minimax_h3 の書き換え(36+/41-)と
-「padded-layout attention mask の廃止」により、**同一seed MD5 が一致しない可能性が高い**
-— 回帰確認は MD5 前提ではなく PSNR+目視評価へのフォールバックを覚悟すること。
+**diff レベル監査での追加判明事項(2026-08-09、Sonnet エージェントによる全行監査)**:
+- **数値経路の土台は無変更**: scheduling_minimax_h3.py の差分(36+/41-)は **docstring
+  整形のみでコード変更ゼロ**(diff で確認)。transformer は padding-row 処理の削除のみ
+  (QKV 構造・forward シグネチャ無変更)、video VAE の `_decode` は byte-identical。
+  → **同一seed MD5 一致の可能性は残っている**。回帰はまず MD5、不一致なら PSNR+目視
+- **デコード契約の変更が全生成関数に波及**: 旧 `MiniMaxH3VideoDecodeStep` は packed
+  シーケンス行を受けて内部で unpatchify していたが、新版は**新設
+  `MiniMaxH3AfterDenoiseStep` が unpatchify を担い、decode ステップは unpatchify 済み
+  5Dテンソルを受ける**契約に変更。generate / generate_still_batch / generate_ref2va /
+  generate_ref_batch **全4関数の decode 直前に AfterDenoiseStep 相当の挿入が必要**
+- `build_packed_sequence` / `build_row_timesteps` は before_denoise のステップクラスの
+  `@staticmethod` へ移動しただけでなく**シグネチャも変更**(`audio_channels` /
+  `audio_tag` / `video_tag` が必須引数化)— hires 経路 `_upscale_block_state_2x` は
+  全面書き直し
+- ref2va は `ModularPipeline.from_pretrained(MODEL_ID, workflow="ref2va")` の
+  **workflow 機構**に統合(pipe/pipe_ref 2シェル設計の前提が変わる。`transformer_ref`
+  というコンポーネント名の存続も要確認)。`_execution_device` の解決アルゴリズム
+  (components 挿入順の最初の nn.Module)自体は維持
+- `encode_prompt` は t2va 側・Ref2VA 側とも staticmethod ごと消滅(fl2va は
+  `MiniMaxH3FL2VATextEncoderStep` に分離)。runner が `@torch.no_grad()` を自前で
+  制御するために直接呼んでいた経路なので、新モジュール関数
+  `get_qwen3vl_prompt_embeds` ベースで同じ最適化を組み直す
+
+**追従の作業量見積もり: 大**(当初「中〜大」から上方修正)。改名追従だけでは済まず、
+(a) import 参照先の総付け替え、(b) decode 直前への AfterDenoiseStep 挿入×4関数、
+(c) encode_prompt 直接呼び出しの作り直し×2、(d) 定数 monkeypatch → プロパティ
+override 化、(e) hires 経路の全面書き直し、(f) ref2va 2シェル設計の workflow 機構への
+再設計、(g) KVプレフィックスキャッシュの references.py ベース再実装、が必要。
+土台の数値経路が無変更なので、**移行後の per-機能 MD5/PSNR 回帰で等価性を証明できる
+見込みは高い**のが救い。
 
 **当面の方針**: 現構成(abc5e9b、全機能A/B実測済み)を据え置き。追従するなら
 最小差分の f37ab93 を対象に、(1) t2i/t2va 経路 → (2) ref2va 経路の2段階で。
