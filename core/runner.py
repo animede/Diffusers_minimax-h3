@@ -227,6 +227,35 @@ if TE_QUANT not in ("none", "bnb-4bit"):
 # is proportionally smaller), it does not change *when* or *whether* TE is resident.
 H3_TE_PRUNE = os.environ.get("H3_TE_PRUNE", "0").strip() == "1"
 
+# 量子化済み text_encoder のディスクキャッシュ (既定ON)。
+#
+# 動機: `H3_LOWVRAM=1` は毎リクエストで TE を再ロードするため、その時間がそのまま
+# 固定費になる。この時間の大半は「元の bf16 重みを読む + その場で bnb-4bit へ量子化
+# する」処理であり、**量子化後の重みを一度保存しておけば次回以降は読むだけで済む**。
+#
+# 実測 (2026-08-08、scripts/probe_prequantized_ckpt.py と probe_prequant_equivalence.py):
+#   ロード 66.9s -> 2.6s (25.7倍) / 別実行では 41.5s -> 4.0s (10.3倍)、保存物 17.44GB
+#   (H3_TE_PRUNE=1 の場合)。**出力の等価性はビット一致で確認済み** --
+#   `hidden_states[50]` が現行経路と `torch.equal` で完全一致 (max_abs_diff 0.0、
+#   日英2プロンプト)、`text_token_tags` も一致。bnb-4bit の量子化は決定的なので当然の
+#   結果だが、速いだけで採用しないのが本プロジェクトの流儀なので実測で確かめてある。
+#
+# キャッシュは **設定ごとに別ディレクトリ**へ置く (`te_<quant>_<prune>`)。TE_QUANT や
+# TE_PRUNE を変えると中身が別物になるため、同じ場所を使い回すと設定を切り替えたときに
+# 古い重みを読んでしまう。ディレクトリ名に設定を含めることでこの事故を構造的に防ぐ。
+#
+# ディスクを 17-21GB 消費する。空きが足りない環境のために "0" で完全に無効化できる
+# (無効時は従来どおり毎回その場で量子化する = このフラグ導入前と同一挙動)。保存に
+# 失敗した場合も**生成は続行する** (キャッシュはあくまで高速化であり、機能ではない)。
+H3_TE_PREQUANT = os.environ.get("H3_TE_PREQUANT", "1").strip() == "1"
+H3_TE_PREQUANT_DIR = Path(
+    os.environ.get("H3_TE_PREQUANT_DIR", str(Path(__file__).resolve().parent.parent / "models" / "prequant"))
+)
+# 保存前に確認する空きディスクの下限 (GB)。TE-nf4 は削除版 17.44GB / 未削除 ~21GB
+# なので、保存物 + 余裕を見て 25GB を既定とする。下回る場合は保存をスキップし、
+# 従来経路で動作を続ける (ディスクを埋めてシステムを巻き添えにしないため)。
+H3_TE_PREQUANT_MIN_FREE_GB = float(os.environ.get("H3_TE_PREQUANT_MIN_FREE_GB", "25"))
+
 # EXPERIMENTAL, opt-in, probe for 16GB-class support. "0" (default) = video VAE loads
 # float32, byte-for-byte identical to pre-this-flag behaviour. "1" = the video VAE
 # (`vae`, NOT `audio_vae` -- audio_vae must stay float32 end-to-end, see module
@@ -2360,6 +2389,93 @@ class MiniMaxH3Runner:
         cfg.text_config.num_hidden_layers = MINIMAX_H3_TEXT_ENCODER_LAYER + 1
         return {"text_encoder": cfg}
 
+    def _te_prequant_dir(self) -> Path:
+        """量子化済み TE のキャッシュ先。**設定ごとに別ディレクトリ**にする
+        (TE_QUANT / TE_PRUNE を変えると重みの中身が別物になるため、同じ場所を使い回すと
+        設定切替時に古い重みを読む事故が起きる。名前に設定を埋めて構造的に防ぐ)。"""
+        return H3_TE_PREQUANT_DIR / f"te_{TE_QUANT}_prune{int(H3_TE_PRUNE)}"
+
+    def _load_te_from_prequant(self, cache_dir: Path, progress: ProgressState | None = None) -> bool:
+        """量子化済みキャッシュから TE を読む。成功したら True。
+
+        読めなかった場合(壊れている・transformers のバージョン差など)は**例外を投げず
+        False を返す** -- キャッシュは高速化であって機能ではないので、失敗したら通常の
+        ロード経路へ黙って落ちるのが正しい。壊れたキャッシュは呼び出し側が作り直す。
+        """
+        if not (cache_dir / "config.json").exists():
+            return False
+        if progress:
+            progress.update(
+                phase="loading_text_encoder",
+                message="text_encoder (量子化済みキャッシュ) をロード中...",
+            )
+        t0 = time.time()
+        try:
+            from transformers import AutoModelForImageTextToText
+
+            te = AutoModelForImageTextToText.from_pretrained(
+                str(cache_dir), dtype=torch.bfloat16, device_map="cuda"
+            )
+        except Exception:
+            logger.exception("量子化済み TE キャッシュの読み込みに失敗、通常経路へフォールバック: %s", cache_dir)
+            return False
+        # tokenizer/processor はキャッシュ対象外(小さく、量子化とも無関係)なので
+        # 通常どおりロードする。text_encoder だけを差し替える。
+        self._pipe.load_components(names=["tokenizer", "processor"])
+        self._pipe.text_encoder = te
+        self._text_encoder_loaded = True
+        logger.info(
+            "text_encoder loaded from prequantized cache in %.1fs (%s). gpu=%s",
+            time.time() - t0, cache_dir, gpu_mem_gb(),
+        )
+        return True
+
+    def _save_te_prequant(self, cache_dir: Path):
+        """ロード済み TE を量子化済みのまま保存する。失敗しても生成は続行する。
+
+        ディスクを 17-21GB 消費するため、空きが `H3_TE_PREQUANT_MIN_FREE_GB` を下回る
+        場合は保存せずに警告だけ出す(ディスクを埋めてシステムを巻き添えにしないため)。
+        """
+        import shutil
+
+        try:
+            free_gb = shutil.disk_usage(H3_TE_PREQUANT_DIR.parent if H3_TE_PREQUANT_DIR.exists()
+                                        else Path.cwd()).free / 1e9
+        except Exception:
+            free_gb = float("inf")
+        if free_gb < H3_TE_PREQUANT_MIN_FREE_GB:
+            logger.warning(
+                "量子化済み TE の保存をスキップ: 空きディスクが %.1fGB で下限 %.1fGB を"
+                "下回る (H3_TE_PREQUANT_MIN_FREE_GB で調整可、H3_TE_PREQUANT=0 で無効化可)",
+                free_gb, H3_TE_PREQUANT_MIN_FREE_GB,
+            )
+            return
+        tmp_dir = cache_dir.with_name(cache_dir.name + ".tmp")
+        try:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            tmp_dir.parent.mkdir(parents=True, exist_ok=True)
+            t0 = time.time()
+            self._pipe.text_encoder.save_pretrained(str(tmp_dir))
+            # 一時ディレクトリへ書いてから rename する: 保存中にプロセスが落ちても
+            # 中途半端なキャッシュが「有効」に見えてしまうのを防ぐ (config.json の
+            # 存在でキャッシュ有無を判定しているため)。
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            tmp_dir.rename(cache_dir)
+            size_gb = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file()) / 1e9
+            logger.info(
+                "量子化済み TE を保存: %s (%.2fGB, %.1fs)。次回以降のロードが高速になる",
+                cache_dir, size_gb, time.time() - t0,
+            )
+        except Exception:
+            logger.exception("量子化済み TE の保存に失敗(生成は続行): %s", cache_dir)
+            try:
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+            except Exception:
+                pass
+
     def _load_text_encoder(self, progress: ProgressState | None = None):
         """Load the text_encoder to GPU.
 
@@ -2377,6 +2493,12 @@ class MiniMaxH3Runner:
         """
         self._ensure_pipe_shell()
         if self._text_encoder_loaded:
+            return
+        # 量子化済みキャッシュがあればそこから読む (実測 66.9s -> 2.6s、出力はビット一致。
+        # H3_TE_PREQUANT のモジュールコメント参照)。bnb-4bit のときだけ意味がある --
+        # `none` モードは量子化しないので保存しても得が無い。
+        cache_dir = self._te_prequant_dir()
+        if H3_TE_PREQUANT and TE_QUANT == "bnb-4bit" and self._load_te_from_prequant(cache_dir, progress):
             return
         config_kwargs = self._text_encoder_config_kwargs()
         prune_suffix = ", pruned to 51 layers" if H3_TE_PRUNE else ""
@@ -2412,6 +2534,9 @@ class MiniMaxH3Runner:
                 "text_encoder (NF4%s) loaded to GPU in %.1fs. gpu=%s ram=%s",
                 prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
             )
+            # 初回のみ: 量子化済みの重みを保存しておき、次回以降のロードを短縮する。
+            if H3_TE_PREQUANT:
+                self._save_te_prequant(cache_dir)
             return
         # TE (66GB, or ~53GB pruned) + transformer (66GB) cannot coexist in 96GB VRAM:
         # measured 66.73GB for the unpruned TE alone (the checkpoint shards are

@@ -1,6 +1,7 @@
 venv/
 outputs/
 logs/
+models/
 __pycache__/
 *.pyc
 .DS_Store
