@@ -142,14 +142,29 @@ from PIL import Image
 # without reaching into diffusers' modular_pipelines package themselves. Cheap import
 # (no model loading, just dataclass/PyAV/numpy/torch glue) -- safe at module level,
 # unlike the actual big-model loading calls in this file, which all stay lazy/on-demand.
+#
+# PR #14355 (merged 2026-08-05, f37ab93) note: `MiniMaxH3Reference` still exists under
+# this same import path post-merge, but it is now only the *base* class of a hierarchy
+# (`MiniMaxH3ImageReference` / `MiniMaxH3VideoReference` / `MiniMaxH3AudioReference` in
+# references.py) -- the base class itself carries no `image=`/`video=`/`audio=` fields
+# any more, so app.py's `MiniMaxH3Reference(image=...)` construction (ref2va only) would
+# now raise a plain TypeError at construction time, before ever reaching this module.
+# This import staying valid is exactly why it does NOT ImportError at process start --
+# ref2va's actual breakage only surfaces when a request tries to use it, which is what
+# the RuntimeError guards below (`_ref2va_not_migrated_guard`) are for.
 from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
 
 # The single source of truth for which hidden_states index MiniMax-H3 conditions on
-# (currently 50) -- imported rather than hardcoded so H3_TE_PRUNE (below) always tracks
-# whatever diffusers' own encoders.py/packing.py actually read, even if a future
-# diffusers version changes it. Same "cheap, no model loading" import as
-# MiniMaxH3Reference above.
-from diffusers.modular_pipelines.minimax_h3.packing import MINIMAX_H3_TEXT_ENCODER_LAYER
+# (currently 50). PR #14355 turned the old `packing.MINIMAX_H3_TEXT_ENCODER_LAYER`
+# module constant into the `components.text_encoder_layer` property of
+# `MiniMaxH3ModularPipeline` (modular_pipeline.py) -- there is no longer a module-level
+# constant to import, so this file keeps its own copy here (same value, 50) as the
+# "single source of truth" the rest of this module reads, and H3_TE_PRUNE's layer-count
+# math (`_text_encoder_config_kwargs`, below) uses it the same way it always did. Kept
+# as a plain module constant rather than threaded through `self._pipe.text_encoder_layer`
+# everywhere because several read sites (this constant's own module-docstring comments,
+# `_text_encoder_config_kwargs`) run before a `self._pipe` necessarily exists.
+MINIMAX_H3_TEXT_ENCODER_LAYER = 50
 
 logger = logging.getLogger("minimax_h3.runner")
 
@@ -207,10 +222,11 @@ if TE_QUANT not in ("none", "bnb-4bit"):
 # simply never read) so index 50 sits mid-stack again. Verified bit-identical
 # (`torch.equal`, both bf16 and bnb-4bit nf4) against the unpruned model's
 # `hidden_states[50]` after this fix. This is exactly the failure mode
-# `MiniMaxH3TextEncoderStep.encode_prompt`'s own guard (`if num_layers <=
-# MINIMAX_H3_TEXT_ENCODER_LAYER: raise ValueError(...)`, see encoders.py) was written
-# to catch -- pruning to 50 would have raised there; 51 is the smallest value that both
-# passes that guard and sidesteps the tie_last_hidden_states substitution.
+# `get_qwen3vl_prompt_embeds`'s own guard (`if num_layers <= text_encoder_layer: raise
+# ValueError(...)`, see encoders.py -- this used to be `MiniMaxH3TextEncoderStep.
+# encode_prompt`'s guard pre-PR#14355, same check, moved to the new module function) was
+# written to catch -- pruning to 50 would have raised there; 51 is the smallest value
+# that both passes that guard and sidesteps the tie_last_hidden_states substitution.
 #
 # Applied in `_load_text_encoder()` via `config=` passed straight into
 # `load_components()` (same per-component-kwarg dict shape already used for TE's
@@ -843,6 +859,7 @@ def _encode_ref_prompts_shared_prefix(
     DynamicCache はレイヤー数に自動追従する)。返り値は `prompts` と同順の
     `(prompt_embeds, text_token_tags)` で、encode_prompt と同じ形・dtype 規約。
     """
+    _ref2va_not_migrated_guard("_encode_ref_prompts_shared_prefix")
     import numpy as np
     from diffusers.modular_pipelines.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
     from diffusers.modular_pipelines.minimax_h3.packing_ref2va import (
@@ -964,20 +981,207 @@ def _encode_ref_prompts_shared_prefix(
 def _relaxed_min_duration():
     """静止画モードの間だけ diffusers 側の最小尺バリデーション (5.0s) を緩和する。
 
-    `MINIMAX_H3_MIN_DURATION` の実際の消費箇所は before_encoder.py のみ(packing.py は
-    定義しているだけ)だが、超短尺プローブで実証済みの手順そのままに両モジュールを
-    patch する。生成は app.py の generation_lock で直列化されているため、この一時的な
-    書き換えが並行リクエストへ漏れることはない。scope は `MiniMaxH3SetupStep` の呼び出し
-    1回分だけに絞る(それ以外のブロックはこの定数を読まない)。"""
-    from diffusers.modular_pipelines.minimax_h3 import before_encoder, packing
+    PR #14355 (f37ab93) 後: `MINIMAX_H3_MIN_DURATION` というモジュール定数はもう存在
+    しない。`min_duration` は `MiniMaxH3ModularPipeline` (modular_pipeline.py) の
+    `@property` になり(既定 5.0)、消費箇所も `before_encoder.MiniMaxH3Ref2VASetupStep`
+    (ref2va) と `before_denoise.MiniMaxH3PrepareLayoutStep`(t2va/fl2va -- 静止画
+    モードが通る経路はこちら)の2箇所に分かれた。モジュール定数の monkeypatch は
+    もう効かないので、`MiniMaxH3ModularPipeline` クラスの `min_duration` プロパティ
+    自体を一時的に差し替える -- インスタンス単位ではなくクラス単位なのは、
+    `components.min_duration` を読むブロックが受け取る `components` がこのクラスの
+    インスタンスだから(プロパティはインスタンス属性の代入では上書きできない)。
+    生成は app.py の generation_lock で直列化されているため、この一時的な書き換えが
+    並行リクエストへ漏れることはない。scope は `MiniMaxH3PrepareLayoutStep` の呼び出し
+    1回分だけに絞る(それ以外のブロックはこのプロパティを読まない)。"""
+    from diffusers.modular_pipelines.minimax_h3.modular_pipeline import MiniMaxH3ModularPipeline
 
-    saved = (before_encoder.MINIMAX_H3_MIN_DURATION, packing.MINIMAX_H3_MIN_DURATION)
-    before_encoder.MINIMAX_H3_MIN_DURATION = 0.01
-    packing.MINIMAX_H3_MIN_DURATION = 0.01
+    saved = MiniMaxH3ModularPipeline.min_duration
+    MiniMaxH3ModularPipeline.min_duration = property(lambda self: 0.01)
     try:
         yield
     finally:
-        before_encoder.MINIMAX_H3_MIN_DURATION, packing.MINIMAX_H3_MIN_DURATION = saved
+        MiniMaxH3ModularPipeline.min_duration = saved
+
+
+def _ref2va_not_migrated_guard(caller: str) -> None:
+    """Raise a clear `RuntimeError` for any ref2va entry point until PR #14355's second
+    migration stage lands.
+
+    This task (2026-08-09) ports only the t2i/t2va/still_batch/hires/turbo/FBC paths to
+    diffusers PR #14355's merged shape (f37ab93) -- see README's "今後の外部イベント待ち"
+    §1 for the full audit. ref2va is a separate, larger migration on its own: the
+    `MiniMaxH3Reference` request-facing dataclass became a class hierarchy
+    (`MiniMaxH3ImageReference`/`MiniMaxH3VideoReference`/`MiniMaxH3AudioReference`,
+    references.py), `packing_ref2va.py` (`build_ref2va_presentation`, `reference_kind`,
+    `sample_reference_video_frames`) was deleted with no drop-in replacement, and the old
+    two-shell `pipe`/`pipe_ref` design (`_ensure_pipe_ref_shell`, built around
+    `MiniMaxH3Ref2VABlocks` as a *public* class) does not match the new `workflow="ref2va"`
+    single-shell mechanism (`MiniMaxH3Ref2VABlocks` is no longer exported at all -- ref2va
+    is now folded into `MiniMaxH3Blocks` + `MiniMaxH3AutoDenoiseStep`'s conditional
+    branching). None of that is ported here.
+
+    Rather than let any of the four ref2va entry points
+    (`generate_ref2va`/`generate_ref_batch`/`_ensure_pipe_ref_shell`/
+    `_encode_ref_prompts_shared_prefix`) hit a confusing `ImportError` deep inside a
+    function body (the modules `packing.py`/`packing_ref2va.py` they import from are
+    gone) or a `TypeError` from app.py's now-incompatible `MiniMaxH3Reference(image=...)`
+    construction, this raises upfront with a message that says what is actually going on.
+    Called at the very top of each of those four call sites, before any of their now-stale
+    imports execute. venv stays pinned to abc5e9b (the pre-PR#14355 diffusers) for exactly
+    this reason -- ref2va still works today, just not through this migrated runner.py.
+    """
+    raise RuntimeError(
+        f"{caller}: PR#14355 追従の第2段(ref2va)が未実施です。ref2va は旧ピン留め "
+        "(diffusers abc5e9b) でのみ動作します -- venv を f37ab93 側に切り替えてこの "
+        "runner.py を使う場合、ref2va 系 (generate_ref2va / generate_ref_batch / "
+        "_ensure_pipe_ref_shell / _encode_ref_prompts_shared_prefix) は呼び出せません。"
+        "詳細は README『今後の外部イベント待ち』§1、および runner.py の "
+        "_ref2va_not_migrated_guard の docstring を参照してください。"
+    )
+
+
+def _unpatchify_video_tokens(
+    rows: torch.Tensor,
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    channels: int,
+    patch_size: tuple[int, int, int],
+) -> torch.Tensor:
+    r"""Unpack transformer rows back into a 5D video latent tensor. The inverse of
+    `diffusers.modular_pipelines.minimax_h3.before_denoise.patchify_video_latents`.
+
+    PR #14355 (f37ab93) deleted `packing.py`, which used to export this as
+    `unpatchify_video_tokens` -- there is no replacement upstream at all (the equivalent
+    logic is now inlined directly inside `MiniMaxH3AfterDenoiseStep.__call__`,
+    decoders.py, as part of unpacking a *denoised* sequence back into `latents`/
+    `audio_latents`, not exposed as a standalone function). This project's own policy is
+    to bring back a small self-implementation rather than vendor a private diffusers
+    module (see the "自前実装を好む" project note), so this is a verbatim port of this
+    repo's own copy of the pre-PR#14355 `packing.unpatchify_video_tokens` -- confirmed
+    byte-for-byte identical to the reshape/permute `MiniMaxH3AfterDenoiseStep.__call__`
+    performs on its own `latents` rows (decoders.py), which is the ground truth this port
+    is checked against.
+
+    Only used by hires-fix (`_upscale_block_state_2x`, below), which needs the pass-1 x0
+    estimate as a 5D tensor mid-loop -- before the real `MiniMaxH3AfterDenoiseStep` ever
+    runs (that only happens once, after the whole denoise loop, on the final denoised
+    rows).
+
+    Args:
+        rows (`torch.Tensor` of shape `(num_patches, channels * prod(patch_size))`): The
+            packed rows.
+        num_latent_frames (`int`): Number of latent frames.
+        latent_height (`int`): Latent height.
+        latent_width (`int`): Latent width.
+        channels (`int`): Number of latent channels.
+        patch_size (`tuple[int, int, int]`): The `(t, h, w)` patch.
+
+    Returns:
+        `torch.Tensor` of shape `(batch_size, channels, num_latent_frames, latent_height, latent_width)`.
+    """
+    patch_t, patch_h, patch_w = patch_size
+    rows = rows.reshape(
+        -1,
+        num_latent_frames // patch_t,
+        latent_height // patch_h,
+        latent_width // patch_w,
+        channels,
+        patch_t,
+        patch_h,
+        patch_w,
+    )
+    rows = rows.permute(0, 4, 1, 5, 2, 6, 3, 7)
+    return rows.reshape(-1, channels, num_latent_frames, latent_height, latent_width).contiguous()
+
+
+def _encode_h3_prompt(
+    components,
+    prompt: str,
+    keyframes: list | None,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Build MiniMax-H3's t2va/fl2va presentation of a request and encode it -- the
+    `@torch.no_grad()`-free replacement for the retired
+    `MiniMaxH3TextEncoderStep.encode_prompt` bare staticmethod this file used to call
+    directly (see the call sites' own comments for why bypassing the block's own
+    `__call__` matters here: without an explicit `no_grad()` around this, the autograd
+    graph pins ~50GB of TE weights on GPU past the free that follows).
+
+    PR #14355 (f37ab93) removed `encode_prompt` entirely -- there is no longer a single
+    function that takes a raw prompt string plus optional keyframe images. Its role split
+    across two block `__call__` methods (`MiniMaxH3TextEncoderStep` for t2va,
+    `MiniMaxH3FL2VATextEncoderStep` for fl2va, both in encoders.py) built on top of the
+    new `get_qwen3vl_prompt_embeds` module function, which itself only takes an
+    already-tokenized presentation (`token_ids`/`vision_inputs`), not a prompt string.
+    This function ports the presentation-building half of both `__call__` methods back
+    into one place (read line-for-line from encoders.py as part of this migration; the
+    tokenization shape -- `"<Picture i>: "` label + vision block per keyframe, prompt
+    verbatim, no chat template, no special tokens -- is unchanged from the old
+    `encode_prompt`), then calls `get_qwen3vl_prompt_embeds` for the actual conditioner
+    forward, exactly like both new blocks do internally.
+
+    Args:
+        components: The pipe shell (`MiniMaxH3ModularPipeline` instance) -- `text_encoder`/
+            `tokenizer`/`processor` are read off it, matching every other call site in
+            this file's own naming (`components` is what the modular blocks call this
+            argument too).
+        prompt (`str`): The prompt to encode.
+        keyframes (`list[PIL.Image.Image]` or `None`):
+            The keyframes already prepared onto the target canvas (`MiniMaxH3ResizeStep`'s
+            output), in packed order, or `None`/empty for a t2va (text-only) request.
+        device (`torch.device`, *optional*): The device to run the conditioner on.
+        dtype (`torch.dtype`, *optional*): The dtype of the returned embeddings.
+
+    Returns:
+        `tuple[torch.Tensor, torch.Tensor]`: the `(1, num_text_tokens, 5120)` hidden
+        states and the `(num_text_tokens,)` per-row modality tags, same shape/dtype
+        contract `encode_prompt` used to return.
+    """
+    from diffusers.modular_pipelines.minimax_h3.encoders import get_qwen3vl_prompt_embeds
+
+    tokenizer, processor = components.tokenizer, components.processor
+    text_tag, video_tag = components.text_tag, components.video_tag
+
+    vision_inputs: dict = {}
+    token_ids: list[int] = []
+    token_tags: list[int] = []
+    if keyframes:
+        # Mirrors `MiniMaxH3FL2VATextEncoderStep.__call__` exactly: a `"<Picture i>: "`
+        # label plus one vision block (`<|vision_start|>`, one `<|image_pad|>` per merged
+        # vision patch, `<|vision_end|>`) per keyframe, batched through the image
+        # processor once. The label rows are tagged text, the vision block rows video --
+        # what the transformer's AdaLN modulation keys off.
+        vision = processor.image_processor(images=keyframes, return_tensors="pt")
+        image_grid_thw = vision["image_grid_thw"]
+        vision_inputs = {"pixel_values": vision["pixel_values"], "image_grid_thw": image_grid_thw}
+        merge_size = processor.image_processor.merge_size**2
+        for index in range(len(keyframes)):
+            num_image_tokens = int(image_grid_thw[index].prod()) // merge_size
+            label_ids = tokenizer(f"<Picture {index + 1}>: ", add_special_tokens=False)["input_ids"]
+            vision_ids = (
+                [tokenizer.convert_tokens_to_ids("<|vision_start|>")]
+                + [tokenizer.convert_tokens_to_ids("<|image_pad|>")] * num_image_tokens
+                + [tokenizer.convert_tokens_to_ids("<|vision_end|>")]
+            )
+            token_ids += label_ids + vision_ids
+            token_tags += [text_tag] * len(label_ids) + [video_tag] * len(vision_ids)
+
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    token_ids += prompt_ids
+    token_tags += [text_tag] * len(prompt_ids)
+
+    prompt_embeds = get_qwen3vl_prompt_embeds(
+        components.text_encoder,
+        processor,
+        token_ids,
+        vision_inputs,
+        text_encoder_layer=components.text_encoder_layer,
+        device=device,
+        dtype=dtype,
+    )
+    return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
 
 def _register_minimax_h3_block_for_fbc() -> None:
@@ -1605,7 +1809,16 @@ class MiniMaxH3Runner:
         knows about `transformer_ref`. See the `_pipe_ref` field comment in `__init__` for
         why a second shell is required at all (the t2va shell's spec table has no
         `transformer_ref` entry). Idempotent, and does not load any component weights.
+
+        PR #14355 (f37ab93) note: `MiniMaxH3Ref2VABlocks` is no longer exported from
+        `diffusers.modular_pipelines.minimax_h3` at all -- ref2va folded into the single
+        `MiniMaxH3Blocks` + `MiniMaxH3AutoDenoiseStep` conditional branching, selected via
+        `ModularPipeline.from_pretrained(MODEL_ID, workflow="ref2va")` rather than a second
+        hand-built shell class. This two-shell (`pipe`/`pipe_ref`) design does not carry
+        over as-is, so this method guards instead of migrating -- see
+        `_ref2va_not_migrated_guard`'s docstring.
         """
+        _ref2va_not_migrated_guard("_ensure_pipe_ref_shell")
         self._ensure_pipe_shell()
         if self._pipe_ref is not None:
             return
@@ -1675,6 +1888,27 @@ class MiniMaxH3Runner:
 
         if getattr(self._pipe, "video_processor", None) is None:
             self._pipe.video_processor = VideoProcessor(vae_scale_factor=16, do_normalize=False)
+
+        # PR #14355 (f37ab93) note: `MiniMaxH3ResizeStep` (before_encoder.py, replacing the
+        # old `MiniMaxH3SetupStep`) is a genuinely new consumer of an `image_processor`
+        # component (`ComponentSpec("image_processor", VaeImageProcessor, config=
+        # FrozenDict({"vae_scale_factor": 16}), default_creation_method="from_config")`) --
+        # the pre-PR#14355 `MiniMaxH3SetupStep`/`MiniMaxH3Ref2VASetupStep` this project has
+        # run until now used plain PIL/numpy resize helpers instead and declared zero
+        # `expected_components` (confirmed by reading both in the pinned venv). Bootstrapped
+        # by hand here, mirroring `video_processor`'s own pattern immediately above, for the
+        # same reason: this project calls individual step classes directly rather than
+        # running the full `MiniMaxH3Blocks` auto-pipeline, and it is not verified whether
+        # that hand-assembled call style reliably triggers a `default_creation_method=
+        # "from_config"` component's lazy auto-instantiation the way running the full block
+        # tree would -- `video_processor`'s own manual bootstrap right above is this
+        # project's existing precedent for not relying on that path. LOW CONFIDENCE: this
+        # is new to this migration and has not been exercised against the real f37ab93
+        # venv (see this task's own completion report for the full caveat).
+        from diffusers.image_processor import VaeImageProcessor
+
+        if getattr(self._pipe, "image_processor", None) is None:
+            self._pipe.image_processor = VaeImageProcessor(vae_scale_factor=16)
 
     def _vae_to_gpu(self):
         """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
@@ -2502,6 +2736,39 @@ class MiniMaxH3Runner:
             return prompt_embeds, text_token_tags
         return prompt_embeds.to(DEVICE), text_token_tags
 
+    # PR #14355 マージ版 (f37ab93) 対応: バッチ経路のレイアウト段が作る state テンソルを
+    # デノイズ開始前に計算用GPUへ移すためのキー一覧。新しい before_denoise 系ステップは
+    # 出力テンソルを `components._execution_device` に置くが、バッチの位相並べ替え
+    # (エンコード位相で layout/latents/timesteps まで済ませ、transformer ロードは
+    # デノイズ位相まで遅延)では、その時点の `_execution_device` が解決不能
+    # (TE 外部常駐だと transformer 未ロード・TE デタッチ済みで、CPU 常駐の audio_vae か
+    # フォールバックの cpu に落ちる)なので、テンソルは CPU に生まれる。値は正しく
+    # デバイスだけが違うため、デノイズ直前に明示的に運べばよい。generate() 単発経路は
+    # transformer ロード後に `_pin_execution_device_to_compute()` の窓で回すので不要。
+    _SCENE_STATE_TENSOR_KEYS = (
+        "latents", "audio_latents", "prompt_embeds",
+        "position_ids", "token_tags", "video_indices", "audio_indices", "text_indices",
+        "timesteps", "audio_timesteps", "row_timestep_plan",
+        "condition_latents", "audio_condition_latents",
+    )
+
+    def _scene_state_to_compute(self, state) -> None:
+        """バッチ場面の state テンソル群を計算用GPU (`DEVICE`) へ移す(上のキー一覧の
+        コメント参照)。tensor / list / tuple の入れ子(`row_timestep_plan` は
+        `(unique_timesteps, timestep_indices)` タプルのリスト)を再帰的に運ぶ。
+        既に GPU 上なら `.to()` は no-op なので常に呼んで安全。"""
+        def move(v):
+            if isinstance(v, torch.Tensor):
+                return v.to(DEVICE)
+            if isinstance(v, (list, tuple)):
+                return type(v)(move(x) for x in v)
+            return v
+
+        for key in self._SCENE_STATE_TENSOR_KEYS:
+            v = state.get(key)
+            if v is not None:
+                state.set(key, move(v))
+
     def _detach_te_if_external(self):
         """ロード直後に呼ぶ: 外部常駐 TE の実体を `self._te_module` へ移し、パイプからは
         外す。以後は `_te_attached()` の窓の中でだけ繋がる(理由はそちらの docstring)。"""
@@ -2547,24 +2814,32 @@ class MiniMaxH3Runner:
 
         `_execution_device` は components 順で最初の nn.Module のデバイスを返すため、
         TE を別GPUへ置くと layout/latents/timesteps がそちらにテンソルを作ってしまう
-        (`H3_TE_DEVICE` のコメントの「最大の罠」)。順序は
-        `text_encoder, tokenizer, processor, vae, ...` なので、**text_encoder と vae を
-        一時的にパイプから外す**と次の nn.Module である `transformer` (計算用GPU上) が
-        最初に見つかる。モジュールは runner 側で参照を保持したまま外すだけなので、
-        解放も再ロードも発生しない。
+        (`H3_TE_DEVICE` のコメントの「最大の罠」)。PR #14355 マージ版 (f37ab93) の順序は
+        `image_processor, text_encoder, tokenizer, processor, vae, audio_vae, scheduler,
+        audio_scheduler, transformer_ref, transformer, video_processor` -- **`audio_vae` が
+        `transformer` より前に移動した**(旧版は transformer の後)ので、text_encoder と
+        vae に加えて **audio_vae も一時的にパイプから外さないと、CPU 常駐の audio_vae が
+        最初の nn.Module として拾われて `_execution_device` が cpu に化ける**(マージ版
+        での最初の E2E で position_ids が CPU に作られ、rope() 内の device mismatch として
+        実測再現)。3つ外すと次の nn.Module が `transformer` (計算用GPU上) になる
+        (`transformer_ref` は未ロード時 None なので isinstance スキャンに掛からない)。
+        モジュールは runner 側で参照を保持したまま外すだけなので、解放も再ロードも
+        発生しない。
 
         前提: この窓に入る時点で transformer が計算用GPUにロード済みであること
         (呼び出し側がそう並べる)。
         """
         pipe = self._pipe
-        saved_te, saved_vae = pipe.text_encoder, pipe.vae
+        saved_te, saved_vae, saved_audio_vae = pipe.text_encoder, pipe.vae, pipe.audio_vae
         pipe.text_encoder = None
         pipe.vae = None
+        pipe.audio_vae = None
         try:
             yield
         finally:
             pipe.text_encoder = saved_te
             pipe.vae = saved_vae
+            pipe.audio_vae = saved_audio_vae
 
     def _te_prequant_dir(self) -> Path:
         """量子化済み TE のキャッシュ先。**設定ごとに別ディレクトリ**にする
@@ -2960,13 +3235,26 @@ class MiniMaxH3Runner:
         This function assumes `num_condition_video_rows == 0` / `num_condition_audio_rows
         == 0` (t2va only, no keyframe conditioning rows) -- enforced by the `ValueError`
         `generate()` raises for fl2va + upscale before this is ever reached.
+
+        PR #14355 (f37ab93) note: `packing.py` is gone. `patchify_video_latents` survives
+        as a plain module function in before_denoise.py (imported below, unchanged
+        signature/behaviour). `build_packed_sequence` and `build_row_timesteps` moved onto
+        their respective step classes as `@staticmethod`s and both grew new required
+        arguments (`audio_channels`/`audio_tag`/`video_tag` for the former, an explicit
+        `video_indices`/`audio_indices`/... row-index shape for the latter, replacing the
+        old `MiniMaxH3PackedSequence` namedtuple-style return with a plain positional
+        tuple) -- both call sites below are updated for the new signatures.
+        `unpatchify_video_tokens` has **no replacement upstream at all** (deliberately, per
+        this project's "prefer self-implementation over vendoring" policy) -- it is ported
+        verbatim below as a private module-level helper (`_unpatchify_video_tokens`),
+        copied from this repo's own vendored copy of the pre-PR#14355 packing.py (the
+        algorithm is also, byte-for-byte, what `MiniMaxH3AfterDenoiseStep.__call__` now
+        inlines in decoders.py -- confirmed by reading both).
         """
-        from diffusers.modular_pipelines.minimax_h3.packing import (
-            build_packed_sequence,
-            build_row_timesteps,
+        from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3PrepareLayoutStep,
+            MiniMaxH3SetTimestepsStep,
             patchify_video_latents,
-            unpatchify_video_tokens,
-            MINIMAX_H3_KEYFRAME_NOISE_AUG,
         )
         # NOTE: deliberately NOT using `components._execution_device` here (unlike the
         # rest of this file's calls into the modular blocks). By the time this runs, TE
@@ -2999,7 +3287,7 @@ class MiniMaxH3Runner:
         x0_rows = last_sample.float() + sigma_from_timestep * last_noise_pred.float()
 
         # 2. Unpack the x0 rows into a 5D latent tensor.
-        video_latent = unpatchify_video_tokens(
+        video_latent = _unpatchify_video_tokens(
             x0_rows, num_latent_frames, latent_height, latent_width, vae_latent_channels, patch_size
         )
 
@@ -3040,29 +3328,51 @@ class MiniMaxH3Runner:
         block_state.latents = components.scheduler.scale_noise(x0_upscaled_rows, pass2_start_t, fresh_noise)
 
         # 5. Rebuild the packed layout at the new latent geometry (position_ids/token_tags/
-        # indices all key off latent_height/latent_width -- see build_packed_sequence).
-        # text_token_tags/num_audio_latents are unchanged (audio + text are untouched by the
-        # spatial upscale), only the video row count and its rotary grid change. Calls
-        # `build_packed_sequence` directly (the same function `MiniMaxH3PrepareLayoutStep.
-        # __call__` calls internally) instead of going through the block, so `device` can
-        # be passed explicitly instead of resolved via `components._execution_device`
-        # (unsafe here -- see the NOTE at the top of this function).
-        new_layout = build_packed_sequence(
+        # indices all key off latent_height/latent_width -- see
+        # MiniMaxH3PrepareLayoutStep.build_packed_sequence). text_token_tags/
+        # num_audio_latents are unchanged (audio + text are untouched by the spatial
+        # upscale), only the video row count and its rotary grid change. Calls the
+        # staticmethod directly (the same one `MiniMaxH3PrepareLayoutStep.__call__` calls
+        # internally) instead of going through the block, so `device` can be passed
+        # explicitly instead of resolved via `components._execution_device` (unsafe here --
+        # see the NOTE at the top of this function). PR #14355 made `audio_channels`/
+        # `audio_tag`/`video_tag` required positional arguments -- supplied here from the
+        # same `components` properties `MiniMaxH3PrepareLayoutStep.__call__` itself reads
+        # (`components.audio_channels`/`.audio_tag`/`.video_tag`). The return is now a
+        # plain positional tuple (`position_ids, token_tags, video_indices, audio_indices,
+        # text_indices, num_condition_video_rows, num_condition_audio_rows`), not the old
+        # `MiniMaxH3PackedSequence` namedtuple-style object with `sequence_length` as an
+        # extra field -- unpacked by position below instead of by attribute.
+        (
+            new_position_ids,
+            new_token_tags,
+            new_video_indices,
+            new_audio_indices,
+            new_text_indices,
+            _new_num_condition_video_rows,
+            _new_num_condition_audio_rows,
+        ) = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
             state.get("text_token_tags"),
             num_latent_frames,
             new_h,
             new_w,
             num_audio_latents,
             patch_size,
+            components.audio_channels,
+            components.audio_tag,
+            components.video_tag,
             (),  # keyframe_anchors: t2va only, enforced by the caller.
         )
 
-        block_state.token_tags = new_layout.token_tags.to(device)
-        block_state.position_ids = new_layout.position_ids.to(device)
-        block_state.video_indices = new_layout.video_indices.to(device)
-        block_state.audio_indices = new_layout.audio_indices.to(device)
-        block_state.text_indices = new_layout.text_indices.to(device)
-        # t2va only (enforced by the caller): no conditioning rows, so both stay 0.
+        block_state.token_tags = new_token_tags.to(device)
+        block_state.position_ids = new_position_ids.to(device)
+        block_state.video_indices = new_video_indices.to(device)
+        block_state.audio_indices = new_audio_indices.to(device)
+        block_state.text_indices = new_text_indices.to(device)
+        # t2va only (enforced by the caller): no conditioning rows, so both stay 0 --
+        # matches what `build_packed_sequence` itself returns for an empty
+        # `keyframe_anchors` (`_new_num_condition_video_rows`/`_new_num_condition_audio_rows`
+        # above are always 0 too; assigned explicitly rather than read back for clarity).
         block_state.num_condition_video_rows = 0
         block_state.num_condition_audio_rows = 0
 
@@ -3075,32 +3385,51 @@ class MiniMaxH3Runner:
         # the *absolute* step index (0..num_inference_steps-1), not a pass-relative one --
         # `run_steps()` in generate() keeps calling the loop blocks with the original `i`
         # across the pass-1/pass-2 splice. So this replaces the plan entries from `pass1_steps`
-        # onward (pass 2's own steps) with plans built against `new_layout`, while the
+        # onward (pass 2's own steps) with plans built against the new layout, while the
         # earlier entries (never read again -- pass 2 only iterates i >= pass1_steps) are
         # left as-is, just to keep the list the same full length the denoiser indexes into.
+        #
+        # PR #14355 note: `build_row_timesteps` moved onto `MiniMaxH3SetTimestepsStep` as a
+        # `@staticmethod` and dropped the old `MiniMaxH3PackedSequence` `layout` object in
+        # favour of the individual row-index tensors and counts it actually reads
+        # (`video_indices`/`audio_indices`/`num_condition_video_rows`/
+        # `num_condition_audio_rows`/`num_text_tokens`) -- all already in hand from step 5
+        # above (`new_video_indices`/`new_audio_indices`, and the two condition-row counts,
+        # which are always 0 here). `keyframe_noise_aug` (0.999) is now
+        # `components.keyframe_noise_aug`, a property, replacing the old
+        # `MINIMAX_H3_KEYFRAME_NOISE_AUG` module constant -- same value, same role (the
+        # fixed noise level a conditioning anchor is held at), read the same way
+        # `MiniMaxH3SetTimestepsStep.__call__` itself reads it.
         video_timesteps = state.get("timesteps")
         audio_timesteps = block_state.audio_timesteps
+        num_text_tokens = state.get("text_token_tags").shape[0]
         old_plan = block_state.row_timestep_plan
         new_plan = list(old_plan)
         for i in range(pass1_steps, len(video_timesteps)):
             new_plan[i] = tuple(
                 tensor.to(device)
-                for tensor in build_row_timesteps(
-                    new_layout,
+                for tensor in MiniMaxH3SetTimestepsStep.build_row_timesteps(
+                    new_video_indices,
+                    new_audio_indices,
+                    0,  # num_condition_video_rows: t2va only, enforced by the caller.
+                    0,  # num_condition_audio_rows: t2va only, enforced by the caller.
+                    num_text_tokens,
                     float(video_timesteps[i]),
                     float(audio_timesteps[i]),
-                    max(float(video_timesteps[i]), MINIMAX_H3_KEYFRAME_NOISE_AUG),
+                    max(float(video_timesteps[i]), components.keyframe_noise_aug),
                     1.0,
                 )
             )
         block_state.row_timestep_plan = new_plan
 
-        # Update state's own latent_height/latent_width/layout too, in case anything reads
-        # them again downstream (decode step reads latent_height/latent_width off `state`,
-        # not `block_state` -- see the caller in generate()).
+        # Update state's own latent_height/latent_width too, in case anything reads them
+        # again downstream (decode step reads latent_height/latent_width off `state`, not
+        # `block_state` -- see the caller in generate()). The old `state.set("layout", ...)`
+        # is dropped: it stored the retired `MiniMaxH3PackedSequence` object, which nothing
+        # in this file ever read back via `state.get("layout")` (confirmed by grep) -- it
+        # was write-only bookkeeping, not a real dependency.
         state.set("latent_height", new_h)
         state.set("latent_width", new_w)
-        state.set("layout", new_layout)
         return block_state
 
     # ------------------------------------------------------------------
@@ -3131,8 +3460,10 @@ class MiniMaxH3Runner:
         `still=True` は静止画モード (t2i): `seconds` を無視して `still_frames`
         (STILL_FRAME_CHOICES のいずれか) の超短尺動画を生成し、中央フレームを PNG
         (`t2i_<ts>.png`) として書き出す。超短尺 mp4 も従来どおり保存する。diffusers 側の
-        最小尺 5 秒バリデーションは setup step の間だけ `_relaxed_min_duration()` で
-        緩和する。fl2va (image/last_image) および upscale との併用は未検証のため拒否。
+        最小尺 5 秒バリデーションは `MiniMaxH3PrepareLayoutStep` の呼び出しの間だけ
+        `_relaxed_min_duration()` で緩和する(PR #14355 後、このバリデーションは
+        setup step ではなく layout step が行う -- 詳細はそちらの docstring 参照)。
+        fl2va (image/last_image) および upscale との併用は未検証のため拒否。
 
         `upscale=1` enables two-pass hires-fix: pass 1 denoises `round(num_inference_steps
         * (1 - H3_HIRES_DENOISE))` steps at the requested (height, width), the video latent's
@@ -3154,16 +3485,54 @@ class MiniMaxH3Runner:
         import core.settings as settings
 
         instant = settings.resolve_instant_settings(cache, cache_threshold, attn, turbo)
+        # PR #14355 (f37ab93) import updates (see README "今後の外部イベント待ち" §1 for
+        # the full audit this follows):
+        #   - `MiniMaxH3SetupStep` is gone. Its t2va/fl2va-shared role (canvas defaulting +
+        #     `17*n+5`/duration validation) moved into `MiniMaxH3PrepareLayoutStep.__call__`
+        #     itself (before_denoise.py); its fl2va-only role (putting keyframes onto the
+        #     canvas) is now the separate `MiniMaxH3ResizeStep` (before_encoder.py), run
+        #     only for `is_fl2va` below -- there is no longer a step to run unconditionally
+        #     for both branches the way `MiniMaxH3SetupStep()` used to be.
+        #   - `MiniMaxH3AutoKeyframeVaeEncoderStep` (the conditional auto-block) is gone;
+        #     this file already knows `is_fl2va` itself, so it calls the concrete
+        #     `MiniMaxH3KeyframeVaeEncoderStep` (encoders.py) directly instead of a
+        #     `references`/`image`-sniffing conditional wrapper.
+        #   - `MiniMaxH3TextEncoderStep.encode_prompt` (the bare staticmethod this file used
+        #     to call to get an un-@torch.no_grad()-wrapped encode) is gone, replaced by
+        #     this file's own `_encode_h3_prompt` module helper (defined near the top of
+        #     this file, next to `_unpatchify_video_tokens`), which builds the same
+        #     presentation (tokenize prompt +, for fl2va, prepend a `"<Picture i>: "` label
+        #     and vision block per keyframe -- matching `MiniMaxH3TextEncoderStep`/
+        #     `MiniMaxH3FL2VATextEncoderStep.__call__` line-for-line, both read in full as
+        #     part of this migration) and calls the new module function
+        #     `get_qwen3vl_prompt_embeds` (encoders.py) for the actual conditioner forward.
+        #   - fl2va's keyframe-conditioning noise+pack moved OUT of
+        #     `MiniMaxH3PrepareLatentsStep` (found by cross-checking the old venv's
+        #     `MiniMaxH3PrepareLatentsStep.__call__`, which used to fold in
+        #     `condition_latents`/`audio_condition_latents` from state directly, against the
+        #     new `MiniMaxH3PrepareLatentsStep.__call__`, which no longer reads either --
+        #     this is a real behavioural contract change, not just a rename). Two new steps
+        #     now carry that role, run only for `is_fl2va` and in this exact order relative
+        #     to `MiniMaxH3PrepareLatentsStep` (matches `MiniMaxH3FL2VACoreDenoiseStep`'s own
+        #     block order in modular_blocks_minimax_h3.py -- prepare_layout,
+        #     prepare_condition_latents, prepare_latents, prepare_latents_fl2va):
+        #     `MiniMaxH3PrepareConditionLatentsStep` noises+packs the keyframe VAE-encode
+        #     step's raw `condition_latents` into `condition_rows` *before*
+        #     `MiniMaxH3PrepareLatentsStep` draws the generated rows' own noise (draw order
+        #     is part of what the request's generator reproduces), and
+        #     `MiniMaxH3FL2VAPrepareLatentsStep` prepends `condition_rows` onto `latents`
+        #     *after*.
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3FL2VAPrepareLatentsStep,
+            MiniMaxH3NoKeyframeAnchorsStep,
+            MiniMaxH3PrepareConditionLatentsStep,
             MiniMaxH3PrepareLatentsStep,
             MiniMaxH3PrepareLayoutStep,
             MiniMaxH3SetTimestepsStep,
         )
-        from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3SetupStep
-        from diffusers.modular_pipelines.minimax_h3.modular_blocks_minimax_h3 import (
-            MiniMaxH3AutoKeyframeVaeEncoderStep,
-        )
+        from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3ResizeStep
         from diffusers.modular_pipelines.minimax_h3.decoders import (
+            MiniMaxH3AfterDenoiseStep,
             MiniMaxH3AudioDecodeStep,
             MiniMaxH3VideoDecodeStep,
         )
@@ -3172,7 +3541,7 @@ class MiniMaxH3Runner:
             MiniMaxH3LoopDenoiser,
             MiniMaxH3LoopSchedulerStep,
         )
-        from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3TextEncoderStep
+        from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3KeyframeVaeEncoderStep
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
@@ -3313,29 +3682,36 @@ class MiniMaxH3Runner:
             # in `none` mode, where it is already permanently resident).
             self._vae_to_gpu()
 
-        # --- setup (canvas / frame count / keyframe prep) ---
-        setup_step = MiniMaxH3SetupStep()
-        if still:
-            # 超短尺 (5秒未満) は setup step の duration バリデーションが弾くため、
-            # この1呼び出しの間だけ緩和する(_relaxed_min_duration の docstring 参照)。
-            with _relaxed_min_duration():
-                _, state = setup_step(pipe, state)
+        # --- setup (canvas / keyframe prep) ---
+        # PR #14355 note: there is no longer one `MiniMaxH3SetupStep` shared by both
+        # branches. `MiniMaxH3ResizeStep` (before_encoder.py) now owns fl2va's own half --
+        # putting the keyframes onto the target canvas and resolving `keyframe_anchors`
+        # (`"first"`/`"last"`) -- while `MiniMaxH3NoKeyframeAnchorsStep` (before_denoise.py)
+        # is t2va's declaration that it anchors none (`MiniMaxH3CoreDenoiseStep`'s own
+        # first block, per modular_blocks_minimax_h3.py). Neither step validates duration
+        # or defaults an unset canvas any more -- both moved into
+        # `MiniMaxH3PrepareLayoutStep.__call__` itself (before_denoise.py), which now runs
+        # later in this method regardless of branch, so `_relaxed_min_duration()`'s scope
+        # moves there too (see that call site below) instead of wrapping a setup step here.
+        if is_fl2va:
+            resize_step = MiniMaxH3ResizeStep()
+            _, state = resize_step(pipe, state)
         else:
-            _, state = setup_step(pipe, state)
-        # The setup step's *outputs* (num_frames after alignment, prepared keyframes,
-        # latent geometry) live in the PipelineState -- get_block_state only maps
-        # declared inputs, so read outputs via state.get().
-        actual_num_frames = state.get("num_frames")
+            no_anchors_step = MiniMaxH3NoKeyframeAnchorsStep()
+            _, state = no_anchors_step(pipe, state)
         keyframes = state.get("keyframes")
 
         # --- text encode (still has text_encoder on GPU at this point) ---
         if progress:
             progress.update(phase="encoding", message="プロンプトをエンコード中...")
-        # encode_prompt is a bare staticmethod; the @torch.no_grad() lives on the block
-        # __call__ we bypass. Without no_grad the autograd graph pins ~50GB of TE
+        # `_encode_h3_prompt` (this file's own helper, replacing the retired
+        # `MiniMaxH3TextEncoderStep.encode_prompt` bare staticmethod) is not wrapped in
+        # `@torch.no_grad()` internally, matching the old staticmethod's own contract --
+        # the `@torch.no_grad()` lives on the *block*'s `__call__`, which both this call
+        # and the old one bypass. Without no_grad here the autograd graph pins ~50GB of TE
         # weights on GPU past the free below (observed on the first probe run).
         with self._te_attached(), torch.no_grad():
-            prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
+            prompt_embeds, text_token_tags = _encode_h3_prompt(
                 pipe, prompt, keyframes or None, device=self._encode_device, dtype=torch.bfloat16
             )
         # TE 外部常駐のときはここで計算用GPUへ運ぶ(約42MB)。既定構成では no-op。
@@ -3438,24 +3814,48 @@ class MiniMaxH3Runner:
             # specifically to defer the transformer's ~66GB/34GB load past the keyframe
             # vae-encode step -- unnecessary here since the transformer was never a big
             # *GPU* load in the first place).
-            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
-            _, state = keyframe_step(pipe, state)
+            # PR #14355 note: `MiniMaxH3AutoKeyframeVaeEncoderStep` (the conditional
+            # auto-block that used to skip itself for t2va) is gone -- this file already
+            # knows `is_fl2va`, so it gates the concrete `MiniMaxH3KeyframeVaeEncoderStep`
+            # itself. Required here (not just a redundant optimization): that step's
+            # `keyframes` input is `required=True` with no default, so calling it
+            # unconditionally would raise `ValueError` for every t2va request.
             if is_fl2va:
+                keyframe_step = MiniMaxH3KeyframeVaeEncoderStep()
+                _, state = keyframe_step(pipe, state)
                 self._vae_to_cpu()
 
-            layout_step = MiniMaxH3PrepareLayoutStep()
-            _, state = layout_step(pipe, state)
+            with _relaxed_min_duration() if still else _NullContext():
+                layout_step = MiniMaxH3PrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+            # PR #14355 note: fl2va's keyframe-conditioning noise+pack is no longer folded
+            # into `MiniMaxH3PrepareLatentsStep` itself (that step now only ever draws/packs
+            # the *generated* rows' noise, for every task) -- it moved to two new steps that
+            # only apply when there is conditioning to noise: `MiniMaxH3PrepareConditionLatentsStep`
+            # (noises + packs the raw `condition_latents` the keyframe VAE-encode step above
+            # produced, *before* `MiniMaxH3PrepareLatentsStep` draws the generated rows' own
+            # noise -- draw order is part of what the request's generator reproduces) and
+            # `MiniMaxH3FL2VAPrepareLatentsStep` (prepends the now-noised `condition_rows` to
+            # `latents` *after* -- mirrors `MiniMaxH3FL2VACoreDenoiseStep`'s own block order
+            # in modular_blocks_minimax_h3.py: prepare_layout, prepare_condition_latents,
+            # prepare_latents, prepare_latents_fl2va).
+            if is_fl2va:
+                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            if is_fl2va:
+                fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
+                _, state = fl2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
         elif H3_LOWVRAM:
             # fl2va's keyframe step (if any) runs here too, while TE is still resident
             # (harmless -- it only touches vae/scheduler, not TE) and `vae` is already
             # on GPU from the `is_fl2va` block above this function's setup section.
-            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
-            _, state = keyframe_step(pipe, state)
             if is_fl2va:
+                keyframe_step = MiniMaxH3KeyframeVaeEncoderStep()
+                _, state = keyframe_step(pipe, state)
                 self._vae_to_cpu()
 
             if self._te_external:
@@ -3468,10 +3868,20 @@ class MiniMaxH3Runner:
                 with self._load_lock:
                     self._ensure_transformer(progress)
                 with self._pin_execution_device_to_compute():
-                    layout_step = MiniMaxH3PrepareLayoutStep()
-                    _, state = layout_step(pipe, state)
+                    with _relaxed_min_duration() if still else _NullContext():
+                        layout_step = MiniMaxH3PrepareLayoutStep()
+                        _, state = layout_step(pipe, state)
+                    # See the `H3_LOWVRAM_GROUP` branch above for why fl2va needs these two
+                    # extra steps now (condition-noise moved out of
+                    # `MiniMaxH3PrepareLatentsStep`).
+                    if is_fl2va:
+                        condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                        _, state = condition_latents_step(pipe, state)
                     latents_step = MiniMaxH3PrepareLatentsStep()
                     _, state = latents_step(pipe, state)
+                    if is_fl2va:
+                        fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
+                        _, state = fl2va_latents_step(pipe, state)
                     timesteps_step = MiniMaxH3SetTimestepsStep()
                     _, state = timesteps_step(pipe, state)
             else:
@@ -3479,10 +3889,19 @@ class MiniMaxH3Runner:
                 # `_execution_device` resolves via `text_encoder` (still resident on GPU)
                 # here, exactly like every non-lowvram bnb-4bit branch's own
                 # `force_free_te`-deferred ordering achieves -- see the long comment above.
-                layout_step = MiniMaxH3PrepareLayoutStep()
-                _, state = layout_step(pipe, state)
+                with _relaxed_min_duration() if still else _NullContext():
+                    layout_step = MiniMaxH3PrepareLayoutStep()
+                    _, state = layout_step(pipe, state)
+                # See the `H3_LOWVRAM_GROUP` branch above for why fl2va needs these two extra
+                # steps now (condition-noise moved out of `MiniMaxH3PrepareLatentsStep`).
+                if is_fl2va:
+                    condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                    _, state = condition_latents_step(pipe, state)
                 latents_step = MiniMaxH3PrepareLatentsStep()
                 _, state = latents_step(pipe, state)
+                if is_fl2va:
+                    fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
+                    _, state = fl2va_latents_step(pipe, state)
                 timesteps_step = MiniMaxH3SetTimestepsStep()
                 _, state = timesteps_step(pipe, state)
 
@@ -3501,17 +3920,33 @@ class MiniMaxH3Runner:
             # the transformer is loaded, not after. TE stays resident throughout (it is
             # not involved in this step); fl2va + upscale is rejected earlier in this
             # function, so force_free_te is always False on this branch.
-            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
+            # (`is_fl2va` is always True on this branch, so `MiniMaxH3KeyframeVaeEncoderStep`
+            # runs unconditionally here -- see the `H3_LOWVRAM_GROUP`/`H3_LOWVRAM` branches
+            # above for why other branches gate this on `is_fl2va` instead.)
+            keyframe_step = MiniMaxH3KeyframeVaeEncoderStep()
             _, state = keyframe_step(pipe, state)
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer(progress)
 
             # --- layout / latents / timesteps ---
-            layout_step = MiniMaxH3PrepareLayoutStep()
-            _, state = layout_step(pipe, state)
+            # `still` is always False here (fl2va + still=True is rejected earlier in this
+            # function), so `_relaxed_min_duration()` never actually triggers on this
+            # branch -- wrapped anyway for the same reason every other branch is, so the
+            # scoping rule ("min_duration only relaxed around MiniMaxH3PrepareLayoutStep")
+            # holds uniformly across all branches rather than as a special case.
+            with _relaxed_min_duration() if still else _NullContext():
+                layout_step = MiniMaxH3PrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+            # `is_fl2va` is always True on this branch (see the comment above), so these
+            # two run unconditionally -- see the `H3_LOWVRAM_GROUP` branch's own comment
+            # for why fl2va needs them now.
+            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+            _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
+            _, state = fl2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
         else:
@@ -3531,18 +3966,40 @@ class MiniMaxH3Runner:
                 self._free_text_encoder()
                 self._ensure_transformer(progress)
 
-            # --- keyframe VAE conditioning (fl2va + `none` mode only; vae already
-            # permanently resident in `none` mode) ---
-            keyframe_step = MiniMaxH3AutoKeyframeVaeEncoderStep()
-            _, state = keyframe_step(pipe, state)
+            # --- keyframe VAE conditioning (fl2va only; vae already permanently resident
+            # in `none` mode, already brought to GPU by the `is_fl2va` block earlier in
+            # this method for `bnb-4bit` t2va/fl2va) --- this branch serves both t2va and
+            # fl2va (it is the catch-all "everything else" arm), so -- same reasoning as
+            # the `H3_LOWVRAM`/`H3_LOWVRAM_GROUP` branches above -- the now-required
+            # `keyframes` input of `MiniMaxH3KeyframeVaeEncoderStep` means this has to be
+            # gated on `is_fl2va` rather than called unconditionally.
+            if is_fl2va:
+                keyframe_step = MiniMaxH3KeyframeVaeEncoderStep()
+                _, state = keyframe_step(pipe, state)
 
             # --- layout / latents / timesteps ---
-            layout_step = MiniMaxH3PrepareLayoutStep()
-            _, state = layout_step(pipe, state)
+            with _relaxed_min_duration() if still else _NullContext():
+                layout_step = MiniMaxH3PrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+            # See the `H3_LOWVRAM_GROUP` branch above for why fl2va needs these two extra
+            # steps now (condition-noise moved out of `MiniMaxH3PrepareLatentsStep`).
+            if is_fl2va:
+                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            if is_fl2va:
+                fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
+                _, state = fl2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
+
+        # `num_frames` is only resolved (aligned to `17*n+5`) by `MiniMaxH3PrepareLayoutStep`
+        # now, which runs inside the branch above -- moved here (out of every branch) so it
+        # reads the post-layout_step value regardless of which branch ran. PR #14355 note:
+        # this used to be read right after the old shared `MiniMaxH3SetupStep()` call,
+        # which no longer exists (see the "setup (canvas / keyframe prep)" comment above).
+        actual_num_frames = state.get("num_frames")
 
         # --- denoise loop, instrumented for progress polling ---
         if progress:
@@ -3553,8 +4010,9 @@ class MiniMaxH3Runner:
         pass1_time = None
         interpolate_time = None
         pass2_time = None
-        # Canonical (post-setup) resolution -- MiniMaxH3SetupStep resolves `None` and
-        # snaps to the canvas rules, so this is not necessarily identical to the raw
+        # Canonical (post-layout) resolution -- `MiniMaxH3PrepareLayoutStep` (t2va) /
+        # `MiniMaxH3ResizeStep` (fl2va, via keyframes' own aspect ratio) resolve `None` and
+        # snap to the canvas rules, so this is not necessarily identical to the raw
         # `height`/`width` args.
         out_height, out_width = state.get("height"), state.get("width")
 
@@ -3764,6 +4222,23 @@ class MiniMaxH3Runner:
 
             denoise_wrapper.set_block_state(state, block_state)
         denoise_time = time.time() - t_denoise
+
+        # PR #14355 note: the old `MiniMaxH3VideoDecodeStep` used to unpatchify the
+        # denoised video rows internally before decoding. The new decode contract splits
+        # that out into its own step, `MiniMaxH3AfterDenoiseStep` (decoders.py): it drops
+        # the leading conditioning rows the loop never wrote (`num_condition_video_rows`/
+        # `num_condition_audio_rows`, both 0 for every path this function drives -- fl2va's
+        # keyframe rows and hires-fix are both t2va/fl2va-only, never carrying ref2va-style
+        # conditioning rows past this point) and reshapes `latents`/`audio_latents` from
+        # packed rows back into the 5D video tensor / channel-major audio tensor
+        # `MiniMaxH3VideoDecodeStep`/`MiniMaxH3AudioDecodeStep` now expect as input. This
+        # has to run once, after the whole denoise loop (single-pass or the hires-fix
+        # pass1+pass2 splice, both converge on `state` by this point), and before either
+        # decode step below -- matches where `after_denoise` sits in
+        # `MiniMaxH3CoreDenoiseStep`/`MiniMaxH3FL2VACoreDenoiseStep`'s own block list
+        # (modular_blocks_minimax_h3.py), right before the separate `MiniMaxH3DecodeStep`.
+        after_denoise_step = MiniMaxH3AfterDenoiseStep()
+        _, state = after_denoise_step(pipe, state)
 
         if os.environ.get("H3_DEBUG_MEM_DIAG") == "1":
             _log_gpu_tensor_diag("post-denoise, pre-decode (t2va)")
@@ -4081,18 +4556,25 @@ class MiniMaxH3Runner:
             )
 
         instant = settings.resolve_instant_settings(cache, cache_threshold, attn, turbo)
+        # PR #14355 (f37ab93) import updates -- same shape as `generate()`'s own (see that
+        # method's matching comment for the full reasoning), simpler here since this method
+        # is t2i-only (no keyframes, ever -- `state.set("image", None)` below): no
+        # `MiniMaxH3ResizeStep` is needed, only `MiniMaxH3NoKeyframeAnchorsStep` (t2va's
+        # "I anchor no keyframes" declaration, replacing the retired `MiniMaxH3SetupStep`)
+        # and `MiniMaxH3AfterDenoiseStep` (unpatchify, now a separate step -- see
+        # `generate()`'s own comment at its call site for the full contract change).
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3NoKeyframeAnchorsStep,
             MiniMaxH3PrepareLatentsStep,
             MiniMaxH3PrepareLayoutStep,
             MiniMaxH3SetTimestepsStep,
         )
-        from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3SetupStep
         from diffusers.modular_pipelines.minimax_h3.decoders import (
+            MiniMaxH3AfterDenoiseStep,
             MiniMaxH3AudioDecodeStep,
             MiniMaxH3VideoDecodeStep,
         )
         from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3DenoiseStep
-        from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3TextEncoderStep
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
@@ -4138,20 +4620,26 @@ class MiniMaxH3Runner:
             state.set("condition_latents", None)
             state.set("audio_condition_latents", None)
 
-            setup_step = MiniMaxH3SetupStep()
-            with _relaxed_min_duration():
-                _, state = setup_step(pipe, state)
+            # t2i is always t2va (no keyframes) -- `MiniMaxH3NoKeyframeAnchorsStep` is the
+            # PR #14355 replacement for the retired `MiniMaxH3SetupStep()` call this used to
+            # make (see `generate()`'s matching comment for the full contract change); the
+            # canvas/duration validation `MiniMaxH3SetupStep` used to also perform now lives
+            # in `MiniMaxH3PrepareLayoutStep` itself, so `_relaxed_min_duration()`'s scope
+            # moves down to wrap that call instead, below.
+            no_anchors_step = MiniMaxH3NoKeyframeAnchorsStep()
+            _, state = no_anchors_step(pipe, state)
 
             with self._te_attached(), torch.no_grad():
-                prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
+                prompt_embeds, text_token_tags = _encode_h3_prompt(
                     pipe, prompt, None, device=self._encode_device, dtype=torch.bfloat16
                 )
             prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
             state.set("prompt_embeds", prompt_embeds)
             state.set("text_token_tags", text_token_tags)
 
-            layout_step = MiniMaxH3PrepareLayoutStep()
-            _, state = layout_step(pipe, state)
+            with _relaxed_min_duration():
+                layout_step = MiniMaxH3PrepareLayoutStep()
+                _, state = layout_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
@@ -4171,6 +4659,9 @@ class MiniMaxH3Runner:
         total_steps_all = num_inference_steps * n_scenes
         for idx, scene in enumerate(scenes):
             state = scene["state"]
+            # PR #14355 対応: レイアウト段が CPU に作った state テンソルを計算用GPUへ
+            # (`_scene_state_to_compute` の docstring 参照。既に GPU なら no-op)。
+            self._scene_state_to_compute(state)
             # 場面間のスケジューラリセット (docstring 参照): 値は全場面同一なので
             # _step_index だけ初期化すれば step() が timestep から再導出する。
             pipe.scheduler._step_index = None
@@ -4206,6 +4697,16 @@ class MiniMaxH3Runner:
                     _, state = denoise_step(pipe, state)
             else:
                 _, state = denoise_step(pipe, state)
+            # PR #14355 note: unpatchify is a separate step now (`MiniMaxH3AfterDenoiseStep`,
+            # decoders.py) -- see `generate()`'s matching comment for the full contract
+            # change. Run once per scene, right after that scene's own denoise loop
+            # finishes (while its `state` is still the active one in this per-scene loop),
+            # rather than deferred to the decode-phase loop below -- it only reshapes
+            # `state`'s own tensors (no vae/transformer dependency), so there is no
+            # residency reason to defer it, and doing it here keeps every per-scene `state`
+            # fully decode-ready by the time `scene["state"] = state` is stored.
+            after_denoise_step = MiniMaxH3AfterDenoiseStep()
+            _, state = after_denoise_step(pipe, state)
             scene["state"] = state
             scene["denoise_time_s"] = round(sum(step_times), 2)
             scene["avg_step_time_s"] = round(sum(step_times) / len(step_times), 3) if step_times else None
@@ -4371,7 +4872,12 @@ class MiniMaxH3Runner:
 
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats, in the
         same shape `generate()` returns (plus `references_summary`).
+
+        NOT MIGRATED to PR #14355 (f37ab93) as of 2026-08-09 -- raises immediately. See
+        `_ref2va_not_migrated_guard`'s docstring for the reasons (references.py class
+        hierarchy, deleted packing_ref2va.py, workflow-based single-shell design).
         """
+        _ref2va_not_migrated_guard("generate_ref2va")
         import core.settings as settings
 
         instant = settings.resolve_instant_settings(cache, cache_threshold, attn, turbo)
@@ -5001,7 +5507,11 @@ class MiniMaxH3Runner:
         seed は全場面共通。t2i_batch と同じく decode は場面ごとに保存しながら進むので
         途中失敗でも完了分は残る。`H3_LOWVRAM=1` 以外では呼ばない (app.py 側で逐次
         generate_ref2va() にフォールバック)。
+
+        NOT MIGRATED to PR #14355 (f37ab93) as of 2026-08-09 -- raises immediately, same
+        reasons as `generate_ref2va` (see `_ref2va_not_migrated_guard`'s docstring).
         """
+        _ref2va_not_migrated_guard("generate_ref_batch")
         import core.settings as settings
 
         if not H3_LOWVRAM:

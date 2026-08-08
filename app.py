@@ -44,8 +44,22 @@ from core.runner import (
     MiniMaxH3Reference,
     MiniMaxH3Runner,
     ProgressState,
+    _ref2va_not_migrated_guard,
     seconds_to_num_frames,
 )
+
+
+def _reject_if_ref2va_not_migrated(caller: str) -> None:
+    """PR #14355 追従の第2段が未実施の間、ref2va 系エンドポイントを 503 で返す。
+
+    runner 側の `_ref2va_not_migrated_guard` と同じ理由だが、そこへ到達する前に
+    `MiniMaxH3Reference(image=...)` の構築が新APIの TypeError で落ちて
+    「読み込みに失敗」という紛らわしいエラーになる(実測)ため、参照構築より
+    **手前**でこのガードを通す。"""
+    try:
+        _ref2va_not_migrated_guard(caller)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("minimax_h3.app")
@@ -600,6 +614,7 @@ def api_ref2va(
     「スパイク: Ref2VA×超短尺」参照)。
     """
     global _current_progress
+    _reject_if_ref2va_not_migrated("/api/ref2va")
 
     if not prompt or not prompt.strip():
         raise HTTPException(400, "prompt is required")
@@ -714,6 +729,7 @@ def _run_ref_batch(
     (変えられるのはプロンプトのみ)。
     """
     global _current_progress
+    _reject_if_ref2va_not_migrated("_run_ref_batch")
 
     if still and frames not in STILL_FRAME_CHOICES:
         raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")

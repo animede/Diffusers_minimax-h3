@@ -59,8 +59,11 @@ python3.12 -m venv venv
 # PyTorch (cu128)
 venv/bin/pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 
-# diffusers は PR #14355 の「検証済みコミットに固定」して入れる(下の注意を必ず読むこと)
-venv/bin/pip install "git+https://github.com/huggingface/diffusers.git@abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc"
+# diffusers は「検証済みコミットに固定」して入れる(下の注意を必ず読むこと)。
+# このブランチ (migrate-pr14355) はマージ版 f37ab93 が前提。t2i/t2va/バッチは
+# 同一seed MD5 回帰済みだが、ref2va 系は未追従(503 を返す)-- ref2va が要るなら
+# main + 旧ピン abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc を使うこと。
+venv/bin/pip install "git+https://github.com/huggingface/diffusers.git@f37ab93e621d5ce206c9662e8291ca8b67d9c555"
 
 # transformers は 5.14.1 以上が必須
 #   (5.1.0 には Qwen3VLProcessor.create_mm_token_type_ids が無く、PR #14355 のエンコーダが動かない)
@@ -78,12 +81,11 @@ venv/bin/pip install torchao==0.17.0
 ```
 
 > **重要: diffusers はコミット固定のまま使うこと。**
-> PR #14355 は **2026-08-05 にマージ済み**だが、本アプリは未追従。Modular のブロック
-> (`MiniMaxH3SetTimestepsStep` / `MiniMaxH3LoopDenoiser` 等)を自前で呼び、
-> `get_block_state()` / `state.get(...)` / `row_timestep_plan` といった state 契約に
-> 強く依存しており、マージ版では **packing.py/packing_ref2va.py の削除を含む大規模
-> リファクタ**が入っているため、上げると ImportError で起動すらしない(2026-08-09 に
-> 影響調査済み)。詳細は末尾「今後の外部イベント待ち」の §1 を参照。
+> PR #14355 は **2026-08-05 にマージ済み**。このブランチ (migrate-pr14355) は
+> **第1段追従済み**: t2i/t2va/バッチ経路はマージ版 f37ab93 に対して**同一seed MD5
+> 完全一致**で回帰済み(末尾「追従 第1段」節)。**ref2va 系のみ未追従**(第2段、
+> エンドポイントは 503 を返す)。main ブランチは旧ピン abc5e9b 前提のまま。
+> 詳細は末尾「今後の外部イベント待ち」の §1 を参照。
 
 ### SageAttention(任意、既定で有効)
 
@@ -1469,6 +1471,41 @@ turboなし 30steps は t2i で 51.1s(上記実測)— 素の 157s に対し、3
 固定費撤廃だけで3倍速い。
 
 詳細な VRAM 収支の導出・位相×常駐表は `docs/RESIDENCY.md` §5.5・§5.6 を参照。
+
+## 2026-08-09: PR #14355 マージ版 (f37ab93) への追従 第1段 — t2i/t2va/バッチ、同一seed MD5 完全一致
+
+ブランチ migrate-pr14355。runner.py の t2i/t2va/still_batch/hires/turbo/FBC 経路を
+マージ版の新契約(§1 の影響調査参照)へ移植し、venv を f37ab93 へ差し替え
+(`--no-deps --force-reinstall`、他の依存は不変)。**ref2va 系は第2段送り**
+(app.py/runner.py 両方にガード、503 + 明確なメッセージ)。
+
+**回帰結果(全て abc5e9b で記録したベースラインと同一 seed で比較)**:
+
+| 経路 | 結果 | MD5 |
+|---|---|---|
+| t2i turbo 4steps seed=11 | 定常 9.24s(移行前 9.7s) | **PNG 完全一致** |
+| t2i turbo 4steps seed=12 | 9.24s | **PNG 完全一致** |
+| t2i 30steps seed=1 | 49.65s | **PNG 完全一致** |
+| t2va 5秒 turbo seed=21 | 41.54s、peak 44.15GB(同値) | **MP4 完全一致** |
+| t2i_batch 2場面 seed=11 | 16.47s(8.2s/枚) | 場面1 = 単発 seed=11 **完全一致** |
+
+数値経路(スケジューラ/transformer/VAE)が無変更という影響調査の結論どおり、
+**移行はビット等価**。性能・VRAM ピークも移行前と同値。
+
+**移植で踏んだ新しい罠2つ(いずれも `_execution_device` の変種)**:
+
+1. **components 順で `audio_vae` が `transformer` より前に移動した**(旧:
+   `text_encoder, tokenizer, processor, vae, scheduler, audio_scheduler, transformer,
+   video_processor, audio_vae` → 新: `image_processor, text_encoder, tokenizer,
+   processor, vae, audio_vae, scheduler, audio_scheduler, transformer_ref, transformer,
+   video_processor`)。`_pin_execution_device_to_compute()` が text_encoder と vae しか
+   外していなかったため、CPU 常駐の audio_vae が最初の nn.Module として拾われ、
+   新レイアウトステップ(出力を `_execution_device` に置く契約)が position_ids を
+   CPU に作り、rope() 内で device mismatch(実測再現)。→ audio_vae も窓の間外す
+2. **バッチの位相並べ替えではレイアウト段の `_execution_device` が解決不能**
+   (TE 外部常駐だと transformer 未ロード+TE デタッチ済み)→ テンソルが CPU に
+   生まれる。値は正しいので、デノイズ直前に `_scene_state_to_compute()` で明示的に
+   計算GPUへ運ぶ(既に GPU なら no-op)
 
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
