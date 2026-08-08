@@ -76,6 +76,13 @@ TE と transformer が**両方とも常駐しっぱなし**。VAE だけがフ�
 | + `H3_TE_PREQUANT=1` | 21〜34s | 32.5s | **~55s** |
 | + `H3_TE_DEVICE=cuda:1` | **0s** | 14.8〜32.7s | **~25s** |
 
+**`H3_KEEP_TRANSFORMER=1` を重ねた場合**(`H3_TE_DEVICE` 設定必須、詳細は §5.5): 上の
+表の「(transformer 解放)」行と「デコード」行が変わる — transformer は**デコード位相でも
+解放されず**、**リクエストをまたいでも常駐したまま**になる(「入口」の解放も発生しない)。
+常駐し続けるのは初回ロードの1回のみで、transformer ロードの固定費(14.8〜32.7s)は
+初回だけに収束する。デコード位相のピークは transformer 34.3GB 常駐 + fp16 デコード
+~11.4GB(`H3_VIDEO_VAE_FP16=1` 必須)。実測は §5.5 参照。
+
 ### `H3_LOWVRAM=group`(24-32GB級)
 
 transformer は**ホストRAMに常駐**し、ブロック単位(1〜2個、~1.4GB)で GPU を往復する。
@@ -110,7 +117,7 @@ transformer は**ホストRAMに常駐**し、ブロック単位(1〜2個、~1.4
 | 「`H3_TE_PREQUANT` で TE が常駐するようになる」 | **違う**。ロードするタイミングは変わらない。**ロードが速くなるだけ**(53s→29.5s) |
 | 「turbo にすると VRAM が増える/減る」 | ほぼ変わらない。LoRA はラッパーで、初回に 1.38GB を読むだけ |
 | 「`H3_LOWVRAM=group` は 1 より常に省メモリで遅い」 | 省メモリは正しいが、**静止画では group の方が遅い**(ブロック転送が固定費で、計算が軽い超短尺では転送が支配する) |
-| 「TE を別GPUに置けば固定費がゼロになる」 | TE 分だけ。**transformer のロード(14.8〜32.7s)は残る**(デコード前に解放しているため) |
+| 「TE を別GPUに置けば固定費がゼロになる」 | TE 分だけ。**transformer のロード(14.8〜32.7s)は残る**(デコード前に解放しているため)。ただし `H3_KEEP_TRANSFORMER=1` を重ねればこれも初回のみに収束する(§5.5) |
 
 ---
 
@@ -188,19 +195,47 @@ TE用GPUに必要な容量は用途で変わる。
 ただし余裕 1.7GB は薄く、参照画像を 2枚以上にするとさらに要求が増える(実測では
 2枚でも OOM した)。**24GB でも ref2va の複数参照は保証できない。**
 
-### 5.5 未検証の組み合わせ(容量的には成立しうる)
+### 5.5 `H3_KEEP_TRANSFORMER=1` — transformer 常駐のままデコード(2026-08-09 実測・成立)
 
-**transformer を常駐させたままデコードする**構成。固定費(transformer ロード 14.8〜32.7s)が
-消えるが、現状は入らない:
+**transformer を常駐させたままデコードする**構成。固定費(transformer ロード 14.8〜32.7s、
+`H3_LOWVRAM=1` では毎リクエスト発生)が消える。5.3 の不等式どおり fp32 デコードでは
+入らないが、`H3_VIDEO_VAE_FP16=1` を使うと入る:
 
 ```
-transformer 34.3 + デコードピーク 16.29 = 50.6GB  > 48GB   ← 現状 不可
-transformer 34.3 + 11.4 (H3_VIDEO_VAE_FP16=1)   = 45.7GB  < 48GB  ← 入る可能性
+transformer 34.3 + デコードピーク 16.29 = 50.6GB  > 48GB   ← 不可(fp32 VAE)
+transformer 34.3 + 11.4 (H3_VIDEO_VAE_FP16=1)   = 45.7GB  < 48GB  ← 導出予測
 ```
 
-video VAE fp16 は PSNR 39.97dB(目視区別不能)と実測済みなので品質面の障害は小さいが、
-**余裕が 2GB 程度しかなく未検証**。試す場合は `H3_VIDEO_VAE_FP16=1` を有効にした上で、
-デコード前の `_free_transformer()` を条件付きでスキップする改修が要る。
+`core/runner.py` の `H3_KEEP_TRANSFORMER=1` として実装済み。成立条件は import 時ガードで
+強制する(3つとも必須、欠けたら `RuntimeError`):
+
+1. `H3_LOWVRAM=1`(raw `"1"` のみ。`group` は対象外 — 別設計のため無関係)
+2. `H3_TE_DEVICE` 設定済み(TE が別GPU。**さもないとエンコード位相が先に破綻する**:
+   TE-nf4 17.45GB + 常駐transformer-int8 34.3GB = 51.75GB > 実効予算)
+3. `H3_VIDEO_VAE_FP16=1`(fp32 では上記のとおり 50.6GB で入らない)
+
+既定(`H3_KEEP_TRANSFORMER=0`)は挙動不変。`transformer_ref`(ref2va 経路)は対象外で
+従来どおり毎回解放される。
+
+**実機 E2E 実測(2026-08-09、48GB GPU0 + 20GB GPU1、`H3_LOWVRAM=1 H3_TE_PRUNE=1
+H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`)**:
+
+- transformer(int8) は初回リクエストで1回だけロード(32.0s)。以降のリクエストで再ロード
+  なし(サーバーログで確認)
+- t2i turbo 4steps 定常: **9.7s/枚**(denoise 4.32s、decode 1.5s)。peak VRAM 41.97GB
+  (デノイズ時)
+- t2i steps=30 定常: 51.1s(denoise 45.7s)。peak 41.97GB
+- t2va 5秒 turbo 4steps: **44.2s**(denoise 26.05s、decode 10.81s)。**peak VRAM
+  44.15GB = デコード位相**(transformer 34.03GB 常駐 + fp16 デコード)。上記の導出予測
+  45.7GB に対し実測 44.15GB、カタログ 48.9GB に対し余裕 ~4.8GB
+- nvidia-smi 実測ピーク 42,620 MiB(1秒サンプリング。瞬間ピークは torch 計測の
+  44.15GB が正)
+- 同一seed 出力等価性: フラグOFFのベースライン(他は同条件)と PNG MD5 **完全一致**
+  (seed=11、md5 `665eadddea8f34298a1b5b89e69d4bd0`)。ベースライン側は total 63.27s
+  (transformer ロード込み)/ peak 36.4GB
+- 高速化の系譜: t2i turbo 157s(08-07朝)→ 83.2s(`H3_TE_PREQUANT`)→ ~35s
+  (`H3_TE_DEVICE`)→ **9.7s**(`H3_KEEP_TRANSFORMER`)。t2va 5s turbo:
+  143s → 60.5s → **44.2s**
 
 ### 5.6 導出式の検算(全ケースで実測と一致)
 
@@ -213,8 +248,8 @@ video VAE fp16 は PSNR 39.97dB(目視区別不能)と実測済みなので品�
 | TE用GPU 24GB・ref2va | 20.67 / 24.27 | OK | (未実測・期待値) |
 | GPU0 48GB・デノイズ | 40.60 / 49.81 | OK | ○ peak 40.89 |
 | GPU0 48GB・TE常駐のままデノイズ | 58.05 / 49.81 | NG | ○ だから毎回入れ替えている |
-| GPU0 48GB・transformer常駐のままデコード | 50.29 / 49.81 | NG | (未実装) |
-| 同上 + video VAE fp16 | 45.40 / 49.81 | OK | (未検証・§5.5) |
+| GPU0 48GB・transformer常駐のままデコード | 50.29 / 49.81 | NG | (fp32 VAEでは未実装のまま) |
+| 同上 + video VAE fp16(`H3_KEEP_TRANSFORMER=1`) | 45.70 予測 / 49.81 | OK | ○ 実測 44.15GB(§5.5、2026-08-09) |
 
 **GPU を替えたらこの式に新しい容量を入れて再導出すること。** 表を覚え直す必要はない。
 

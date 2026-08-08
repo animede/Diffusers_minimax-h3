@@ -1405,6 +1405,63 @@ UI は Ref2VA タブの「バッチ連続生成(1行=1場面)」チェック(静
   前に発生し、~98.5GB残留で後続リクエストがOOMする連鎖を観測 → 上記3のクリーンアップ
   経路として本実装に反映済み
 
+## 2026-08-09: H3_KEEP_TRANSFORMER — transformer 常駐で毎リクエスト再ロード固定費を撤廃
+
+`H3_LOWVRAM=1` はデコード直前に transformer を解放し、次リクエストで**毎回**再ロードする
+(実測 14.8〜32.7s の固定費、`docs/RESIDENCY.md` §5.5)。`H3_KEEP_TRANSFORMER=1` はこの
+解放をスキップし、transformer を GPU に常駐させたまま次のリクエストに持ち越すことで
+この固定費を初回ロードの1回だけに収束させる。
+
+**成立条件は3つとも必須**(`core/runner.py` の import 時ガードで強制、欠けたら
+`RuntimeError`)。VRAM 収支の理由:
+
+1. `H3_LOWVRAM=1`(raw `"1"` のみ。`group` は transformer をホストRAM常駐+ブロック
+   offload する別設計のため対象外)
+2. `H3_TE_DEVICE` 設定済み(TE を別GPUに常駐)— **これが無いとエンコード位相が先に
+   破綻する**: TE-nf4 17.45GB + 常駐transformer-int8 34.3GB = 51.75GB が実効予算を
+   超える
+3. `H3_VIDEO_VAE_FP16=1` — encode 位相は TE を別GPUに逃がすことで回避できるが、
+   decode 位相は fp32 デコードピーク16.29GBのままだと transformer 34.3 + 16.29 =
+   50.6GB で実効予算(~49.8GB)を超える。fp16 化した VAE のデコードピーク ~11.4GB
+   なら 34.3 + 11.4 = 45.7GB で収まる(video VAE fp16 の品質影響は既知実測 PSNR
+   **39.97dB**・目視差なし、詳細は「video VAE の fp16 化」節)
+
+既定(`H3_KEEP_TRANSFORMER=0`)は挙動不変。**ref2va(`transformer_ref`)は対象外** —
+このフラグの範囲外で、従来どおり毎回解放される。
+
+```bash
+# 推奨起動コマンド (48GB GPU0 + 20GB GPU1)
+H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+```
+
+**実機 E2E 実測(2026-08-09、48GB GPU0 + 20GB GPU1、上記起動構成)**:
+
+- transformer(int8) は初回リクエストで1回だけロード(32.0s)。以降のリクエストで
+  再ロードなし(サーバーログで確認)
+- t2i turbo 4steps 定常: **9.7s/枚**(denoise 4.32s、decode 1.5s)。peak VRAM 41.97GB
+  (デノイズ時)
+- t2i steps=30 定常: 51.1s(denoise 45.7s)。peak 41.97GB
+- t2va 5秒 turbo 4steps: **44.2s**(denoise 26.05s、decode 10.81s)。**peak VRAM
+  44.15GB = デコード位相**(transformer 34.03GB 常駐 + fp16 デコード)。導出予測
+  45.7GB に対し実測 44.15GB、カタログ 48.9GB に対し余裕 ~4.8GB
+- nvidia-smi 実測ピーク 42,620 MiB(1秒サンプリング。瞬間ピークは torch 計測の
+  44.15GB が正)
+- 同一seed 出力等価性: フラグOFFのベースライン(他は同条件)と PNG MD5 **完全一致**
+  (seed=11、md5 `665eadddea8f34298a1b5b89e69d4bd0`)。ベースライン側は total 63.27s
+  (transformer ロード込み)/ peak 36.4GB
+
+**高速化の系譜**:
+
+| | t2i turbo | t2va 5秒 turbo |
+|---|---|---|
+| 08-07朝(素の構成) | 157s | 143s |
+| `H3_TE_PREQUANT` | 83.2s | — |
+| `H3_TE_DEVICE` | ~35s | 60.5s |
+| `H3_KEEP_TRANSFORMER`(本節) | **9.7s** | **44.2s** |
+
+詳細な VRAM 収支の導出・位相×常駐表は `docs/RESIDENCY.md` §5.5・§5.6 を参照。
+
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
 ### 1. diffusers PR #14355 のマージ待ち — **安易に上げないこと**

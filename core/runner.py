@@ -439,6 +439,54 @@ if H3_LOWVRAM_ANY:
             "anything else on a 24-48GB-class card."
         )
 
+# EXPERIMENTAL, opt-in. `H3_LOWVRAM=1` は毎リクエスト、デコード直前に transformer を
+# 解放し次リクエストで再ロードする (実測 14.8-32.7s の固定費、RESIDENCY.md §5.5)。
+# `H3_KEEP_TRANSFORMER=1` はその解放をスキップし、transformer をリクエスト間も
+# GPU に常駐させたままにする -- 48GB級 (実効予算 ~49.8GB) では
+# transformer(int8) 34.3GB + デコードピーク **fp16** 11.4GB = 45.7GB で入る見込み
+# (未検証、余裕 ~4GB)。fp32 デコードピーク 16.29GB では 34.3+16.29=50.6GB で
+# 入らないため、H3_VIDEO_VAE_FP16=1 が必須 (RESIDENCY.md §5.6)。
+# 成立条件 (3つとも必須、欠けたら import 時に RuntimeError):
+#   1) H3_LOWVRAM == True (raw "1" のみ。"group" は対象外 -- このフラグの目的は
+#      lowvram=1 の毎リクエスト再ロード固定費の削減であって、group モードは
+#      そもそも transformer を常駐させたまま CPU/GPU 間を group offload する
+#      別設計なので無関係)
+#   2) H3_TE_DEVICE が設定済み (TE が別GPU)。そうでないと **デコード位相ではなく
+#      エンコード位相が先に破綻する**: TE(bnb-4bit) 17.45GB + transformer(int8)
+#      34.3GB = 51.75GB > 実効予算49.8GB で、prompt encode の時点で入らない
+#      (transformer を常駐させたまま TE を同じGPUにロードしようとするため)
+#   3) H3_VIDEO_VAE_FP16 == True (上記のとおり fp32 では 50.6GB で入らない)
+# 既定 (H3_KEEP_TRANSFORMER=0) は 1バイトも挙動が変わらない -- 既存の
+# H3_LOWVRAM=1 の「リクエスト間は何も常駐させない」定常状態のまま。
+H3_KEEP_TRANSFORMER = os.environ.get("H3_KEEP_TRANSFORMER", "0").strip() == "1"
+if H3_KEEP_TRANSFORMER:
+    _keep_transformer_missing = []
+    if not H3_LOWVRAM:
+        _keep_transformer_missing.append(
+            f"H3_LOWVRAM must be '1' (got {H3_LOWVRAM_RAW!r}) -- this flag only removes "
+            "H3_LOWVRAM=1's per-request transformer reload cost; 'group' mode already "
+            "keeps its transformer resident via a different (CPU+block-offload) design "
+            "and is unrelated"
+        )
+    if not H3_TE_DEVICE:
+        _keep_transformer_missing.append(
+            "H3_TE_DEVICE must be set (TE on a separate GPU) -- otherwise the *encode* "
+            "phase (not decode) breaks first: TE-nf4 17.45GB + resident transformer-int8 "
+            "34.3GB = 51.75GB, over the ~49.8GB effective budget"
+        )
+    if not H3_VIDEO_VAE_FP16:
+        _keep_transformer_missing.append(
+            "H3_VIDEO_VAE_FP16 must be '1' -- fp32 decode peak 16.29GB + resident "
+            "transformer-int8 34.3GB = 50.6GB, over the ~49.8GB effective budget "
+            "(fp16 decode peak ~11.4GB fits: 34.3+11.4=45.7GB)"
+        )
+    if _keep_transformer_missing:
+        raise RuntimeError(
+            "H3_KEEP_TRANSFORMER=1 requires H3_LOWVRAM=1 AND H3_TE_DEVICE set AND "
+            "H3_VIDEO_VAE_FP16=1 (see this flag's module comment for the VRAM budget "
+            "derivation). Missing: " + "; ".join(_keep_transformer_missing)
+        )
+
 # "group" mode's own RAM guard (see H3_LOWVRAM_GROUP's design comment further down):
 # the int8 transformer (~34GB) is loaded once and stays resident in host RAM for the
 # life of the process (unlike H3_LOWVRAM=1's per-request from-scratch reload) --
@@ -3181,9 +3229,25 @@ class MiniMaxH3Runner:
                 # out mid-denoise could) without loading a replacement; the transformer
                 # is loaded further down, after TE has already finished encoding and
                 # been freed again.
-                self._free_transformer()
+                #
+                # H3_KEEP_TRANSFORMER=1: skip freeing `transformer` here so it stays
+                # GPU-resident across requests (the whole point of the flag -- see its
+                # module comment for the VRAM budget derivation). Only safe because the
+                # flag's own import-time guard requires H3_TE_DEVICE to be set, i.e. TE
+                # loads onto a *different* GPU than transformer, so the encode phase
+                # below (`_load_text_encoder`) does not have to share this GPU's budget
+                # with TE at all. `transformer_ref` is still freed unconditionally (ref2va
+                # is out of scope for this flag -- it uses a different transformer_ref
+                # residency path entirely, see `generate_ref2va`). `_active_variant` is
+                # deliberately left alone (not reset to None): if `transformer` is still
+                # resident from the previous request, it is still the t2va one (this
+                # branch never loads transformer_ref), so "t2va" remains correct; if
+                # nothing is resident yet (first request), `_ensure_transformer` below
+                # sets it to "t2va" itself once it loads.
+                if not H3_KEEP_TRANSFORMER:
+                    self._free_transformer()
+                    self._active_variant = None
                 self._free_transformer_ref()
-                self._active_variant = None
                 self._ensure_vaes(progress)
                 self._load_text_encoder(progress)
             elif H3_LOWVRAM_GROUP:
@@ -3788,8 +3852,28 @@ class MiniMaxH3Runner:
             # preloading it now would just be evicted again at that request's own encode
             # phase for no benefit, and would leave a 34GB resident model sitting idle
             # between requests on a card that cannot spare it.
+            #
+            # H3_KEEP_TRANSFORMER=1 also falls through this same H3_LOWVRAM branch (it
+            # does nothing here) and that is correct *by construction*: this flag never
+            # freed `transformer` in the first place (see the decode-phase skip just
+            # below), so there is nothing to restore -- it was never dropped. Confirmed by
+            # reading this closure: the only other branches that touch `transformer` here
+            # are the `bnb-4bit and not H3_LOWVRAM_ANY` branch (`none`/plain `bnb-4bit`
+            # modes, not lowvram) and `H3_LOWVRAM_GROUP`'s TE-only branch -- neither
+            # applies when H3_LOWVRAM=1, which this flag requires.
 
-        if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_GROUP:
+        # H3_KEEP_TRANSFORMER=1: skip freeing `transformer` for the decode window too --
+        # this is the flag's actual payoff (H3_LOWVRAM=1 otherwise pays the ~14.8-32.7s
+        # reload cost on *every* request just to make room for the VAE pair's decode
+        # peak). Only safe because the import-time guard already forced
+        # H3_VIDEO_VAE_FP16=1: transformer-int8 34.3GB + fp16 decode peak ~11.4GB =
+        # 45.7GB fits the ~49.8GB effective budget (RESIDENCY.md §5.5). With the fp32 VAE
+        # decode peak (~16.29GB) this would be 50.6GB and would NOT fit -- which is
+        # exactly why H3_VIDEO_VAE_FP16=1 is a hard requirement of this flag, rejected at
+        # import time rather than left to fail here mid-request.
+        if H3_KEEP_TRANSFORMER:
+            pass
+        elif TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_GROUP:
             self._free_transformer()
         elif H3_LOWVRAM_GROUP:
             with self._load_lock:
@@ -4015,10 +4099,16 @@ class MiniMaxH3Runner:
         n_scenes = len(prompts)
 
         # --- entry: lowvram=1 の定常状態 (nothing big resident) から開始 ---
+        # H3_KEEP_TRANSFORMER=1: generate() のエントリ分岐と同じ理由で `transformer` の
+        # 解放をスキップし常駐させる (詳細はそちらのコメント/H3_KEEP_TRANSFORMER の
+        # モジュールコメント参照)。このメソッドは H3_LOWVRAM=1 専用 (上のガード参照) な
+        # ので、H3_KEEP_TRANSFORMER の import 時ガードが要求する H3_LOWVRAM=1 は既に
+        # 満たされている。
         with self._load_lock:
-            self._free_transformer()
+            if not H3_KEEP_TRANSFORMER:
+                self._free_transformer()
+                self._active_variant = None
             self._free_transformer_ref()
-            self._active_variant = None
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
         torch.cuda.reset_peak_memory_stats()
@@ -4125,7 +4215,13 @@ class MiniMaxH3Runner:
         # --- decode 位相: transformer を落として VAE で全場面をデコード ---
         if progress:
             progress.update(phase="decoding", message="全場面をデコード中...")
-        self._free_transformer()
+        # H3_KEEP_TRANSFORMER=1: generate() のデコード前分岐と同じ理由 (fp16 VAE 前提で
+        # transformer 34.3 + デコード~11.4 = 45.7GB が実効予算49.8GBに収まる導出、
+        # RESIDENCY.md §5.5) でスキップ。このメソッドはバッチ全体で1回しかこの位相を
+        # 通らないため、常駐維持の効果は generate() の毎リクエスト分より小さいが、
+        # 挙動は同じにしておく (二重の特別扱いを避ける)。
+        if not H3_KEEP_TRANSFORMER:
+            self._free_transformer()
         self._vae_to_gpu()
         t_decode = time.time()
         results: list[dict] = []
