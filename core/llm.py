@@ -18,10 +18,13 @@ H3 のクラウド版(Hailuo AI)は内部にプロンプト整形層を持つが
 few-shot 例を入れてある(diffusers-server の LLM強化で確立した知見)。
 """
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+logger = logging.getLogger("minimax_h3.llm")
 
 DEFAULT_LLM_URL = "http://127.0.0.1:64650"
 LLM_TIMEOUT_S = 180  # h3-official は system prompt が長く(15.8KB/23.6KB)応答も遅いため延長
@@ -145,6 +148,56 @@ def _read_skill_file(name: str) -> str:
 # 全文投入する。要約・独自解釈は行わず、公式のフィールド名・順序・記法を厳守させる。
 # ---------------------------------------------------------------------------
 
+# ガイド本文より後ろに置く「最終指示」。英語版・日本語版で共有する(内容は同一の規則で、
+# 表現だけ言語に合わせる)。ここに置く理由と各規則の根拠は _H3_OFFICIAL_WRAPPER_EN の
+# 末尾コメントを参照。
+_TIMING_RULES_EN = (
+    "\n\nFINAL INSTRUCTIONS (highest priority; these override anything above that conflicts):\n"
+    "1. SHOT LENGTH: every shot must be long enough to be usable. A shot containing dialogue "
+    "needs at least 3.0 seconds; a shot without dialogue needs at least 1.5 seconds. Choose cut "
+    "times so that EVERY shot -- including the LAST one, which runs from its cut time to the end "
+    "of the video -- satisfies this. Putting a cut at 4.5s in a 5-second video is WRONG because "
+    "it leaves the final shot only 0.5 seconds.\n"
+    "2. DIALOGUE MUST FIT: spoken Japanese takes roughly 0.25 seconds per character (a 12-character "
+    "line takes about 3 seconds). Every line of dialogue must fit inside the shot that contains it. "
+    "Never shorten or rewrite the user's dialogue -- instead, give that shot more time.\n"
+    "3. NUMBER OF SHOTS: match the shot count to the duration. Around 1-2 shots for 5 seconds, "
+    "2-3 for 10 seconds, 3-4 for 15 seconds. Fewer, longer shots are better than many short ones. "
+    "A single shot for the whole video is perfectly acceptable when there is one continuous action.\n"
+    "4. ONE SHOT, ONE FRAMING: do not change the shot size or the main subject inside a single "
+    "shot. If the framing or the subject must change, use a new [Shot n] with its own cut time. "
+    "Never write a close-up of one subject and then pan to follow a different subject in the same "
+    "shot.\n"
+    "5. OFF-SCREEN VOICE: if a speaker is not visible in the shot where they speak, you must use "
+    "the exact phrase `says in an off-screen voiceover` and state that the on-screen character's "
+    "lips remain closed, exactly as the guide requires.\n"
+    "6. SPEAKER IDS: every <d> block must be preceded by a speaker ID such as (S1), and the first "
+    "time a speaker appears their voice must be characterised (age, gender, pitch, timbre, pace).\n"
+)
+
+_TIMING_RULES_JA = (
+    "\n\n【最終指示・時間配分(最優先。上記と矛盾する場合はこちらを優先)】\n"
+    "1. ショットの長さ: 各ショットは実用に足る長さが必要。台詞のあるショットは最低3.0秒、"
+    "台詞の無いショットは最低1.5秒。**最後のショット(カット時刻から動画の終わりまで)を含めて"
+    "全ショット**がこれを満たすようにカット時刻を選ぶこと。5秒の動画で4.5秒にカットを置くのは"
+    "誤り(最終ショットが0.5秒しか残らない)。\n"
+    "2. 台詞は必ずショット内に収める: 日本語の発話は1文字あたり約0.25秒(12文字で約3秒)。"
+    "各台詞は、それが属するショットの尺に収まること。**ユーザーの台詞を短縮・書き換えては"
+    "ならない** -- 代わりにそのショットに長い尺を与えること。\n"
+    "3. ショット数: 尺に見合った数にすること。5秒なら1〜2、10秒なら2〜3、15秒なら3〜4が目安。"
+    "短いショットを多数並べるより、少なく長いショットのほうが良い。連続した1つの動作なら"
+    "動画全体を1ショットにしてよい。\n"
+    "4. 1ショット1構図: 同一ショット内でショットサイズや主要被写体を変えないこと。画角や被写体を"
+    "変える必要があるなら、カット時刻を持つ新しい [Shot n] を立てること。あるショットで"
+    "ある被写体のクローズアップを書き、同じショット内で別の被写体を追ってパンする、"
+    "という書き方は禁止。\n"
+    "5. 画面外の声: 話者がそのショットに映っていない場合は、ガイドの規定どおり "
+    "`says in an off-screen voiceover` という定型句を必ず使い、画面内の人物の唇は閉じたままと"
+    "明記すること。\n"
+    "6. 話者ID: すべての <d> ブロックの直前に (S1) 等の話者IDを置き、初出時にはその声を"
+    "特徴づける記述(年齢・性別・声の高さ・音色・話す速さ)を添えること。\n"
+)
+
 _H3_OFFICIAL_WRAPPER_EN = (
     "You are a prompt-rewriting assistant for the MiniMax H3 (Hailuo 3.0) video+audio "
     "generation model. Follow the skill instructions and reference guide given below "
@@ -160,7 +213,14 @@ _H3_OFFICIAL_WRAPPER_EN = (
     "required fields in order). No preamble, no explanation, no markdown code fences, no "
     "labels like \"Prompt:\".\n\n"
     "--- BEGIN SKILL INSTRUCTIONS ---\n{skill_md}\n--- END SKILL INSTRUCTIONS ---\n\n"
-    "--- BEGIN REFERENCE GUIDE ({guide_name}) ---\n{guide_text}\n--- END REFERENCE GUIDE ---"
+    "--- BEGIN REFERENCE GUIDE ({guide_name}) ---\n{guide_text}\n--- END REFERENCE GUIDE ---\n\n"
+    # ガイド本文(15.8KB)より**後ろ**に置く再指示。日本語版で「言語指定は後ろほど強く
+    # 効く」ことを実機で確認済みだが、英語版には後方ブロックが無く、尺の制約を含む
+    # すべての自前指示が前方でガイドに埋もれていた(2026-08-08 のレビューで発見)。
+    # 内容は実測ベースライン(5入力×3回、scripts/probe_h3official_compliance.py)で
+    # 実際に出た故障クラスに対応する: 時間配分の違反 40%、うち半分は LLM 側で直せる
+    # 配分ミス、および1ショット内での画角の混在(クラスB)。
+    + _TIMING_RULES_EN
 )
 
 _H3_OFFICIAL_WRAPPER_JA = (
@@ -192,6 +252,7 @@ _H3_OFFICIAL_WRAPPER_JA = (
     "(3) タイムコード記法(At MM:SS.SSS)、(4) <d> タグ内の台詞・歌詞と画面上のテキスト"
     "(原語のまま保持)、(5) fully_preserved 等の関係マーカー。"
     "地の文(情景・被写体・動作・カメラ・音の描写)のみ日本語にすること。"
+    + _TIMING_RULES_JA
 )
 
 
@@ -230,6 +291,86 @@ def enhance_prompt(
     if mode == "translate":
         return chat_completion(TRANSLATE_SYSTEM_PROMPT, text, temperature=0.2)
     if mode == "h3-official":
-        system_prompt = build_h3_official_system_prompt(task, seconds, lang)
-        return chat_completion(system_prompt, text, temperature=0.4)
+        return _enhance_h3_official(text, seconds, task=task, lang=lang)
     raise ValueError(f"mode は {VALID_MODES} のいずれかです: {mode!r}")
+
+
+class InfeasibleInputError(ValueError):
+    """入力の台詞が指定尺に収まらない(どのモデルでも解決不能)。400 として返す。"""
+
+
+# 修復ループの試行回数。1回目で違反があれば、その内容を突きつけて再生成する。
+# 実測ベースライン(2026-08-08)では違反 40%、うち半分は尺に収まる配分ミス
+# = 具体的に指摘すれば直せる見込みの部類だったため、2回まで再試行する。
+H3_OFFICIAL_MAX_REPAIRS = int(os.environ.get("H3_OFFICIAL_MAX_REPAIRS", "2"))
+
+_REPAIR_TEMPLATE = (
+    "あなたが直前に出力したプロンプトには次の問題があります:\n\n{report}\n\n"
+    "動画の尺は {seconds:.2f} 秒です。上記の問題**だけ**を修正し、それ以外の内容"
+    "(情景・被写体・台詞の文言・音の描写)は可能な限り保持してください。"
+    "台詞は一字一句変えてはいけません。修正後のプロンプト全文のみを出力してください"
+    "(前置き・説明・コードフェンスは禁止)。\n\n"
+    "--- 直前の出力 ---\n{previous}"
+)
+
+
+def enhance_prompt_checked(
+    text: str,
+    seconds: float = 10.0,
+    *,
+    task: str = "t2va",
+    lang: str = "en",
+) -> dict:
+    """h3-official 生成 + 検証 + 修復ループ。`enhance_prompt` と違い、検証結果も返す。
+
+    返り値: {"result": str, "check": {...}, "attempts": int, "repaired": bool}
+    入力の台詞が尺に収まらない場合は `InfeasibleInputError`(LLM に投げる前に判定)。
+    """
+    return _enhance_h3_official(text, seconds, task=task, lang=lang, want_detail=True)
+
+
+def _enhance_h3_official(text, seconds, *, task, lang, want_detail=False):
+    from core import prompt_check
+
+    # --- LLM に投げる前の実現可能性チェック ---
+    # 実測で違反6件中3件がこれ。台詞が尺より長い場合、公式仕様が逐語保持を要求する以上
+    # どのモデルでも解決できないので、書き換えを試みずにユーザーへ返す。
+    feasible = prompt_check.check_input_feasible(text, seconds)
+    if not feasible["feasible"]:
+        raise InfeasibleInputError(feasible["advice"])
+
+    system_prompt = build_h3_official_system_prompt(task, seconds, lang)
+    result = chat_completion(system_prompt, text, temperature=0.4)
+    check = prompt_check.check_prompt(result, seconds, task=task)
+    attempts = 1
+
+    # --- 修復ループ: 違反があれば具体的に指摘して再生成 ---
+    for _ in range(H3_OFFICIAL_MAX_REPAIRS):
+        if check["ok"]:
+            break
+        logger.info("h3-official: 違反あり、修復を試行 (%d回目): %s",
+                    attempts, ",".join(check["violations"]))
+        repair_input = _REPAIR_TEMPLATE.format(
+            report=check["report"], seconds=float(seconds), previous=result
+        )
+        try:
+            candidate = chat_completion(system_prompt, repair_input, temperature=0.4)
+        except Exception:
+            logger.exception("h3-official: 修復リクエストが失敗、直前の出力を返す")
+            break
+        attempts += 1
+        cand_check = prompt_check.check_prompt(candidate, seconds, task=task)
+        # 悪化させない: 違反が増えるなら採用しない (修復が別の場所を壊す事故を防ぐ)
+        if len(cand_check["violations"]) <= len(check["violations"]):
+            result, check = candidate, cand_check
+        else:
+            logger.info("h3-official: 修復案は違反が増えたため破棄 (%d -> %d)",
+                        len(check["violations"]), len(cand_check["violations"]))
+            break
+
+    if check["violations"]:
+        logger.warning("h3-official: 修復後も違反が残存: %s", ",".join(check["violations"]))
+    if want_detail:
+        return {"result": result, "check": check, "attempts": attempts,
+                "repaired": attempts > 1}
+    return result

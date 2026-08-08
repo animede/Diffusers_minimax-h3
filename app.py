@@ -24,11 +24,13 @@ import core.gallery as gallery
 import core.settings as settings
 from core.llm import (
     H3SkillNotFetchedError,
+    InfeasibleInputError,
     LLMConnectionError,
     VALID_H3_OFFICIAL_LANGS,
     VALID_H3_OFFICIAL_TASKS,
     VALID_MODES,
     enhance_prompt,
+    enhance_prompt_checked,
     get_llm_url,
 )
 from core.runner import (
@@ -915,7 +917,25 @@ def api_prompt_enhance(
             raise HTTPException(400, f"lang は {VALID_H3_OFFICIAL_LANGS} のいずれかです: {lang!r}")
     t0 = time.time()
     try:
+        if mode == "h3-official":
+            # h3-official のみ、検証+修復ループ付きの経路を通す(core/llm.py の
+            # enhance_prompt_checked)。違反が残った場合もプロンプト自体は返し、
+            # `check` フィールドでUIに警告表示させる(生成をブロックはしない --
+            # 結果は編集可能なので人間が最終ゲート)。
+            detail = enhance_prompt_checked(text.strip(), seconds=seconds, task=task, lang=lang)
+            return {
+                "result": detail["result"], "mode": mode, "task": task, "lang": lang,
+                "elapsed_s": time.time() - t0,
+                "violations": detail["check"]["violations"],
+                "warnings": detail["check"]["warnings"],
+                "check_report": detail["check"]["report"],
+                "attempts": detail["attempts"],
+                "repaired": detail["repaired"],
+            }
         result = enhance_prompt(text.strip(), mode, seconds=seconds, task=task, lang=lang)
+    except InfeasibleInputError as e:
+        # 台詞が尺に収まらない = どのモデルでも解決不能。書き換えを試みずに助言を返す。
+        raise HTTPException(400, str(e))
     except LLMConnectionError as e:
         raise HTTPException(502, f"LLMサーバに接続できません(H3_LLM_URL={get_llm_url()}): {e}")
     except H3SkillNotFetchedError as e:

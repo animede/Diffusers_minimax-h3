@@ -1205,7 +1205,19 @@ enhanceBtn.addEventListener('click', async () => {
     promptBackup = text;
     promptEl.value = data.result;
     undoBtn.style.display = '';
-    setStatus(`LLM強化完了 (${data.mode}, ${data.elapsed_s.toFixed(1)}s) — 内容を確認・編集してから生成してください`);
+    // h3-official は検証+修復ループ付き (core/prompt_check.py)。残った違反・警告は
+    // ここで見せる。生成はブロックしない — プロンプトは編集可能なので人間が最終ゲート。
+    let msg = `LLM強化完了 (${data.mode}, ${data.elapsed_s.toFixed(1)}s`;
+    if (data.repaired) msg += `, 自動修復 ${data.attempts}回目`;
+    msg += ')';
+    const hasIssue = (data.violations && data.violations.length) || (data.warnings && data.warnings.length);
+    if (hasIssue) {
+      msg += ` — 未解決の指摘があります:\n${data.check_report}`;
+    } else {
+      msg += ' — 内容を確認・編集してから生成してください';
+    }
+    setStatus(msg, false);
+    statusBox.style.whiteSpace = 'pre-wrap';
   } catch (e) {
     setStatus('LLM強化エラー: ' + e.message, true);
   } finally {
