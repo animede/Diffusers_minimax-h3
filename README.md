@@ -901,6 +901,12 @@ venv/bin/python scripts/probe_t2va.py
 - `GET /api/status`: ロード状態・VRAM/RAM
 - `GET /api/progress`: 生成中の進捗ポーリング用
 
+## 技術レポート
+
+本 README は「どう使うか」の運用ドキュメントである。**「なぜそう作ったか・何につまずいたか・どう確かめたか」**を通しで読みたい場合は
+**[docs/TECHNICAL_REPORT.md](docs/TECHNICAL_REPORT.md)** を参照(2026-08-04〜08-08 の全作業のまとめ。
+diffusers 経路の設計判断、メモリ設計、実機で踏んだ16件の罠とその解決、検証手法、到達点)。
+
 ## コミュニティ改良の取り込み一覧
 
 ComfyUI コミュニティ等で出た改良を本アプリ(diffusers 経路)へ取り込んだ作業の記録は
