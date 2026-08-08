@@ -1104,6 +1104,59 @@ API は `/api/prompt/enhance` の h3-official 応答に `violations` / `warnings
 落ち着く(リクエストを重ねるほど遅くなり 34秒前後で頭打ち)。**それでも従来経路の
 46〜56秒より速い**が、プローブの数値をそのまま性能として報告してはいけない。
 
+## text_encoder を別GPUへ常駐 (`H3_TE_DEVICE`、既定 ``、2026-08-09)
+
+`H3_LOWVRAM=1` が毎リクエストで TE を再ロードする根本原因は、**デノイズ中に TE の
+置き場所が無いこと**にある(48GB では transformer-int8 34GB + 活性化 5GB = 39GB で、
+残り 9GB に TE の 17.45GB は入らない)。TE を2枚目のGPUへ逃がせばこの再ロードが消える。
+
+```bash
+# 例: TE を cuda:1 に常駐させる (CUDA_VISIBLE_DEVICES は設定しない = 両GPUを見せる)
+H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 venv/bin/python -m uvicorn app:app --port 8611
+```
+
+**実測(RTX PRO 5000 48GB + RTX 4000 SFF Ada 20GB、t2i turbo 4steps、768²)**:
+
+| | 1回目 | 定常(2回目以降) |
+|---|---|---|
+| 従来(TE も cuda:0) | 81.3s | 67.6〜86.2s(平均 **78.4s**) |
+| **TE を cuda:1 へ** | 88.2s(TE初回ロード込み) | 33.6〜36.7s(**約35s、-55%**) |
+
+TE のロードは**プロセス起動後1回だけ**。GPU1 に 17GB 常駐したまま、GPU0 はアイドル時
+2.3GB まで下がる。
+
+- **ref2va は自動的に拒否される**(20GB級の場合): 2048px 短辺の参照を vision tower に
+  通す活性化が入らず OOM することを実測済み(19.25GB 使用中に 204MB 不足)。
+  TE用GPUが 24GB 未満なら理由を添えて 400 を返す — 「動くはず」で走らせて OOM させない。
+  24GB 以上なら自動的に許可される。t2va/fl2va/t2i とその各バッチは併用可能
+- **PCIe 幅は問題にならない**: GPU1 は Gen4 x4(x16対応カードだが4レーン接続)だが、
+  TE は起動時に一度載せるだけで、毎リクエストの転送は prompt_embeds の約42MB のみ(約6ms)
+
+**出力は従来構成とビット一致しない**(PNG の MD5 が異なる)。原因は **sm_120(Blackwell)
+と sm_89(Ada)のアーキテクチャ差による丸め**で、実測した `hidden_states[50]` の
+**相対RMS差は 0.084%**(max_abs_diff 3.5、値のRMS 57.4)。これは既に採用済みの
+参照プレフィックス共有の差(1.5%)より**20倍小さく**、バグの水準(ネガティブ
+コントロール 27-30%)とは桁が違う。Sage Attention や int8 と同種の軌道ドリフトであり、
+目視でも品質は同等。**ビット再現が要る対照実験では `H3_TE_DEVICE` を外すこと**。
+
+### 実装の要点(`_execution_device` の罠、再び)
+
+`_execution_device` は components 順(`text_encoder, tokenizer, processor, vae, ...`)で
+最初の nn.Module のデバイスを返す(実装を読んで確認)。**TE を cuda:1 に置くと
+これが cuda:1 を返し**、layout/latents/timesteps も decode も別GPUにテンソルを作る。
+
+最初は「layout の窓だけ塞ぐ」実装にしたが、**decode でも発火した**
+(`latents = latents * latents_std + latents_mean` が
+`Expected all tensors to be on the same device, cuda:0 and cuda:1` で失敗、実機で再現)。
+窓を個別に塞ぐ方式は漏れるため、**「既定では TE をパイプから外しておき、エンコード中
+だけ繋ぐ」**(`_te_attached()`)という反転した設計に変更した。これなら新しい経路が
+増えても安全側に倒れる。モジュール実体は `self._te_module` が保持し続けるので、
+外しても解放されない。
+
+layout/latents/timesteps の窓ではさらに `_pin_execution_device_to_compute()` で
+vae も一時的に外す(TE を外した後の次の nn.Module が CPU 上の vae になり、今度は
+`_execution_device` が cpu を返してしまうため。transformer が最初に見つかるようにする)。
+
 ## 静止画モード (T2I、`/api/t2i`、2026-08-07 本実装)
 
 H3を「超短尺動画→静止画取り出し」で画像生成の代用にするモード。前段の超短尺プローブ
@@ -1425,7 +1478,9 @@ token_refiner は bf16 ベース + bf16 デルタ**という混在状態にな�
   2026-08-08。TEロード 53.0s→29.5s、リクエスト合計 -35%)。**残るのは transformer int8**
   で、保存に約34GB を要しこの箱のディスク空き(43GB)では非現実的。ディスクに余裕の
   ある機なら、同じ手法で transformer のロード(約32.5s)も削れる見込み
-- **TE を2枚目GPUに常駐させる**(2026-08-08 スパイク済み、未実装): TE を別カードへ
+- ~~**TE を2枚目GPUに常駐させる**~~ → **2026-08-09 実装済み**(`H3_TE_DEVICE`、
+  定常 78.4s→約35s = -55%。上記「text_encoder を別GPUへ常駐」節を参照)。以下は
+  スパイク時の記録: TE を別カードへ
   逃がせば GPU0 に transformer を常駐させたままにでき、**固定費が丸ごと消える**。
   実測では現行の RTX 4000 SFF Ada 20GB で **t2va は成立**(peak 17.76GB/余裕 3.23GB)
   だが **ref2va は OOM**(2048px の参照を vision tower に通すため 1〜2GB 不足)。

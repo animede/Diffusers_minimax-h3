@@ -247,6 +247,30 @@ H3_TE_PRUNE = os.environ.get("H3_TE_PRUNE", "0").strip() == "1"
 # ディスクを 17-21GB 消費する。空きが足りない環境のために "0" で完全に無効化できる
 # (無効時は従来どおり毎回その場で量子化する = このフラグ導入前と同一挙動)。保存に
 # 失敗した場合も**生成は続行する** (キャッシュはあくまで高速化であり、機能ではない)。
+# EXPERIMENTAL, opt-in。"" (既定) は従来どおり全モデルが同じ GPU を使う。
+# "cuda:1" 等を指定すると **text_encoder だけを別GPUへ常駐**させ、リクエスト間も解放しない。
+#
+# 動機: `H3_LOWVRAM=1` が毎リクエストで TE を再ロードする根本原因は、デノイズ中に TE の
+# 置き場所が無いこと (48GB では transformer-int8 34GB + 活性化 5GB = 39GB で、残り 9GB に
+# TE の 17.45GB は入らない)。TE を別カードへ逃がせばこの再ロード (実測 29.5-53s) が消える。
+#
+# 実測 (2026-08-08、scripts/probe_te_on_second_gpu.py、RTX 4000 SFF Ada 20GB / PCIe Gen4 x4):
+#   t2va は成立 (peak 17.76GB、余裕 3.23GB、エンコード 0.5-0.7s) / **ref2va は OOM**
+#   (2048px 短辺の参照を vision tower に通すため 1-2GB 不足)。よって 20GB 級では
+#   t2va/fl2va/t2i 系のみ対象とし、**ref2va は従来経路へフォールバックする** (下記
+#   `_te_external_usable_for()`)。ref2va まで含めるには 24GB 級の TE 用GPUが要る。
+#   PCIe 幅は問題にならない: TE は起動時に一度載せるだけで、毎リクエストの転送は
+#   prompt_embeds の 42MB のみ (x4 でも約6ms)。
+#
+# **最大の罠**: `_execution_device` は `components` の順で最初に見つかった nn.Module の
+# デバイスを返す (実装を読んで確認: modular_pipeline.py)。順序は
+# `text_encoder, tokenizer, processor, vae, scheduler, audio_scheduler, transformer, ...`
+# なので、TE を cuda:1 に置くと **layout/latents/timesteps が cuda:1 上にテンソルを作り**、
+# cuda:0 の transformer との device mismatch になる。対策は
+# `_pin_execution_device_to_compute()` -- その窓の間だけ text_encoder と vae をパイプから
+# 外し、transformer (cuda:0) が最初に見つかるようにする (モジュール自体は解放しない)。
+H3_TE_DEVICE = os.environ.get("H3_TE_DEVICE", "").strip()
+
 H3_TE_PREQUANT = os.environ.get("H3_TE_PREQUANT", "1").strip() == "1"
 H3_TE_PREQUANT_DIR = Path(
     os.environ.get("H3_TE_PREQUANT_DIR", str(Path(__file__).resolve().parent.parent / "models" / "prequant"))
@@ -1502,6 +1526,9 @@ class MiniMaxH3Runner:
         # H3_TURBO_LORA only: cached local path of the downloaded turbo LoRA safetensors,
         # resolved once per process by `_download_turbo_lora_if_needed()`.
         self._turbo_lora_path: str | None = None
+        # TE 外部常駐 (H3_TE_DEVICE) のときの TE 実体。パイプからは普段外しておき
+        # (`_te_attached()` 参照)、この属性が唯一の強参照になる。
+        self._te_module = None
         # Instant-apply turbo toggle (see core/settings.py / _TurboLoRALinear.enabled):
         # whether `apply_turbo_lora()` has structurally wrapped `transformer`'s Linear
         # modules yet. Wrapping only ever happens once per transformer instance (lazily,
@@ -2389,6 +2416,108 @@ class MiniMaxH3Runner:
         cfg.text_config.num_hidden_layers = MINIMAX_H3_TEXT_ENCODER_LAYER + 1
         return {"text_encoder": cfg}
 
+    @property
+    def _te_external(self) -> bool:
+        """TE を計算用GPUとは別のデバイスへ常駐させる構成か(`H3_TE_DEVICE` 参照)。"""
+        return bool(H3_TE_DEVICE) and H3_TE_DEVICE != str(DEVICE)
+
+    def _te_external_usable_for(self, mode: str) -> bool:
+        """このモードで TE 外部常駐を使ってよいか。
+
+        ref2va は 2048px 短辺の参照を vision tower に通すため活性化が大きく、20GB 級では
+        OOM することを実測済み(`H3_TE_DEVICE` のコメント参照)。TE 用GPUの総容量が
+        24GB 未満なら ref2va は従来経路へフォールバックする — 「動くはず」で走らせて
+        OOM させるより、確実に動く経路を選ぶ。
+        """
+        if not self._te_external:
+            return False
+        if mode != "ref2va":
+            return True
+        try:
+            total_gb = torch.cuda.get_device_properties(torch.device(H3_TE_DEVICE).index).total_memory / 1e9
+        except Exception:
+            return False
+        return total_gb >= 24.0
+
+    @property
+    def _encode_device(self) -> torch.device:
+        """プロンプトエンコードを実行するデバイス。TE 外部常駐なら TE のある側。"""
+        return torch.device(H3_TE_DEVICE) if self._te_external else DEVICE
+
+    def _to_compute_device(self, prompt_embeds, text_token_tags):
+        """エンコード結果を計算用GPUへ移す(TE 外部常駐のときのみ実体のコピーが起きる)。
+
+        運ぶのは prompt_embeds だけ(4,104トークン×5,120×bf16 で約42MB)なので、
+        PCIe Gen4 x4 でも約6ms。`text_token_tags` は CPU 上の小さな整数テンソル。
+        """
+        if not self._te_external:
+            return prompt_embeds, text_token_tags
+        return prompt_embeds.to(DEVICE), text_token_tags
+
+    def _detach_te_if_external(self):
+        """ロード直後に呼ぶ: 外部常駐 TE の実体を `self._te_module` へ移し、パイプからは
+        外す。以後は `_te_attached()` の窓の中でだけ繋がる(理由はそちらの docstring)。"""
+        if not self._te_external:
+            return
+        self._te_module = self._pipe.text_encoder
+        self._pipe.text_encoder = None
+        if self._pipe_ref is not None:
+            self._pipe_ref.text_encoder = None
+
+    @contextmanager
+    def _te_attached(self):
+        """TE 外部常駐時、**この窓の間だけ** TE をパイプへ繋ぐ。
+
+        窓の外では外しておくのが要点。`_execution_device` は components 順で最初の
+        nn.Module を拾うので、別GPU上の TE を繋ぎっぱなしにすると layout だけでなく
+        **decode も別GPUにテンソルを作る** -- 実機で
+        `latents = latents * latents_std + latents_mean` が
+        `Expected all tensors to be on the same device, cuda:0 and cuda:1` で落ちるのを
+        再現した。窓を個別に塞ぐのではなく「既定は外れている」方が安全なので、
+        エンコードのときだけ繋ぐ設計にしている。
+
+        モジュール自体は `self._te_module` が保持し続けるので、外しても解放されない
+        (別GPUに常駐させたままにするのがこの構成の目的)。
+        """
+        if not self._te_external:
+            yield
+            return
+        pipe, pipe_ref = self._pipe, self._pipe_ref
+        pipe.text_encoder = self._te_module
+        if pipe_ref is not None:
+            pipe_ref.text_encoder = self._te_module
+        try:
+            yield
+        finally:
+            pipe.text_encoder = None
+            if pipe_ref is not None:
+                pipe_ref.text_encoder = None
+
+    @contextmanager
+    def _pin_execution_device_to_compute(self):
+        """この窓の間だけ `_execution_device` が計算用GPU(`DEVICE`)を返すようにする。
+
+        `_execution_device` は components 順で最初の nn.Module のデバイスを返すため、
+        TE を別GPUへ置くと layout/latents/timesteps がそちらにテンソルを作ってしまう
+        (`H3_TE_DEVICE` のコメントの「最大の罠」)。順序は
+        `text_encoder, tokenizer, processor, vae, ...` なので、**text_encoder と vae を
+        一時的にパイプから外す**と次の nn.Module である `transformer` (計算用GPU上) が
+        最初に見つかる。モジュールは runner 側で参照を保持したまま外すだけなので、
+        解放も再ロードも発生しない。
+
+        前提: この窓に入る時点で transformer が計算用GPUにロード済みであること
+        (呼び出し側がそう並べる)。
+        """
+        pipe = self._pipe
+        saved_te, saved_vae = pipe.text_encoder, pipe.vae
+        pipe.text_encoder = None
+        pipe.vae = None
+        try:
+            yield
+        finally:
+            pipe.text_encoder = saved_te
+            pipe.vae = saved_vae
+
     def _te_prequant_dir(self) -> Path:
         """量子化済み TE のキャッシュ先。**設定ごとに別ディレクトリ**にする
         (TE_QUANT / TE_PRUNE を変えると重みの中身が別物になるため、同じ場所を使い回すと
@@ -2414,7 +2543,8 @@ class MiniMaxH3Runner:
             from transformers import AutoModelForImageTextToText
 
             te = AutoModelForImageTextToText.from_pretrained(
-                str(cache_dir), dtype=torch.bfloat16, device_map="cuda"
+                str(cache_dir), dtype=torch.bfloat16,
+                device_map=H3_TE_DEVICE if self._te_external else "cuda",
             )
         except Exception:
             logger.exception("量子化済み TE キャッシュの読み込みに失敗、通常経路へフォールバック: %s", cache_dir)
@@ -2428,6 +2558,7 @@ class MiniMaxH3Runner:
             "text_encoder loaded from prequantized cache in %.1fs (%s). gpu=%s",
             time.time() - t0, cache_dir, gpu_mem_gb(),
         )
+        self._detach_te_if_external()
         return True
 
     def _save_te_prequant(self, cache_dir: Path):
@@ -2526,14 +2657,18 @@ class MiniMaxH3Runner:
                 names=["text_encoder", "tokenizer", "processor"],
                 dtype=torch.bfloat16,
                 quantization_config={"text_encoder": quant_config},
-                device_map={"text_encoder": "cuda"},
+                # TE 外部常駐 (H3_TE_DEVICE) のときはそのデバイスへ直接置く。
+                # bnb-4bit はデバイス間移動ができないので、置き場所はロード時に決める。
+                device_map={"text_encoder": H3_TE_DEVICE if self._te_external else "cuda"},
                 config=config_kwargs,
             )
             self._text_encoder_loaded = True
             logger.info(
-                "text_encoder (NF4%s) loaded to GPU in %.1fs. gpu=%s ram=%s",
-                prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
+                "text_encoder (NF4%s) loaded to GPU%s in %.1fs. gpu=%s ram=%s",
+                prune_suffix, f" ({H3_TE_DEVICE})" if self._te_external else "",
+                time.time() - t0, gpu_mem_gb(), ram_gb(),
             )
+            self._detach_te_if_external()
             # 初回のみ: 量子化済みの重みを保存しておき、次回以降のロードを短縮する。
             if H3_TE_PREQUANT:
                 self._save_te_prequant(cache_dir)
@@ -2576,6 +2711,12 @@ class MiniMaxH3Runner:
         mode.
         """
         if not self._text_encoder_loaded:
+            return
+        # TE 外部常駐 (H3_TE_DEVICE): 別GPUに置いてある TE は解放しない -- 解放しないこと
+        # 自体がこの構成の目的 (毎リクエストの再ロード 29.5-53s を消すため)。計算用GPUの
+        # ヘッドルームには一切影響しないので、force=True の呼び出しも無視してよい。
+        if self._te_external:
+            logger.debug("text_encoder は %s に常駐しているため解放しない", H3_TE_DEVICE)
             return
         if TE_QUANT == "bnb-4bit" and not force:
             # Permanently resident in this mode -- never freed mid-run (see
@@ -3129,10 +3270,12 @@ class MiniMaxH3Runner:
         # encode_prompt is a bare staticmethod; the @torch.no_grad() lives on the block
         # __call__ we bypass. Without no_grad the autograd graph pins ~50GB of TE
         # weights on GPU past the free below (observed on the first probe run).
-        with torch.no_grad():
+        with self._te_attached(), torch.no_grad():
             prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
-                pipe, prompt, keyframes or None, device=DEVICE, dtype=torch.bfloat16
+                pipe, prompt, keyframes or None, device=self._encode_device, dtype=torch.bfloat16
             )
+        # TE 外部常駐のときはここで計算用GPUへ運ぶ(約42MB)。既定構成では no-op。
+        prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
 
@@ -3251,23 +3394,40 @@ class MiniMaxH3Runner:
             if is_fl2va:
                 self._vae_to_cpu()
 
-            # --- layout / latents / timesteps, run NOW (TE still GPU-resident) ---
-            # `_execution_device` resolves via `text_encoder` (still resident on GPU)
-            # here, exactly like every non-lowvram bnb-4bit branch's own
-            # `force_free_te`-deferred ordering achieves -- see the long comment above.
-            layout_step = MiniMaxH3PrepareLayoutStep()
-            _, state = layout_step(pipe, state)
-            latents_step = MiniMaxH3PrepareLatentsStep()
-            _, state = latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
-            _, state = timesteps_step(pipe, state)
+            if self._te_external:
+                # TE 外部常駐 (H3_TE_DEVICE): TE は別GPUにあるので、計算用GPUのヘッドルームを
+                # 空けるための解放は不要 -- 先に transformer をロードしてしまう。ただし
+                # `_execution_device` は components 順で最初の nn.Module (= 別GPU上の TE) を
+                # 拾ってしまうため、layout/latents/timesteps は
+                # `_pin_execution_device_to_compute()` の窓の中で回す (その間だけ
+                # text_encoder と vae をパイプから外し、transformer が最初に見つかるようにする)。
+                with self._load_lock:
+                    self._ensure_transformer(progress)
+                with self._pin_execution_device_to_compute():
+                    layout_step = MiniMaxH3PrepareLayoutStep()
+                    _, state = layout_step(pipe, state)
+                    latents_step = MiniMaxH3PrepareLatentsStep()
+                    _, state = latents_step(pipe, state)
+                    timesteps_step = MiniMaxH3SetTimestepsStep()
+                    _, state = timesteps_step(pipe, state)
+            else:
+                # --- layout / latents / timesteps, run NOW (TE still GPU-resident) ---
+                # `_execution_device` resolves via `text_encoder` (still resident on GPU)
+                # here, exactly like every non-lowvram bnb-4bit branch's own
+                # `force_free_te`-deferred ordering achieves -- see the long comment above.
+                layout_step = MiniMaxH3PrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+                latents_step = MiniMaxH3PrepareLatentsStep()
+                _, state = latents_step(pipe, state)
+                timesteps_step = MiniMaxH3SetTimestepsStep()
+                _, state = timesteps_step(pipe, state)
 
-            # Only now is it safe to free TE and load the (int8) transformer: every
-            # tensor that would have needed `_execution_device` to resolve correctly
-            # already exists, materialized on the right device, on `state`.
-            with self._load_lock:
-                self._free_text_encoder(force=True)
-                self._ensure_transformer(progress)
+                # Only now is it safe to free TE and load the (int8) transformer: every
+                # tensor that would have needed `_execution_device` to resolve correctly
+                # already exists, materialized on the right device, on `state`.
+                with self._load_lock:
+                    self._free_text_encoder(force=True)
+                    self._ensure_transformer(progress)
         elif TE_QUANT == "bnb-4bit" and is_fl2va:
             # bnb-4bit + fl2va only: transformer(66.3) + TE-nf4(21.0) + vae pair(11.0)
             # already sums to ~98.3GB before any activation buffer, over this card's
@@ -3892,10 +4052,11 @@ class MiniMaxH3Runner:
             with _relaxed_min_duration():
                 _, state = setup_step(pipe, state)
 
-            with torch.no_grad():
+            with self._te_attached(), torch.no_grad():
                 prompt_embeds, text_token_tags = MiniMaxH3TextEncoderStep.encode_prompt(
-                    pipe, prompt, None, device=DEVICE, dtype=torch.bfloat16
+                    pipe, prompt, None, device=self._encode_device, dtype=torch.bfloat16
                 )
+            prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
             state.set("prompt_embeds", prompt_embeds)
             state.set("text_token_tags", text_token_tags)
 
@@ -4144,6 +4305,17 @@ class MiniMaxH3Runner:
         t_start = time.time()
         if not references:
             raise ValueError("ref2va needs at least one reference; use generate() for text-only requests.")
+        # TE 外部常駐 (H3_TE_DEVICE) の TE用GPUが 24GB 未満なら ref2va は動かない:
+        # 2048px 短辺の参照を vision tower に通す活性化が入らず OOM することを実測済み
+        # (20GB カードで 19.25GB 使用中に 204MB 不足、`H3_TE_DEVICE` のコメント参照)。
+        # 「動くはず」で走らせて OOM させるより、理由を添えて明確に拒否する。
+        if self._te_external and not self._te_external_usable_for("ref2va"):
+            raise ValueError(
+                f"ref2va は H3_TE_DEVICE={H3_TE_DEVICE!r} との併用ができません "
+                "(参照画像を vision tower に通す活性化が入らず OOM するため、TE用GPUには "
+                "24GB 以上が必要 -- 20GB 級で実測確認済み)。ref2va を使うときは "
+                "H3_TE_DEVICE を外して起動してください(t2va/fl2va/t2i は併用可能)。"
+            )
         kinds = [reference_kind(index, entry) for index, entry in enumerate(references)]
         if set(kinds) == {"audio"}:
             raise ValueError(
@@ -4269,10 +4441,12 @@ class MiniMaxH3Runner:
         # --- text encode (references' vision blocks + prompt; still has TE on GPU) ---
         if progress:
             progress.update(phase="encoding", message="プロンプト+参照をエンコード中...")
-        with torch.no_grad():
+        with self._te_attached(), torch.no_grad():
             prompt_embeds, text_token_tags = MiniMaxH3Ref2VATextEncoderStep.encode_prompt(
-                pipe, prompt, state.get("prepared_references"), device=DEVICE, dtype=torch.bfloat16
+                pipe, prompt, state.get("prepared_references"),
+                device=self._encode_device, dtype=torch.bfloat16,
             )
+        prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
 
@@ -4743,6 +4917,14 @@ class MiniMaxH3Runner:
             raise ValueError("prompts が空です。")
         if not references:
             raise ValueError("ref batch needs at least one reference.")
+        # 単発 ref2va と同じ理由で、TE用GPUが 24GB 未満なら参照バッチも成立しない
+        # (`generate_ref2va()` の同じガードのコメント参照)。
+        if self._te_external and not self._te_external_usable_for("ref2va"):
+            raise ValueError(
+                f"参照バッチは H3_TE_DEVICE={H3_TE_DEVICE!r} との併用ができません "
+                "(TE用GPUに 24GB 以上が必要 -- 20GB 級で OOM を実測確認済み)。"
+                "H3_TE_DEVICE を外して起動してください(t2i バッチは併用可能)。"
+            )
         if still:
             if still_frames not in STILL_FRAME_CHOICES:
                 raise ValueError(f"still_frames must be one of {STILL_FRAME_CHOICES}, got {still_frames}")
