@@ -1451,14 +1451,21 @@ H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANS
   (seed=11、md5 `665eadddea8f34298a1b5b89e69d4bd0`)。ベースライン側は total 63.27s
   (transformer ロード込み)/ peak 36.4GB
 
-**高速化の系譜**:
+**高速化の系譜**(48GB GPU0・`H3_LOWVRAM=1` 系、t2va は 768²・5秒):
 
-| | t2i turbo | t2va 5秒 turbo |
+| | t2i | t2va 5秒 |
 |---|---|---|
-| 08-07朝(素の構成) | 157s | 143s |
-| `H3_TE_PREQUANT` | 83.2s | — |
-| `H3_TE_DEVICE` | ~35s | 60.5s |
-| `H3_KEEP_TRANSFORMER`(本節) | **9.7s** | **44.2s** |
+| turboなし 30steps(GPU交換直後の素の構成、08-07) | 157s | 351.4s(デノイズ197.7s) |
+| lightx2v turbo 4steps 導入(08-07朝) | 157s | 143s |
+| + `H3_TE_PREQUANT` | 83.2s | — |
+| + `H3_TE_DEVICE` | ~35s | 60.5s |
+| + `H3_KEEP_TRANSFORMER`(本節) | **9.7s** | **44.2s** |
+
+t2va は素の構成比 **8.0倍**(351.4s → 44.2s)。turbo だけでは 2.6倍(デノイズは7.6倍
+短縮されるがロード固定費 ~110s が残る)で、残りは固定費撤廃
+(`H3_TE_PREQUANT`/`H3_TE_DEVICE`/`H3_KEEP_TRANSFORMER`)の寄与。なお本節構成での
+turboなし 30steps は t2i で 51.1s(上記実測)— 素の 157s に対し、30steps のままでも
+固定費撤廃だけで3倍速い。
 
 詳細な VRAM 収支の導出・位相×常駐表は `docs/RESIDENCY.md` §5.5・§5.6 を参照。
 

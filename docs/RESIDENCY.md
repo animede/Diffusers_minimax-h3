@@ -234,8 +234,8 @@ H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`)**:
   (seed=11、md5 `665eadddea8f34298a1b5b89e69d4bd0`)。ベースライン側は total 63.27s
   (transformer ロード込み)/ peak 36.4GB
 - 高速化の系譜: t2i turbo 157s(08-07朝)→ 83.2s(`H3_TE_PREQUANT`)→ ~35s
-  (`H3_TE_DEVICE`)→ **9.7s**(`H3_KEEP_TRANSFORMER`)。t2va 5s turbo:
-  143s → 60.5s → **44.2s**
+  (`H3_TE_DEVICE`)→ **9.7s**(`H3_KEEP_TRANSFORMER`)。t2va 5s(768²):
+  turboなし30steps **351.4s**(48GB素の構成)→ turbo 143s → 60.5s → **44.2s**(8.0倍)
 
 ### 5.6 導出式の検算(全ケースで実測と一致)
 
