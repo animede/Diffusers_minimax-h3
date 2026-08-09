@@ -465,21 +465,22 @@
          どちらの軸とも直交する)。 -->
     <div class="tab-group">
       <span class="tab-group-label">動画</span>
-      <!-- 段見出しが出力(動画/静止画)を担うので、ボタン2行目には**入力**だけを書く
-           (段×タブで「動画×テキスト=T2VA」と読める)。括弧書きを1行に詰めると
-           パネル幅 378px ではボタン内幅 77px に対し文字 95px で折り返し、ボタンの
-           高さが不揃いになったため、最初から2行構造にして幅に依存しないようにした。 -->
+      <!-- 段見出しが出力(動画/静止画)を担うので、括弧内には**入力**だけを書く
+           (段×タブで「動画×テキスト=T2VA」と読める)。モデル名と括弧書きは
+           **明示的に改行**する: 1行に詰めるとパネル幅 378px ではボタン内幅 77px に
+           対し文字 95px で自然折り返しが起き、折り返し位置がボタンごとに変わって
+           高さが不揃いになる。最初から2行に固定すれば幅に依存しない。 -->
       <div class="tabs">
-        <button class="tab-btn active" data-mode="t2va">T2VA<small>テキスト</small></button>
-        <button class="tab-btn" data-mode="fl2va">FL2VA<small>フレーム</small></button>
-        <button class="tab-btn" data-mode="ref2va">Ref2VA<small>参照</small></button>
+        <button class="tab-btn active" data-mode="t2va">T2VA<small>(テキスト)</small></button>
+        <button class="tab-btn" data-mode="fl2va">FL2VA<small>(フレーム)</small></button>
+        <button class="tab-btn" data-mode="ref2va">Ref2VA<small>(参照)</small></button>
       </div>
     </div>
     <div class="tab-group">
       <span class="tab-group-label">静止画</span>
       <div class="tabs">
-        <button class="tab-btn" data-mode="t2i">T2I<small>テキスト</small></button>
-        <button class="tab-btn" data-mode="ref2i">Ref2I<small>参照</small></button>
+        <button class="tab-btn" data-mode="t2i">T2I<small>(テキスト)</small></button>
+        <button class="tab-btn" data-mode="ref2i">Ref2I<small>(参照)</small></button>
       </div>
     </div>
 
