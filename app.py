@@ -41,25 +41,13 @@ from core.runner import (
     MAX_SECONDS,
     MIN_SECONDS,
     STILL_FRAME_CHOICES,
-    MiniMaxH3Reference,
+    MiniMaxH3AudioReference,
+    MiniMaxH3ImageReference,
     MiniMaxH3Runner,
+    MiniMaxH3VideoReference,
     ProgressState,
-    _ref2va_not_migrated_guard,
     seconds_to_num_frames,
 )
-
-
-def _reject_if_ref2va_not_migrated(caller: str) -> None:
-    """PR #14355 追従の第2段が未実施の間、ref2va 系エンドポイントを 503 で返す。
-
-    runner 側の `_ref2va_not_migrated_guard` と同じ理由だが、そこへ到達する前に
-    `MiniMaxH3Reference(image=...)` の構築が新APIの TypeError で落ちて
-    「読み込みに失敗」という紛らわしいエラーになる(実測)ため、参照構築より
-    **手前**でこのガードを通す。"""
-    try:
-        _ref2va_not_migrated_guard(caller)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("minimax_h3.app")
@@ -551,9 +539,10 @@ def api_fl2va(
 
 
 # Content-type / extension -> reference kind ("image" | "video" | "audio"). Video/audio
-# containers are decoded by PyAV inside MiniMaxH3Reference itself (it accepts a path and
-# decodes it when built, per packing_ref2va.py's module docstring) -- this app only needs
-# to classify the upload and hand it a path, never touching pixels/samples itself.
+# containers are decoded by PyAV inside each MiniMaxH3*Reference class's own `from_file`
+# classmethod (it accepts a path and decodes it when built, per references.py's module
+# docstring) -- this app only needs to classify the upload and hand it a path, never
+# touching pixels/samples itself.
 _REF_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 _REF_VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
 _REF_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac"}
@@ -602,8 +591,8 @@ def api_ref2va(
     references の送信順が参照順(プロンプト内ラベル・rotary配置に反映される)。種別は
     content-type/拡張子から自動判定する。`seconds` を省略できるのは references に音声を
     持つ参照(音声単体 or 音声付き動画)がちょうど1本のときのみ(その音声長が生成尺になる、
-    MiniMaxH3Ref2VASetupStep.prepare_references の仕様どおり) -- それ以外で省略すると
-    ValueError を 400 に変換して返す。
+    core/runner.py の `_num_frames_from_audio_reference` の仕様どおり) -- それ以外で
+    省略すると ValueError を 400 に変換して返す。
 
     cache/cache_threshold/attn/turbo は即反映(再ロード不要)の任意パラメータ
     (transformer_ref へ適用される)。
@@ -614,7 +603,6 @@ def api_ref2va(
     「スパイク: Ref2VA×超短尺」参照)。
     """
     global _current_progress
-    _reject_if_ref2va_not_migrated("/api/ref2va")
 
     if not prompt or not prompt.strip():
         raise HTTPException(400, "prompt is required")
@@ -636,12 +624,13 @@ def api_ref2va(
     elif seconds is not None:
         seconds = max(MIN_SECONDS, min(MAX_SECONDS, float(seconds)))
 
-    # Each upload is spooled to a real temp file: MiniMaxH3Reference(image=path) /
-    # (video=path) / (audio=path) decodes a path itself (PyAV for video/audio, PIL for
-    # image), and this app never needs the pixels/samples directly. Cleaned up in
-    # `finally`, after generate_ref2va() has already decoded everything into in-memory
-    # MiniMaxH3Reference objects (construction happens before the try block below, so
-    # the temp files must outlive that construction).
+    # Each upload is spooled to a real temp file: MiniMaxH3ImageReference.from_file(path) /
+    # MiniMaxH3VideoReference.from_file(path) / MiniMaxH3AudioReference.from_file(path)
+    # decodes a path itself (PyAV for video/audio, PIL for image), and this app never
+    # needs the pixels/samples directly. Cleaned up in `finally`, after generate_ref2va()
+    # has already decoded everything into in-memory MiniMaxH3*Reference objects
+    # (construction happens before the try block below, so the temp files must outlive
+    # that construction).
     tmp_paths: list[Path] = []
     built_references = []
     try:
@@ -654,11 +643,11 @@ def api_ref2va(
             tmp_paths.append(tmp_path)
             try:
                 if kind == "image":
-                    built_references.append(MiniMaxH3Reference(image=str(tmp_path)))
+                    built_references.append(MiniMaxH3ImageReference.from_file(str(tmp_path)))
                 elif kind == "video":
-                    built_references.append(MiniMaxH3Reference(video=str(tmp_path)))
+                    built_references.append(MiniMaxH3VideoReference.from_file(str(tmp_path)))
                 else:
-                    built_references.append(MiniMaxH3Reference(audio=str(tmp_path)))
+                    built_references.append(MiniMaxH3AudioReference.from_file(str(tmp_path)))
             except Exception as e:
                 raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
 
@@ -729,7 +718,6 @@ def _run_ref_batch(
     (変えられるのはプロンプトのみ)。
     """
     global _current_progress
-    _reject_if_ref2va_not_migrated("_run_ref_batch")
 
     if still and frames not in STILL_FRAME_CHOICES:
         raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
@@ -750,7 +738,7 @@ def _run_ref_batch(
         height = round_canvas_value(height)
         width = round_canvas_value(width)
 
-    # 参照のスプールと構築は /api/ref2va と同じ手順 (tmp ファイル → MiniMaxH3Reference)。
+    # 参照のスプールと構築は /api/ref2va と同じ手順 (tmp ファイル → MiniMaxH3*Reference.from_file)。
     tmp_paths: list[Path] = []
     built_references = []
     try:
@@ -763,11 +751,11 @@ def _run_ref_batch(
             tmp_paths.append(tmp_path)
             try:
                 if kind == "image":
-                    built_references.append(MiniMaxH3Reference(image=str(tmp_path)))
+                    built_references.append(MiniMaxH3ImageReference.from_file(str(tmp_path)))
                 elif kind == "video":
-                    built_references.append(MiniMaxH3Reference(video=str(tmp_path)))
+                    built_references.append(MiniMaxH3VideoReference.from_file(str(tmp_path)))
                 else:
-                    built_references.append(MiniMaxH3Reference(audio=str(tmp_path)))
+                    built_references.append(MiniMaxH3AudioReference.from_file(str(tmp_path)))
             except Exception as e:
                 raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
 

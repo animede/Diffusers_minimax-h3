@@ -138,21 +138,31 @@ import numpy as np
 import torch
 from PIL import Image
 
-# Re-exported so callers (app.py) can do `from core.runner import MiniMaxH3Reference`
-# without reaching into diffusers' modular_pipelines package themselves. Cheap import
-# (no model loading, just dataclass/PyAV/numpy/torch glue) -- safe at module level,
-# unlike the actual big-model loading calls in this file, which all stay lazy/on-demand.
+# Re-exported so callers (app.py) can do
+# `from core.runner import MiniMaxH3ImageReference` (etc.) without reaching into
+# diffusers' modular_pipelines package themselves. Cheap import (no model loading, just
+# dataclass/PyAV/numpy/torch glue) -- safe at module level, unlike the actual big-model
+# loading calls in this file, which all stay lazy/on-demand.
 #
-# PR #14355 (merged 2026-08-05, f37ab93) note: `MiniMaxH3Reference` still exists under
-# this same import path post-merge, but it is now only the *base* class of a hierarchy
-# (`MiniMaxH3ImageReference` / `MiniMaxH3VideoReference` / `MiniMaxH3AudioReference` in
-# references.py) -- the base class itself carries no `image=`/`video=`/`audio=` fields
-# any more, so app.py's `MiniMaxH3Reference(image=...)` construction (ref2va only) would
-# now raise a plain TypeError at construction time, before ever reaching this module.
-# This import staying valid is exactly why it does NOT ImportError at process start --
-# ref2va's actual breakage only surfaces when a request tries to use it, which is what
-# the RuntimeError guards below (`_ref2va_not_migrated_guard`) are for.
-from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Reference
+# PR #14355 (merged 2026-08-05, f37ab93) note: the old `MiniMaxH3Reference(image=...)` /
+# `(video=...)` / `(audio=...)` single-class construction is gone -- `MiniMaxH3Reference`
+# is now only the *base* class of a hierarchy (references.py): `MiniMaxH3ImageReference`,
+# `MiniMaxH3VideoReference`, `MiniMaxH3AudioReference`, each a `@dataclass` with its own
+# field (`image=`/`frames=`/`audio=`) and a `from_file(path_or_url)` classmethod that
+# decodes a path itself (PIL for an image, PyAV for video/audio) -- the direct
+# replacement for the old single-class path construction app.py used. `kind`
+# ("image"/"video"/"audio") and `has_audio` are attributes on every instance (class
+# attrs on `MiniMaxH3ImageReference`/`MiniMaxH3AudioReference`, a property on
+# `MiniMaxH3VideoReference`), so call sites that used to call the old free function
+# `packing_ref2va.reference_kind(index, entry)` now just read `entry.kind`/
+# `entry.has_audio` directly -- confirmed by reading before_encoder.py's
+# `MiniMaxH3Ref2VASetupStep.__call__`, which does exactly that.
+from diffusers.modular_pipelines.minimax_h3 import (
+    MiniMaxH3AudioReference,
+    MiniMaxH3ImageReference,
+    MiniMaxH3Reference,
+    MiniMaxH3VideoReference,
+)
 
 # The single source of truth for which hidden_states index MiniMax-H3 conditions on
 # (currently 50). PR #14355 turned the old `packing.MINIMAX_H3_TEXT_ENCODER_LAYER`
@@ -814,11 +824,12 @@ if H3_VAE_SMALLCLIP_FIX:
 # (~4104トークン、~65s/場面) の Qwen3-VL エンコードを場面ごとに繰り返すのは純粋な重複 --
 # プレフィックスを1回だけ `use_cache=True` で通し、場面ごとにプロンプト末尾
 # (14-33トークン、~0.2s) だけをキャッシュ継続する。"0" でいつでも従来経路 (場面ごとの
-# encode_prompt フル計算) に戻せる。
+# _encode_ref2va_prompt フル計算) に戻せる。
 #
-# 精度 (scripts/probe_ref_prefix_cache.py で実測済み):
+# 精度 (scripts/probe_ref_prefix_cache.py で実測済み、PR #14355 前の実装に対して):
 # - プレフィックス部分の hidden_states[50] はフル計算と**ビット一致** (因果LMで参照が
-#   前置・プロンプトは末尾 verbatim のため。packing_ref2va.build_ref2va_presentation で確認)
+#   前置・プロンプトは末尾 verbatim のため。旧 packing_ref2va.build_ref2va_presentation で
+#   確認 -- 後継の MiniMaxH3Ref2VATextEncoderStep._build_presentation も同じ構造を保つ)
 # - プロンプト末尾部分は相対RMS ~1.5% の丸め差が残る (カーネル/GEMM のタイル経路が
 #   系列長で変わるため。eager 固定でも同水準 = sdpa 固有ではなく実行経路差そのもの)。
 #   これがロジックバグでないことはネガティブコントロールで確定: わざと位置オフセットを
@@ -831,19 +842,35 @@ H3_REF_PREFIX_CACHE = os.environ.get("H3_REF_PREFIX_CACHE", "1").strip() == "1"
 def _encode_ref_prompts_shared_prefix(
     pipe,
     prompts: list[str],
-    prepared_references,
+    normalized_references,
     device: torch.device,
     dtype: torch.dtype,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     r"""参照プレフィックスを1回だけ KV キャッシュ化し、場面 (プロンプト) ごとにプロンプト
-    末尾だけを継続エンコードする (`MiniMaxH3Ref2VATextEncoderStep.encode_prompt` の
-    バッチ特化版。H3_REF_PREFIX_CACHE のモジュールコメントに実測精度、
-    scripts/probe_ref_prefix_cache.py に検証手順)。
+    末尾だけを継続エンコードする (`MiniMaxH3Ref2VATextEncoderStep.__call__` のバッチ特化版。
+    H3_REF_PREFIX_CACHE のモジュールコメントに実測精度、scripts/probe_ref_prefix_cache.py
+    に検証手順 -- どちらも PR #14355 以前の `encode_prompt` 静的メソッドに対して取られた
+    ものだが、プレフィックス/継続分割点の設計自体は新実装でも同じ形のまま成り立つ、
+    このdocstringが説明する通り)。
+
+    PR #14355 (f37ab93) 後: `packing_ref2va.build_ref2va_presentation` /
+    `sample_reference_video_frames` は削除され、同等のロジックは
+    `MiniMaxH3Ref2VATextEncoderStep` のインスタンスメソッドに吸収された --
+    `_gather_vision_features` (画像/動画参照をプロセッサへ通し、ビジョントークン数と
+    動画ブロックのタイムスタンプを求める。動画のフレームサンプリングは
+    `_sample_video_condition_frames` staticmethod、旧 `sample_reference_video_frames` の
+    後継)と `_build_presentation` (staticmethod、旧 `build_ref2va_presentation` の後継 --
+    ラベル付け・ビジョンブロック挿入・プロンプト末尾追加のトークン化)。この関数は
+    `MiniMaxH3Ref2VATextEncoderStep()` のインスタンスを1つ作り、その2メソッドを
+    `__call__` 相当の手順でプレフィックス (プロンプト空文字) に対して1回だけ呼び、
+    以降は `get_qwen3vl_prompt_embeds` を経由せず旧実装同様 `text_encoder.model(...)` を
+    直接 `use_cache=True` で叩く (KVキャッシュ継続には `get_qwen3vl_prompt_embeds` の
+    `use_cache=False` 固定呼び出しでは足りないため)。
 
     設計はプローブをそのまま踏襲する:
-      1. `build_ref2va_presentation(tokenizer, "", ...)` (プロンプト空文字) のトークン列は、
+      1. `_build_presentation(tokenizer, "", ...)` (プロンプト空文字) のトークン列は、
          任意のプロンプト付きフル系列の先頭と完全一致する (プロンプトは常に最後に
-         `emit(text(prompt))` されるだけ -- packing_ref2va で確認、トークン単位の一致も
+         `emit(text(prompt))` されるだけ -- encoders.py で確認、トークン単位の一致も
          プローブで実測)。これをプレフィックスとして1回だけ `use_cache=True` で通す
       2. 場面ごとにプロンプト末尾のみを `past_key_values=cache` で継続する。
          `attention_mask`/`mm_token_type_ids`/`pixel_values` 系は全て None
@@ -855,20 +882,16 @@ def _encode_ref_prompts_shared_prefix(
     「プレフィックス→全場面の継続」を1回の呼び出し内で完結させるので安全だが、
     呼び出し側はこの関数の実行中に他の text_encoder 呼び出しを挟んではならない。
 
-    H3_TE_PRUNE (51層 TE) でも成立する (encode_prompt と同じ num_layers ガードを行い、
-    DynamicCache はレイヤー数に自動追従する)。返り値は `prompts` と同順の
-    `(prompt_embeds, text_token_tags)` で、encode_prompt と同じ形・dtype 規約。
+    H3_TE_PRUNE (51層 TE) でも成立する (`get_qwen3vl_prompt_embeds` と同じ num_layers
+    ガードを行い、DynamicCache はレイヤー数に自動追従する)。返り値は `prompts` と同順の
+    `(prompt_embeds, text_token_tags)` で、`MiniMaxH3Ref2VATextEncoderStep.__call__` と
+    同じ形・dtype 規約。
     """
-    _ref2va_not_migrated_guard("_encode_ref_prompts_shared_prefix")
-    import numpy as np
-    from diffusers.modular_pipelines.minimax_h3.packing import MINIMAX_H3_TEXT_TAG
-    from diffusers.modular_pipelines.minimax_h3.packing_ref2va import (
-        build_ref2va_presentation,
-        sample_reference_video_frames,
-    )
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VATextEncoderStep
     from transformers.cache_utils import DynamicCache
 
     components = pipe
+    step = MiniMaxH3Ref2VATextEncoderStep()
 
     num_layers = components.text_encoder.config.text_config.num_hidden_layers
     if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
@@ -878,45 +901,33 @@ def _encode_ref_prompts_shared_prefix(
             f"`text_encoder` has {num_layers}."
         )
 
-    # --- encode_prompt と同一の画像/動画参照の前処理 (encoders.py を丸ごと踏襲) ---
-    merge_size = components.processor.image_processor.merge_size**2
+    # --- MiniMaxH3Ref2VATextEncoderStep.__call__ と同一の画像/動画参照の前処理 ---
+    vision_inputs, image_token_counts, video_token_counts, video_timestamps = step._gather_vision_features(
+        components.processor, normalized_references, components.fps
+    )
+    pixel_values = vision_inputs.get("pixel_values")
+    image_grid_thw = vision_inputs.get("image_grid_thw")
+    pixel_values_videos = vision_inputs.get("pixel_values_videos")
+    video_grid_thw = vision_inputs.get("video_grid_thw")
 
-    pixel_values, image_grid_thw, image_token_counts = None, None, []
-    images = [reference.image for reference in prepared_references if reference.kind == "image"]
-    if images:
-        vision = components.processor.image_processor(images=images, return_tensors="pt")
-        pixel_values, image_grid_thw = vision["pixel_values"], vision["image_grid_thw"]
-        image_token_counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
-
-    pixel_values_videos, video_grid_thw, video_block_token_counts = None, None, []
-    videos = [reference for reference in prepared_references if reference.kind == "video"]
-    if videos:
-        # `block_timestamps` の書き戻しは必須: 直後の `build_ref2va_presentation` が
-        # 動画ラベルの timestamp 文字列を作るのに読む (encode_prompt と同一の順序)。
-        sampled = [sample_reference_video_frames(reference.frames) for reference in videos]
-        for reference, (_, block_timestamps) in zip(videos, sampled):
-            reference.block_timestamps = block_timestamps
-        vision = components.processor.video_processor(
-            videos=[np.stack(frames) for frames, _ in sampled], do_sample_frames=False, return_tensors="pt"
-        )
-        pixel_values_videos, video_grid_thw = vision["pixel_values_videos"], vision["video_grid_thw"]
-        video_block_token_counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
-        for reference, grid in zip(videos, video_grid_thw):
-            if int(grid[0]) != len(reference.block_timestamps):
-                raise ValueError(
-                    f"The processor merged a reference video into {int(grid[0])} vision blocks, but MiniMax-H3 "
-                    f"labels {len(reference.block_timestamps)} of them."
-                )
-
-    prefix_ids, prefix_tags = build_ref2va_presentation(
-        components.tokenizer, "", prepared_references, image_token_counts, video_block_token_counts
+    prefix_ids, prefix_tags = step._build_presentation(
+        components.tokenizer,
+        "",
+        normalized_references,
+        image_token_counts,
+        video_token_counts,
+        video_timestamps,
+        text_tag=components.text_tag,
+        video_tag=components.video_tag,
     )
     prefix_input = torch.tensor([prefix_ids], dtype=torch.long, device=device)
     mm_token_type_ids = torch.tensor(
         components.processor.create_mm_token_type_ids([prefix_ids]), dtype=torch.long, device=device
     )
 
-    # encode_prompt と同じ CPU オフロードフックの手動発火 (`.model(...)` を直接呼ぶため)。
+    # get_qwen3vl_prompt_embeds と同じ CPU オフロードフックの手動発火 (`.model(...)` を
+    # 直接呼ぶため -- KVキャッシュ継続にはそのヘルパーの `use_cache=False` 固定では
+    # 足りないので、ここは自前で呼ぶ)。
     model = components.text_encoder.model
     hook = getattr(components.text_encoder, "_hf_hook", None)
     if hook is not None and hasattr(hook, "pre_forward"):
@@ -968,9 +979,9 @@ def _encode_ref_prompts_shared_prefix(
 
         prompt_embeds = torch.cat([prefix_hidden, suffix_hidden], dim=1)
         # プロンプトはビジョンブロックを含まない純テキストの末尾セグメントなので、
-        # suffix のタグは全て MINIMAX_H3_TEXT_TAG。
+        # suffix のタグは全て components.text_tag。
         text_token_tags = torch.tensor(
-            list(prefix_tags) + [MINIMAX_H3_TEXT_TAG] * len(suffix_ids), dtype=torch.long
+            list(prefix_tags) + [components.text_tag] * len(suffix_ids), dtype=torch.long
         )
         results.append((prompt_embeds, text_token_tags))
 
@@ -1001,43 +1012,6 @@ def _relaxed_min_duration():
         yield
     finally:
         MiniMaxH3ModularPipeline.min_duration = saved
-
-
-def _ref2va_not_migrated_guard(caller: str) -> None:
-    """Raise a clear `RuntimeError` for any ref2va entry point until PR #14355's second
-    migration stage lands.
-
-    This task (2026-08-09) ports only the t2i/t2va/still_batch/hires/turbo/FBC paths to
-    diffusers PR #14355's merged shape (f37ab93) -- see README's "今後の外部イベント待ち"
-    §1 for the full audit. ref2va is a separate, larger migration on its own: the
-    `MiniMaxH3Reference` request-facing dataclass became a class hierarchy
-    (`MiniMaxH3ImageReference`/`MiniMaxH3VideoReference`/`MiniMaxH3AudioReference`,
-    references.py), `packing_ref2va.py` (`build_ref2va_presentation`, `reference_kind`,
-    `sample_reference_video_frames`) was deleted with no drop-in replacement, and the old
-    two-shell `pipe`/`pipe_ref` design (`_ensure_pipe_ref_shell`, built around
-    `MiniMaxH3Ref2VABlocks` as a *public* class) does not match the new `workflow="ref2va"`
-    single-shell mechanism (`MiniMaxH3Ref2VABlocks` is no longer exported at all -- ref2va
-    is now folded into `MiniMaxH3Blocks` + `MiniMaxH3AutoDenoiseStep`'s conditional
-    branching). None of that is ported here.
-
-    Rather than let any of the four ref2va entry points
-    (`generate_ref2va`/`generate_ref_batch`/`_ensure_pipe_ref_shell`/
-    `_encode_ref_prompts_shared_prefix`) hit a confusing `ImportError` deep inside a
-    function body (the modules `packing.py`/`packing_ref2va.py` they import from are
-    gone) or a `TypeError` from app.py's now-incompatible `MiniMaxH3Reference(image=...)`
-    construction, this raises upfront with a message that says what is actually going on.
-    Called at the very top of each of those four call sites, before any of their now-stale
-    imports execute. venv stays pinned to abc5e9b (the pre-PR#14355 diffusers) for exactly
-    this reason -- ref2va still works today, just not through this migrated runner.py.
-    """
-    raise RuntimeError(
-        f"{caller}: PR#14355 追従の第2段(ref2va)が未実施です。ref2va は旧ピン留め "
-        "(diffusers abc5e9b) でのみ動作します -- venv を f37ab93 側に切り替えてこの "
-        "runner.py を使う場合、ref2va 系 (generate_ref2va / generate_ref_batch / "
-        "_ensure_pipe_ref_shell / _encode_ref_prompts_shared_prefix) は呼び出せません。"
-        "詳細は README『今後の外部イベント待ち』§1、および runner.py の "
-        "_ref2va_not_migrated_guard の docstring を参照してください。"
-    )
 
 
 def _unpatchify_video_tokens(
@@ -1175,6 +1149,75 @@ def _encode_h3_prompt(
     prompt_embeds = get_qwen3vl_prompt_embeds(
         components.text_encoder,
         processor,
+        token_ids,
+        vision_inputs,
+        text_encoder_layer=components.text_encoder_layer,
+        device=device,
+        dtype=dtype,
+    )
+    return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
+
+
+def _encode_ref2va_prompt(
+    components,
+    prompt: str,
+    normalized_references: list,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Build MiniMax-H3's `ref2va` presentation of a request and encode it -- the single
+    -request (non-batch) analogue of `_encode_ref_prompts_shared_prefix`, and the
+    `@torch.no_grad()`-free replacement for the retired
+    `MiniMaxH3Ref2VATextEncoderStep.encode_prompt` bare staticmethod this file used to
+    call directly (see `_encode_h3_prompt`'s own docstring for why bypassing the block's
+    `__call__` matters here -- same reasoning, ref2va's own text encoder step).
+
+    PR #14355 (f37ab93) removed the `encode_prompt` staticmethod entirely; its role is now
+    `MiniMaxH3Ref2VATextEncoderStep.__call__` (encoders.py), built out of two of that same
+    class's own instance/static methods -- `_gather_vision_features` (runs the reference
+    images/videos through the processor, batched per modality) and `_build_presentation`
+    (tokenizes the labelled presentation: `"<Picture i>: "` / `"<Audio j>: "` /
+    `"<Video k>: "` labels plus vision blocks, then the prompt verbatim) -- followed by one
+    `get_qwen3vl_prompt_embeds` call. This function creates one throwaway
+    `MiniMaxH3Ref2VATextEncoderStep()` instance to reuse those two methods (matching
+    `__call__`'s own sequence exactly) and calls `get_qwen3vl_prompt_embeds` itself, the
+    same shape `_encode_h3_prompt` already uses for t2va/fl2va.
+
+    Args:
+        components: The pipe shell (`MiniMaxH3ModularPipeline` instance).
+        prompt (`str`): The prompt to encode.
+        normalized_references (`list[MiniMaxH3Reference]`):
+            The references already normalized by `MiniMaxH3Ref2VASetupStep` (rates/
+            resolutions resolved), in packed order.
+        device (`torch.device`, *optional*): The device to run the conditioner on.
+        dtype (`torch.dtype`, *optional*): The dtype of the returned embeddings.
+
+    Returns:
+        `tuple[torch.Tensor, torch.Tensor]`: the `(1, num_text_tokens, 5120)` hidden
+        states and the `(num_text_tokens,)` per-row modality tags.
+    """
+    from diffusers.modular_pipelines.minimax_h3.encoders import (
+        MiniMaxH3Ref2VATextEncoderStep,
+        get_qwen3vl_prompt_embeds,
+    )
+
+    step = MiniMaxH3Ref2VATextEncoderStep()
+    vision_inputs, image_token_counts, video_token_counts, video_timestamps = step._gather_vision_features(
+        components.processor, normalized_references, components.fps
+    )
+    token_ids, token_tags = step._build_presentation(
+        components.tokenizer,
+        prompt,
+        normalized_references,
+        image_token_counts,
+        video_token_counts,
+        video_timestamps,
+        text_tag=components.text_tag,
+        video_tag=components.video_tag,
+    )
+    prompt_embeds = get_qwen3vl_prompt_embeds(
+        components.text_encoder,
+        components.processor,
         token_ids,
         vision_inputs,
         text_encoder_layer=components.text_encoder_layer,
@@ -1626,6 +1669,44 @@ def seconds_to_num_frames(seconds: float) -> int:
     return align_num_frames(round(seconds * FPS))
 
 
+def _num_frames_from_audio_reference(references: list, fps: int) -> int:
+    r"""ref2va の `seconds=None` を、ちょうど1本の音声を持つ参照 (単体の
+    `MiniMaxH3AudioReference`、または音声付きの `MiniMaxH3VideoReference`) の長さから
+    `num_frames` へ変換する。
+
+    PR #14355 (f37ab93) 前は `MiniMaxH3Ref2VASetupStep.prepare_references` がこの導出を
+    内部で行っていたが、後継の `MiniMaxH3Ref2VASetupStep.__call__` は `num_frames` を
+    必須入力にし (before_encoder.py)、この導出そのものを削除した -- そのブロックの
+    `num_frames` の docstring 自身が代わりのレシピを明記している:
+    `round(samples / sample_rate * 24)`。この関数はそのレシピをそのまま適用し、旧実装の
+    「音声を持つ参照がちょうど1本のときだけ許可、それ以外は ValueError」という制約を
+    维持する (呼び出し側のドキュメント/バリデーション文言と一致させるため)。
+
+    参照はまだ正規化前 (`MiniMaxH3Ref2VASetupStep` を通す前) の生の入力なので、
+    `sample_rate` が None のときは記録された値をそのまま秒数計算に使う (正規化後の
+    audio_sampling_rate ではなく、参照自身が運んできたレート -- 正規化はここでは
+    まだ行われていないので、無指定なら「そのまま」を意味する `MiniMaxH3VideoReference`/
+    `MiniMaxH3AudioReference` の宣言どおりに扱う)。
+    """
+    audio_bearing = [entry for entry in references if entry.has_audio]
+    if len(audio_bearing) != 1:
+        raise ValueError(
+            "`seconds` を省略できるのは references に音声を持つ参照 (単体の "
+            "MiniMaxH3AudioReference、または音声付きの MiniMaxH3VideoReference) が "
+            f"ちょうど1本のときだけです。見つかった数: {len(audio_bearing)}。"
+        )
+    reference = audio_bearing[0]
+    waveform = reference.audio
+    sample_rate = reference.sample_rate
+    if sample_rate is None:
+        raise ValueError(
+            "音声参照の sample_rate が不明なため、seconds を自動導出できません。"
+            "`from_file()` で読み込んだ参照は必ず sample_rate を持つはずです。"
+        )
+    num_samples = waveform.shape[-1]
+    return align_num_frames(round(num_samples / sample_rate * fps))
+
+
 def gpu_mem_gb() -> dict:
     if not torch.cuda.is_available():
         return {}
@@ -1752,23 +1833,32 @@ class MiniMaxH3Runner:
         self._load_lock = threading.Lock()
 
         # --- ref2va (omni-reference) additions ---
-        # A second ModularPipeline shell, built from MiniMaxH3Ref2VABlocks (the only way
-        # to get a pipe whose `_component_specs` know about `transformer_ref` -- the
-        # default `ModularPipeline.from_pretrained(MODEL_ID)` shell above is built from
-        # MiniMaxH3Blocks (t2va/fl2va) and its spec table has no `transformer_ref` entry
-        # at all, confirmed by probe: `pipe.load_components(names=["transformer_ref"])`
-        # on the t2va shell logs "Unknown components will be ignored: {'transformer_ref'}"
-        # and leaves `pipe.transformer_ref` unset. `transformer`/`transformer_ref` are
-        # each ~66.3GB bf16 and cannot coexist in this card's ~96GB (same constraint as
-        # TE vs transformer above), so only one of `self._pipe.transformer` /
-        # `self._pipe_ref.transformer_ref` is ever GPU-resident at a time -- tracked by
-        # `self._active_variant`. Every other component (text_encoder, tokenizer,
-        # processor, vae, audio_vae, scheduler, audio_scheduler, video_processor) is
-        # loaded once on `self._pipe` and shared onto `self._pipe_ref` by plain attribute
-        # assignment (`ModularPipeline.components` is just `{name: getattr(self, name)
-        # for name in self._component_specs if hasattr(self, name)}` -- confirmed by
-        # reading modular_pipeline.py -- so this is not a hack, it is the documented shape
-        # of that dict) -- avoids a second ~66GB TE / ~11GB VAE load.
+        # PR #14355 (f37ab93) note: there is only ONE ModularPipeline shell now, not two.
+        # Pre-merge, `MiniMaxH3Ref2VABlocks` was a separate public blocks class, and the
+        # default `ModularPipeline.from_pretrained(MODEL_ID)` shell (built from the t2va/
+        # fl2va-only `MiniMaxH3Blocks` of that era) had no `transformer_ref` entry in its
+        # `_component_specs` at all -- hence the old second `_pipe_ref` shell. Post-merge,
+        # `MiniMaxH3Blocks` (default_blocks_name, what `_ensure_pipe_shell` below builds
+        # with no `workflow=` argument) itself unions t2va+fl2va+ref2va: its
+        # `expected_components` includes BOTH `transformer` and `transformer_ref` --
+        # confirmed both by reading `SequentialPipelineBlocks.expected_components`
+        # (modular_pipeline.py: unions every sub-block's own, and `MiniMaxH3AutoDenoiseStep`
+        # -- one of `MiniMaxH3Blocks`' five sub-blocks -- lists `MiniMaxH3Ref2VACoreDenoiseStep`
+        # as one of ITS three sub-blocks, which is what pulls `transformer_ref` in) and by
+        # this project's own first-migration-stage boot log, which already showed
+        # `self._pipe.component_names` containing `transformer_ref` right alongside
+        # `transformer`. So `self._pipe.load_components(names=["transformer_ref"], ...)`
+        # (see `_ensure_transformer_ref` below) works directly on the ONE shell -- no
+        # second `init_pipeline()` call, no second spec table.
+        # `self._pipe_ref` is kept as a plain alias for `self._pipe` (not a separate
+        # object) purely so every `self._pipe_ref.transformer_ref` / `self._pipe_ref.*`
+        # call site elsewhere in this file (there are dozens) keeps working unchanged --
+        # it is always the exact same `ModularPipeline` instance as `self._pipe`, never a
+        # distinct one. `transformer`/`transformer_ref` are each ~66.3GB bf16 and cannot
+        # coexist in this card's ~96GB (same constraint as TE vs transformer above), so
+        # only one of `self._pipe.transformer` / `self._pipe.transformer_ref` is ever
+        # GPU-resident at a time (except `H3_TRANSFORMER_BOTH_RESIDENT`'s int8 mode, where
+        # both fit) -- tracked by `self._active_variant`.
         self._pipe_ref = None
         self._transformer_ref_loaded = False
         # "t2va" | "ref2va" | None (nothing loaded yet). Only one of `transformer` /
@@ -1805,46 +1895,24 @@ class MiniMaxH3Runner:
                      self._pipe._blocks.__class__.__name__, self._pipe.component_names)
 
     def _ensure_pipe_ref_shell(self):
-        """Build the second ModularPipeline shell (MiniMaxH3Ref2VABlocks), whose spec table
-        knows about `transformer_ref`. See the `_pipe_ref` field comment in `__init__` for
-        why a second shell is required at all (the t2va shell's spec table has no
-        `transformer_ref` entry). Idempotent, and does not load any component weights.
-
-        PR #14355 (f37ab93) note: `MiniMaxH3Ref2VABlocks` is no longer exported from
-        `diffusers.modular_pipelines.minimax_h3` at all -- ref2va folded into the single
-        `MiniMaxH3Blocks` + `MiniMaxH3AutoDenoiseStep` conditional branching, selected via
-        `ModularPipeline.from_pretrained(MODEL_ID, workflow="ref2va")` rather than a second
-        hand-built shell class. This two-shell (`pipe`/`pipe_ref`) design does not carry
-        over as-is, so this method guards instead of migrating -- see
-        `_ref2va_not_migrated_guard`'s docstring.
+        """PR #14355 (f37ab93): no second shell to build any more (see the `_pipe_ref`
+        field comment in `__init__` for why) -- `self._pipe_ref` is just made to point at
+        the same single `self._pipe` shell, which already has `transformer_ref` in its own
+        `_component_specs`. Idempotent, and does not load any component weights. Kept as a
+        method (rather than inlining the alias in `__init__`) so every existing call site
+        that calls this before touching `self._pipe_ref` keeps working unchanged.
         """
-        _ref2va_not_migrated_guard("_ensure_pipe_ref_shell")
         self._ensure_pipe_shell()
-        if self._pipe_ref is not None:
-            return
-        from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3Ref2VABlocks
-
-        logger.info("building ref2va ModularPipeline shell from %s", MODEL_ID)
-        self._pipe_ref = MiniMaxH3Ref2VABlocks().init_pipeline(MODEL_ID)
-        logger.info("ref2va pipe shell built: blocks=%s components=%s",
-                     self._pipe_ref._blocks.__class__.__name__, self._pipe_ref.component_names)
+        self._pipe_ref = self._pipe
 
     def _sync_shared_components_to_ref(self):
-        """Mirror every component the two shells have in common (everything except
-        `transformer` / `transformer_ref` themselves) from `self._pipe` onto
-        `self._pipe_ref`, by plain attribute assignment -- confirmed safe by reading
-        `ModularPipeline.components`'s implementation (see `_pipe_ref` field comment).
-        Called before any ref2va block runs, so text_encoder/vae/audio_vae/schedulers are
-        loaded exactly once regardless of which variant a request asks for. Safe to call
-        repeatedly (e.g. once per generate() call): each assignment just re-points the
-        same already-loaded module, it never re-loads or copies weights.
+        """PR #14355 (f37ab93): a no-op now that `self._pipe_ref is self._pipe` (see
+        `_ensure_pipe_ref_shell`) -- there is nothing to mirror between two shells because
+        there is only one. Kept (rather than deleted) so every existing call site that
+        calls this before running a ref2va block keeps working unchanged; it still ensures
+        the alias itself is set up.
         """
         self._ensure_pipe_ref_shell()
-        for name in ("text_encoder", "tokenizer", "processor", "vae", "audio_vae",
-                     "scheduler", "audio_scheduler", "video_processor"):
-            component = getattr(self._pipe, name, None)
-            if component is not None:
-                setattr(self._pipe_ref, name, component)
 
     def _ensure_vaes(self, progress: ProgressState | None = None):
         """Load vae + audio_vae (~11GB fp32) component weights (host RAM/disk -> not GPU yet
@@ -3052,17 +3120,18 @@ class MiniMaxH3Runner:
         # depending on quantization, and a host-RAM transit would both waste time and
         # evict the page-cached model shards that make the next per-request reload fast.
         #
-        # BUG FOUND DURING THIS TASK'S OWN VERIFICATION: `self._pipe_ref.text_encoder`
-        # (set by `_sync_shared_components_to_ref` via plain attribute assignment, so it
-        # is the *same* module object as `self._pipe.text_encoder`, not a copy) also has
-        # to be cleared here, or it keeps the refcount above zero and `del
-        # self._pipe.text_encoder` frees nothing -- reproduced on this task's own second
-        # ref2va attempt: `_free_text_encoder(force=True)` logged as having run, but
-        # `gpu.allocated_gb` did not drop (stayed at ~87.5GB, TE-nf4's ~21GB never
-        # released), and the very next denoise step OOM'd identically to the un-freed
-        # case. Only `text_encoder` needs this (the only shared component this class ever
-        # `del`s outright -- vae/audio_vae are `.to()`-moved, never deleted, and
-        # transformer/transformer_ref are never shared between the two shells).
+        # BUG FOUND DURING THIS TASK'S FIRST MIGRATION STAGE (pre-PR#14355-ref2va-port,
+        # two-shell design): `self._pipe_ref.text_encoder` (set by
+        # `_sync_shared_components_to_ref` via plain attribute assignment onto a
+        # *separate* shell object, so it held its own strong reference to the same
+        # module) also had to be cleared here, or it kept the refcount above zero and
+        # `del self._pipe.text_encoder` freed nothing. PR #14355's ref2va port made
+        # `self._pipe_ref` a plain alias for `self._pipe` (`_ensure_pipe_ref_shell`'s
+        # docstring) -- there is only one shell now, so the block below is a redundant
+        # no-op (`self._pipe_ref.text_encoder` is already `None`, set by the line right
+        # above, since they are the same object) rather than a fix for a live bug. Left
+        # in rather than deleted: harmless, and it stays correct if this alias
+        # relationship were ever to change again.
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
         if self._pipe_ref is not None and getattr(self._pipe_ref, "text_encoder", None) is not None:
@@ -4840,7 +4909,8 @@ class MiniMaxH3Runner:
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
-        `MiniMaxH3Reference` images/videos/audio clips (up to 9/3/3, 12 total).
+        `MiniMaxH3ImageReference` / `MiniMaxH3VideoReference` / `MiniMaxH3AudioReference`
+        instances (up to 9/3/3, 12 total).
 
         `still=True` は参照付き静止画モード (ref2i): `seconds` を無視して `still_frames`
         (STILL_FRAME_CHOICES) の超短尺を生成し、中央フレームを PNG に書き出す。
@@ -4853,10 +4923,9 @@ class MiniMaxH3Runner:
         `seconds=None` is only valid when `references` carries exactly one audio-bearing
         reference (a lone audio reference, or a video reference with a soundtrack) -- the
         generated duration is then that reference's own, per
-        `MiniMaxH3Ref2VASetupStep.prepare_references`. `height`/`width` default to
-        MiniMax-H3's own 16:9 canvas when left out (references never bind the target
-        geometry -- each is prepared at its own resolution, see packing_ref2va.py's
-        module docstring).
+        `MiniMaxH3Ref2VASetupStep.__call__`. `height`/`width` default to MiniMax-H3's own
+        16:9 canvas when left out (references never bind the target geometry -- each is
+        prepared at its own resolution, see references.py's module docstring).
 
         Mirrors `generate()`'s structure closely (same FBC instrumentation, same
         bnb-4bit-mode decode-window transformer drop/reload pattern), but against
@@ -4873,35 +4942,38 @@ class MiniMaxH3Runner:
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats, in the
         same shape `generate()` returns (plus `references_summary`).
 
-        NOT MIGRATED to PR #14355 (f37ab93) as of 2026-08-09 -- raises immediately. See
-        `_ref2va_not_migrated_guard`'s docstring for the reasons (references.py class
-        hierarchy, deleted packing_ref2va.py, workflow-based single-shell design).
+        PR #14355 (f37ab93) migration note: `self._pipe_ref` is now just an alias for
+        `self._pipe` (see `_ensure_pipe_ref_shell`'s docstring) -- there is only ONE
+        ModularPipeline shell, whose `_component_specs` already carries `transformer_ref`
+        alongside `transformer`. `MiniMaxH3Ref2VACoreDenoiseStep`'s own block order
+        (modular_blocks_minimax_h3.py) is `prepare_layout, prepare_condition_latents,
+        prepare_latents, prepare_latents_ref2va, set_timesteps, denoise, after_denoise` --
+        this method follows that order exactly (see `generate()`'s own fl2va comment on
+        why `MiniMaxH3PrepareConditionLatentsStep` must run *before*
+        `MiniMaxH3PrepareLatentsStep`, and `MiniMaxH3Ref2VAPrepareLatentsStep` after: the
+        draw order is part of what the request's generator reproduces).
+        `MiniMaxH3AfterDenoiseStep` (unpatchify) is inserted right before decode, same as
+        `generate()`'s own t2va/fl2va path.
         """
-        _ref2va_not_migrated_guard("generate_ref2va")
         import core.settings as settings
 
         instant = settings.resolve_instant_settings(cache, cache_threshold, attn, turbo)
 
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3PrepareConditionLatentsStep,
             MiniMaxH3PrepareLatentsStep,
+            MiniMaxH3Ref2VAPrepareLatentsStep,
             MiniMaxH3Ref2VAPrepareLayoutStep,
             MiniMaxH3SetTimestepsStep,
         )
         from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
         from diffusers.modular_pipelines.minimax_h3.decoders import (
+            MiniMaxH3AfterDenoiseStep,
             MiniMaxH3AudioDecodeStep,
             MiniMaxH3VideoDecodeStep,
         )
-        from diffusers.modular_pipelines.minimax_h3.denoise import (
-            MiniMaxH3Ref2VADenoiseStep,
-            MiniMaxH3Ref2VALoopDenoiser,
-            MiniMaxH3LoopSchedulerStep,
-        )
-        from diffusers.modular_pipelines.minimax_h3.encoders import (
-            MiniMaxH3Ref2VAReferenceEncoderStep,
-            MiniMaxH3Ref2VATextEncoderStep,
-        )
-        from diffusers.modular_pipelines.minimax_h3.packing_ref2va import reference_kind
+        from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3Ref2VADenoiseStep
+        from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VAReferenceEncoderStep
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
@@ -4918,7 +4990,11 @@ class MiniMaxH3Runner:
                 "24GB 以上が必要 -- 20GB 級で実測確認済み)。ref2va を使うときは "
                 "H3_TE_DEVICE を外して起動してください(t2va/fl2va/t2i は併用可能)。"
             )
-        kinds = [reference_kind(index, entry) for index, entry in enumerate(references)]
+        # PR #14355 後: `packing_ref2va.reference_kind(index, entry)` は削除され、
+        # `kind`/`has_audio` は各 MiniMaxH3*Reference インスタンス自身の属性になった
+        # (references.py -- `MiniMaxH3ImageReference.kind`/`has_audio` はクラス属性、
+        # `MiniMaxH3VideoReference.has_audio` はプロパティ)。
+        kinds = [entry.kind for entry in references]
         if set(kinds) == {"audio"}:
             raise ValueError(
                 "An audio reference has to be paired with at least one image or video reference and cannot be "
@@ -4932,11 +5008,20 @@ class MiniMaxH3Runner:
                     "still_frames=5 には H3_VAE_SMALLCLIP_FIX=1 (既定) が必要です "
                     "(潜在2フレームのデコードは上流のチャンク境界バグで落ちるため)。"
                 )
-            # 音声参照からの尺自動導出 (seconds=None 時の Ref2VASetupStep の挙動) と
-            # 静止画の固定超短尺は両立しない -- 静止画では常に still_frames が尺を決める。
+            # 音声参照からの尺自動導出 (seconds=None) と静止画の固定超短尺は両立しない --
+            # 静止画では常に still_frames が尺を決める。
             num_frames = still_frames
+        elif seconds is not None:
+            num_frames = seconds_to_num_frames(seconds)
         else:
-            num_frames = None if seconds is None else seconds_to_num_frames(seconds)
+            # PR #14355 後: `num_frames` は `MiniMaxH3Ref2VASetupStep` の必須入力になり
+            # (before_encoder.py, `InputParam(name="num_frames", required=True)`)、
+            # 音声参照の長さからの尺自動導出は setup step 内ではもう行われない --
+            # そのブロックの `num_frames` docstring 自身が「音声参照と同じ尺にするには
+            # `round(samples / sample_rate * 24)` を渡せ」と明記している。旧実装の
+            # `seconds=None` 挙動 (音声を持つ参照がちょうど1本なら、その音声長を尺にする)
+            # はこの runner 側で肩代わりする。
+            num_frames = _num_frames_from_audio_reference(references, FPS)
 
         with self._load_lock:
             # Free `transformer` (t2va's, if resident) now, but do NOT load
@@ -5028,8 +5113,9 @@ class MiniMaxH3Runner:
 
         # --- setup (canvas / frame count / reference prep) ---
         # Reference images/videos/audio are decoded and resized here (each at its own
-        # resolution -- see packing_ref2va.py's module docstring), and the frame count is
-        # resolved from a lone audio-bearing reference when `num_frames` was left None.
+        # resolution -- see references.py's module docstring). `num_frames` is already
+        # resolved above (this block's own input is `required=True` now -- see the
+        # `_num_frames_from_audio_reference` call site's comment).
         setup_step = MiniMaxH3Ref2VASetupStep()
         if still:
             # 超短尺 (5秒未満) は setup step の duration バリデーションが弾くため、
@@ -5044,8 +5130,8 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="encoding", message="プロンプト+参照をエンコード中...")
         with self._te_attached(), torch.no_grad():
-            prompt_embeds, text_token_tags = MiniMaxH3Ref2VATextEncoderStep.encode_prompt(
-                pipe, prompt, state.get("prepared_references"),
+            prompt_embeds, text_token_tags = _encode_ref2va_prompt(
+                pipe, prompt, state.get("normalized_references"),
                 device=self._encode_device, dtype=torch.bfloat16,
             )
         prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
@@ -5072,20 +5158,21 @@ class MiniMaxH3Runner:
             # TE-vs-vae conflict, unrelated to this mode's transformer choreography
             # (which is why the original comment here, reasoning only about
             # transformer_ref's tiny footprint, missed it). Prompt+reference text
-            # encoding (`MiniMaxH3Ref2VATextEncoderStep.encode_prompt`, a bare
-            # staticmethod call, not a block -- already ran above and does not need
-            # `_execution_device`) is TE's only job for this request, and it is
-            # already done by this point -- so TE can be freed here, before `vae` goes
-            # to GPU, same as generate()'s own decode-window fix. Safe ordering for
-            # `_execution_device` (resolved by `reference_encoder_step`/`layout_step`
-            # below, per `MiniMaxH3Ref2VABlocks`' component order `text_encoder, ...,
-            # vae, ..., transformer_ref`): free TE FIRST, then bring `vae` onto GPU --
-            # by the time `reference_encoder_step` runs, `text_encoder` is gone from
-            # the scan and `vae` is already GPU-resident, so `_execution_device`
-            # resolves to `vae`'s correct (GPU) location. The reverse order (`vae` to
-            # GPU while TE is still resident, then free TE) would also resolve
-            # correctly per the scan order, but freeing first avoids ever holding
-            # TE(21)+vae(11)=32GB at the same time even transiently.
+            # encoding (`_encode_ref2va_prompt`, this file's own no_grad-wrapped
+            # replacement for the retired `encode_prompt` staticmethod -- see its own
+            # docstring -- already ran above and does not need `_execution_device`) is
+            # TE's only job for this request, and it is already done by this point --
+            # so TE can be freed here, before `vae` goes to GPU, same as generate()'s
+            # own decode-window fix. Safe ordering for `_execution_device` (resolved by
+            # `reference_encoder_step`/`layout_step` below, per the pipe's own
+            # `_component_specs` order `text_encoder, ..., vae, ..., transformer_ref`):
+            # free TE FIRST, then bring `vae` onto GPU -- by the time
+            # `reference_encoder_step` runs, `text_encoder` is gone from the scan and
+            # `vae` is already GPU-resident, so `_execution_device` resolves to `vae`'s
+            # correct (GPU) location. The reverse order (`vae` to GPU while TE is still
+            # resident, then free TE) would also resolve correctly per the scan order,
+            # but freeing first avoids ever holding TE(21)+vae(11)=32GB at the same
+            # time even transiently.
             with self._load_lock:
                 self._free_text_encoder(force=True)
             self._vae_to_gpu()
@@ -5097,15 +5184,19 @@ class MiniMaxH3Runner:
 
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
             _, state = layout_step(pipe, state)
+            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+            _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+            _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
         elif H3_LOWVRAM:
             self._vae_to_gpu()
             # Same `_execution_device` resolution trap as generate()'s own H3_LOWVRAM
             # branch (see its long comment): `vae` sits between `text_encoder` and
-            # `transformer_ref` in `MiniMaxH3Ref2VABlocks`' component order, and stays a
+            # `transformer_ref` in the pipe's own component order, and stays a
             # resident (if CPU-placed) `nn.Module` even outside its active phase -- so
             # freeing TE before transformer_ref is loaded is only safe once every step
             # that resolves its device via `_execution_device` has already run and
@@ -5123,8 +5214,12 @@ class MiniMaxH3Runner:
 
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
             _, state = layout_step(pipe, state)
+            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+            _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+            _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
 
@@ -5151,11 +5246,19 @@ class MiniMaxH3Runner:
                 # next request needs it, not a moment sooner than necessary" shape
                 # `generate()`'s own force_free_te reload already uses.
 
-            # --- layout / latents / timesteps ---
+            # --- layout / condition latents / latents / ref2va latents / timesteps ---
+            # Order matches `MiniMaxH3Ref2VACoreDenoiseStep`'s own block_classes list
+            # (modular_blocks_minimax_h3.py) exactly: the conditioning noise (image/video
+            # references) has to be drawn from the request's generator BEFORE the
+            # generated rows' own noise, and packed into `latents`/`audio_latents` AFTER.
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
             _, state = layout_step(pipe, state)
+            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+            _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+            _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
         else:
@@ -5172,11 +5275,15 @@ class MiniMaxH3Runner:
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
 
-            # --- layout / latents / timesteps ---
+            # --- layout / condition latents / latents / ref2va latents / timesteps ---
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
             _, state = layout_step(pipe, state)
+            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+            _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+            _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
 
@@ -5206,10 +5313,10 @@ class MiniMaxH3Runner:
         # IMPORTANT (same reasoning as generate()'s force_free_te comment): this free is
         # deliberately deferred until after layout_step/latents_step/timesteps_step above,
         # not fused into the reference-encoder section further up. `_execution_device`
-        # resolves to the device of the *first* `nn.Module` still set on `self._pipe_ref`,
-        # in `MiniMaxH3Ref2VABlocks`' component order -- `text_encoder` first, then `vae`.
-        # Freeing text_encoder before those three steps run would make `vae` (parked on
-        # CPU in bnb-4bit mode outside its active phase, which ended when
+        # resolves to the device of the *first* `nn.Module` still set on `self._pipe_ref`
+        # (== `self._pipe`), in the pipe's own `_component_specs` order -- `text_encoder`
+        # first, then `vae`. Freeing text_encoder before those three steps run would make
+        # `vae` (parked on CPU in bnb-4bit mode outside its active phase, which ended when
         # `_vae_to_cpu()` ran above) the new first hit, silently resolving
         # `_execution_device` to `cpu` -- the identical device-mismatch trap generate()'s
         # own comment documents finding for its layout_step. Freeing TE only once those
@@ -5270,11 +5377,22 @@ class MiniMaxH3Runner:
             _, state = denoise_step(pipe, state)
         denoise_time = time.time() - t_denoise
 
+        # PR #14355 note: unpatchify is a separate step now (`MiniMaxH3AfterDenoiseStep`,
+        # decoders.py) -- see `generate()`'s matching comment for the full contract. Has to
+        # run once, right after the denoise loop and before either decode step below;
+        # matches where `after_denoise` sits in `MiniMaxH3Ref2VACoreDenoiseStep`'s own
+        # block list (modular_blocks_minimax_h3.py). Unlike t2va/fl2va,
+        # `num_condition_video_rows`/`num_condition_audio_rows` on `state` (set by the
+        # layout step above) are NOT zero here -- a reference always adds condition rows,
+        # which is exactly what this step drops before reshaping the generated rows back
+        # into a 5D video tensor / channel-major audio tensor.
+        after_denoise_step = MiniMaxH3AfterDenoiseStep()
+        _, state = after_denoise_step(pipe, state)
+
         # --- decode (shared MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep -- no
-        # ref2va-specific decode step exists; num_condition_video_rows/
-        # num_condition_audio_rows on `state`, set by the layout step above from
-        # build_ref2va_packed_sequence's reference row counts, is what makes these drop
-        # the reference rows and decode only the generated ones) ---
+        # ref2va-specific decode step exists; `MiniMaxH3AfterDenoiseStep` just above
+        # already dropped the reference condition rows, so these two only ever see the
+        # generated rows) ---
         if progress:
             progress.update(phase="decoding", message="動画/音声をデコード中...")
         # bf16 mode: transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) would exceed
@@ -5508,10 +5626,14 @@ class MiniMaxH3Runner:
         途中失敗でも完了分は残る。`H3_LOWVRAM=1` 以外では呼ばない (app.py 側で逐次
         generate_ref2va() にフォールバック)。
 
-        NOT MIGRATED to PR #14355 (f37ab93) as of 2026-08-09 -- raises immediately, same
-        reasons as `generate_ref2va` (see `_ref2va_not_migrated_guard`'s docstring).
+        PR #14355 (f37ab93) migration note: same single-shell/`self._pipe_ref is
+        self._pipe` shape as `generate_ref2va()` (see its own migration-note docstring
+        paragraph) -- `MiniMaxH3PrepareConditionLatentsStep`/`MiniMaxH3Ref2VAPrepareLatentsStep`
+        are inserted into the per-scene layout/latents/timesteps phase below in the same
+        order `MiniMaxH3Ref2VACoreDenoiseStep`'s block list uses, and
+        `MiniMaxH3AfterDenoiseStep` runs right after each scene's own denoise loop, before
+        that scene's decode.
         """
-        _ref2va_not_migrated_guard("generate_ref_batch")
         import core.settings as settings
 
         if not H3_LOWVRAM:
@@ -5546,24 +5668,25 @@ class MiniMaxH3Runner:
             batch_num_frames = seconds_to_num_frames(seconds)
 
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+            MiniMaxH3PrepareConditionLatentsStep,
             MiniMaxH3PrepareLatentsStep,
+            MiniMaxH3Ref2VAPrepareLatentsStep,
             MiniMaxH3Ref2VAPrepareLayoutStep,
             MiniMaxH3SetTimestepsStep,
         )
         from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
         from diffusers.modular_pipelines.minimax_h3.decoders import (
+            MiniMaxH3AfterDenoiseStep,
             MiniMaxH3AudioDecodeStep,
             MiniMaxH3VideoDecodeStep,
         )
         from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3Ref2VADenoiseStep
-        from diffusers.modular_pipelines.minimax_h3.encoders import (
-            MiniMaxH3Ref2VAReferenceEncoderStep,
-            MiniMaxH3Ref2VATextEncoderStep,
-        )
-        from diffusers.modular_pipelines.minimax_h3.packing_ref2va import reference_kind
+        from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VAReferenceEncoderStep
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
-        kinds = [reference_kind(index, entry) for index, entry in enumerate(references)]
+        # PR #14355 後: `packing_ref2va.reference_kind` は削除 -- `entry.kind` を直接読む
+        # (`generate_ref2va()` と同じ、references.py 参照)。
+        kinds = [entry.kind for entry in references]
         if set(kinds) == {"audio"}:
             raise ValueError("An audio reference has to be paired with at least one image or video reference.")
 
@@ -5615,13 +5738,13 @@ class MiniMaxH3Runner:
         # ~65s/場面) の Qwen3-VL 前方計算を1回にまとめ、場面ごとにはプロンプト末尾
         # (14-33トークン、~0.2s) だけを KV キャッシュ継続する -- 実測精度と検証手順は
         # H3_REF_PREFIX_CACHE のモジュールコメントと scripts/probe_ref_prefix_cache.py。
-        # setup は場面ごとに再実行済みだが prepared_references はプロンプト非依存
+        # setup は場面ごとに再実行済みだが normalized_references はプロンプト非依存
         # (デコード/リサイズのみ) なので、先頭場面のものを代表としてプレフィックスに使う。
         if H3_REF_PREFIX_CACHE:
             if progress:
                 progress.update(phase="encoding", message="参照プレフィックスをエンコード中 (全場面で共有)...")
             encoded = _encode_ref_prompts_shared_prefix(
-                pipe, prompts, scenes[0]["state"].get("prepared_references"),
+                pipe, prompts, scenes[0]["state"].get("normalized_references"),
                 device=DEVICE, dtype=torch.bfloat16,
             )
             for scene, (prompt_embeds, text_token_tags) in zip(scenes, encoded):
@@ -5632,8 +5755,8 @@ class MiniMaxH3Runner:
                 if progress:
                     progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
                 with torch.no_grad():
-                    prompt_embeds, text_token_tags = MiniMaxH3Ref2VATextEncoderStep.encode_prompt(
-                        pipe, scene["prompt"], scene["state"].get("prepared_references"),
+                    prompt_embeds, text_token_tags = _encode_ref2va_prompt(
+                        pipe, scene["prompt"], scene["state"].get("normalized_references"),
                         device=DEVICE, dtype=torch.bfloat16,
                     )
                 scene["state"].set("prompt_embeds", prompt_embeds)
@@ -5650,13 +5773,20 @@ class MiniMaxH3Runner:
             _, scene["state"] = reference_encoder_step(pipe, scene["state"])
         self._vae_to_cpu()
 
-        # --- layout/latents/timesteps 位相 (TE まだ常駐 = `_execution_device` が正しく解決) ---
+        # --- layout/condition latents/latents/ref2va latents/timesteps 位相 (TE まだ
+        # 常駐 = `_execution_device` が正しく解決)。ブロック順は
+        # `MiniMaxH3Ref2VACoreDenoiseStep`'s own block_classes (generate_ref2va() の
+        # 同名コメント参照) と一致させる。---
         for scene in scenes:
             state = scene["state"]
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
             _, state = layout_step(pipe, state)
+            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+            _, state = condition_latents_step(pipe, state)
             latents_step = MiniMaxH3PrepareLatentsStep()
             _, state = latents_step(pipe, state)
+            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+            _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
             _, state = timesteps_step(pipe, state)
             scene["state"] = state
@@ -5673,6 +5803,12 @@ class MiniMaxH3Runner:
         total_steps_all = num_inference_steps * n_scenes
         for idx, scene in enumerate(scenes):
             state = scene["state"]
+            # PR #14355 対応: レイアウト段が (TE 常駐時の `_execution_device` 解決の下で)
+            # CPU に作った state テンソルを計算用GPUへ (`_scene_state_to_compute` の
+            # docstring 参照。generate_still_batch の t2va 版と同じ罠 -- transformer_ref
+            # がまだロードされていない encode 位相で layout/latents/timesteps を回すため。
+            # 既に GPU なら no-op)。
+            self._scene_state_to_compute(state)
             # 場面間のスケジューラリセット (generate_still_batch の docstring 参照)。
             # scheduler/audio_scheduler は _sync_shared_components_to_ref で _pipe と
             # 同一オブジェクトを共有しているため、pipe(_ref) 側から触れば足りる。
@@ -5706,6 +5842,12 @@ class MiniMaxH3Runner:
                     _, state = denoise_step(pipe, state)
             else:
                 _, state = denoise_step(pipe, state)
+            # PR #14355 note: unpatchify separated into its own step now
+            # (`MiniMaxH3AfterDenoiseStep`) -- see generate_ref2va()'s matching comment.
+            # Has to run once per scene, right after that scene's own denoise loop and
+            # before its decode below.
+            after_denoise_step = MiniMaxH3AfterDenoiseStep()
+            _, state = after_denoise_step(pipe, state)
             scene["state"] = state
             scene["denoise_time_s"] = round(sum(step_times), 2)
             scene["avg_step_time_s"] = round(sum(step_times) / len(step_times), 3) if step_times else None
