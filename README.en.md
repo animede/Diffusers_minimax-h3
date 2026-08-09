@@ -9,6 +9,21 @@ verification workspace for eventual integration into
 [diffusers-server](https://github.com/animede/diffusers-server) (the diffusers-server
 codebase itself has not been touched at all).
 
+**Measured on one RTX PRO 5000 48GB + one RTX 4000 SFF Ada 20GB:**
+
+| | Baseline | Now | |
+|---|---|---|---|
+| One still image (768²) | 157s | **9.7s** | 16x |
+| 5s video + audio (768²) | 351.4s | **44.2s** | 8.0x |
+
+The central finding of this repository is that the bottleneck was not denoising but the
+**fixed cost of loading and freeing models**. That overhead is removed in three stages (a
+disk cache for the quantized text encoder, keeping the text encoder resident on a second
+GPU, then keeping the transformer resident), and **every one of those speedups is verified
+to produce a byte-identical output (same MD5) at a fixed seed** — so they are demonstrably
+inert, not quality trades. See [docs/TECHNICAL_OVERVIEW.en.md](docs/TECHNICAL_OVERVIEW.en.md)
+for the derivation and the measurements.
+
 **All figures in this README are measured on real hardware**, on an environment of RTX PRO
 6000 Blackwell 96GB / RAM 94GB / Ubuntu 24.04. Low-VRAM configurations have been verified
 down to the 18GB tier using a VRAM ballast (see the VRAM support table below).
