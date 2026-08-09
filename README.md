@@ -7,6 +7,26 @@ MiniMax H3 (Hailuo 3.0) の機能確認用スタンドアロンアプリ。動�
 動かす。将来 [diffusers-server](https://github.com/animede/diffusers-server) へ統合するための
 先行検証ワークスペース(diffusers-server 本体には一切手を入れていない)。
 
+> ## 現在地と再開の入口(2026-08-09 時点)
+>
+> 作業を再開するとき、まずここを読む。
+>
+> | 知りたいこと | 見る場所 |
+> |---|---|
+> | **仕様・性能・設計**(何をどう実現しているか) | [docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md) |
+> | **踏んだ罠・失敗・運用の教訓**(同じ穴を避けたい) | [docs/internal/TECHNICAL_REPORT.md](docs/internal/TECHNICAL_REPORT.md)(末尾の「追補: 2026-08-09」が最新) |
+> | **次に何をやるか**(未着手・未検証) | 本 README の「[今後の外部イベント待ち](#今後の外部イベント待ち積み残し2026-08-06時点)」§3 |
+> | どのモードで何がいつロード/解放されるか | [docs/RESIDENCY.md](docs/RESIDENCY.md) |
+> | diffusers を上げるときの回帰基準値 | [docs/internal/regression_baselines.json](docs/internal/regression_baselines.json) |
+>
+> **現在の状態**: diffusers はマージ版 **f37ab93** にピン留め(PR #14355 の追従完了、全経路が
+> 同一seed MD5 で等価)。推奨起動は
+> `H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`
+> (t2i 定常 9.7s/枚、t2va 5秒 44.2s)。**ref2va を使うときは `H3_TE_DEVICE` を外す**
+> (TE用GPUが 20GB では容量不足で自動 400 拒否)。
+>
+> 時系列の作業記録は本 README の日付付きセクション群(下へ読み進む)。
+
 このREADMEの数値は**すべて実機の実測値**で、環境は RTX PRO 6000 Blackwell 96GB / RAM 94GB /
 Ubuntu 24.04。低VRAM構成については 18GB 相当までVRAMバラストで検証している(下記の
 VRAM対応表を参照)。
@@ -1765,6 +1785,10 @@ token_refiner は bf16 ベース + bf16 デルタ**という混在状態にな�
   (TE は起動時に一度載せるだけ、毎リクエストの転送は prompt_embeds の 42MB のみ)。
   実装には `_execution_device` 周り(本プロジェクト最大の罠所)の慎重な改修が必要
   (`scripts/probe_te_on_second_gpu.py`)
+- **`ref2va` × turbo は未検証**: turbo LoRA は `transformer`(t2va系)にのみ適用を実測して
+  あり、`transformer_ref` への適用は**一度も試していない**。配線上は同じ経路を通るはずだが、
+  蒸留LoRAが参照条件付きの軌道でも成立するかは別問題(strength 0.094 の妥当性も t2va での
+  実測値)。参照付き生成を高速化したくなったら、まずここをスパイクすること
 - **16GB級対応**: TEのストリーミング実行(ブロック単位でGPUへ流す)が必要。現状の床は
   TE-nf4削除版の常駐17.45GB(上記セクション参照)
 - **torch.compile**: 未検証。FBC/group offload の hook との相性(graph break)確認が要る

@@ -13,6 +13,26 @@ codebase itself has not been touched at all).
 6000 Blackwell 96GB / RAM 94GB / Ubuntu 24.04. Low-VRAM configurations have been verified
 down to the 18GB tier using a VRAM ballast (see the VRAM support table below).
 
+> ## Where things stand and where to resume (as of 2026-08-09)
+>
+> Read this first when resuming work.
+>
+> | What you want to know | Where to look |
+> |---|---|
+> | **Spec, performance, design** (what is achieved and how) | [docs/TECHNICAL_OVERVIEW.en.md](docs/TECHNICAL_OVERVIEW.en.md) |
+> | **Pitfalls, failures, operational lessons hit** (to avoid the same holes) | [docs/internal/TECHNICAL_REPORT.en.md](docs/internal/TECHNICAL_REPORT.en.md) (the "Addendum: 2026-08-09" at the end is the latest) |
+> | **What to do next** (not yet started / unverified) | This README's "[Waiting on external events going forward](#waiting-on-external-events-going-forward-backlog-as-of-2026-08-06)" §3 |
+> | Which mode loads/releases what, and when | [docs/RESIDENCY.en.md](docs/RESIDENCY.en.md) |
+> | Regression baselines for when diffusers gets bumped | [docs/internal/regression_baselines.json](docs/internal/regression_baselines.json) |
+>
+> **Current state**: diffusers is pinned to the merged version **f37ab93** (PR #14355
+> tracking complete, all paths equivalent by identical-seed MD5). Recommended launch is
+> `H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`
+> (t2i steady state 9.7s/image, t2va 5s = 44.2s). **When using ref2va, drop `H3_TE_DEVICE`**
+> (with only 20GB on the TE GPU, capacity is insufficient and it auto-rejects with 400).
+>
+> The chronological work log is in this README's dated sections (read on below).
+
 > **Environment change (night of 2026-08-07)**: The GPU in this box was swapped from an
 > RTX PRO 6000 Blackwell 96GB to a two-card setup of **RTX PRO 5000 Blackwell 48GB +
 > RTX 4000 SFF Ada 20GB**. Existing measurements are from the 96GB era (still valid as a
@@ -2007,6 +2027,12 @@ ref2va remains unverified.
   only per-request transfer is prompt_embeds at 42MB). Implementation requires careful
   changes around `_execution_device` (this project's single biggest source of pitfalls)
   (`scripts/probe_te_on_second_gpu.py`)
+- **`ref2va` × turbo is unverified**: turbo LoRA has only been measured applied to
+  `transformer` (the t2va family); applying it to `transformer_ref` has **never been
+  tried**. Wiring-wise it should go through the same path, but whether a distilled LoRA
+  holds up on a reference-conditioned trajectory is a separate question (the strength
+  0.094 validity is also a t2va-only measurement). If speeding up reference-conditioned
+  generation becomes desirable, spike this first
 - **16GB-tier support**: would need streaming execution of TE (flowing it to the GPU block
   by block). The current floor is the pruned TE-nf4's resident 17.45GB (see the section
   above)

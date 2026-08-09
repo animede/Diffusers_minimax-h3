@@ -1,0 +1,127 @@
+{
+ "_readme": "同一seed MD5 回帰の基準値。diffusers を上げたときは同じ条件で再生成し、md5 の一致を確認する。abc5e9b で採取し、f37ab93 追従後も全件一致することを実測済み(= 現行 f37ab93 の期待値でもある)。",
+ "measured_on": "2026-08-09",
+ "pinned_diffusers": [
+  "abc5e9b (採取時)",
+  "f37ab93 (追従後も同一と実測)"
+ ],
+ "gpu": "RTX PRO 5000 48GB (GPU0) + RTX 4000 SFF Ada 20GB (GPU1)",
+ "cases": {
+  "t2i_seed11_4steps": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1",
+   "params": {
+    "seed": 11,
+    "steps": 4,
+    "turbo": true,
+    "resolution": "768x768"
+   },
+   "md5": {
+    "png_path": "665eadddea8f34298a1b5b89e69d4bd0",
+    "mp4_path": "bbbe724047aa3233a07b9efe8767585e"
+   }
+  },
+  "t2i_seed12_4steps": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1",
+   "params": {
+    "seed": 12,
+    "steps": 4,
+    "turbo": true,
+    "resolution": "768x768"
+   },
+   "md5": {
+    "png_path": "8558fdfef6080981f641f2373a190835",
+    "mp4_path": "872bab66b373ff1e374cbb3a5801608f"
+   }
+  },
+  "t2va5s_seed21_4steps": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1",
+   "params": {
+    "seed": 21,
+    "steps": 4,
+    "turbo": true,
+    "resolution": "768x768"
+   },
+   "md5": {
+    "mp4_path": "3125254b093311622652ec4f81172377"
+   }
+  },
+  "t2i_seed1_30steps": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1",
+   "params": {
+    "seed": 1,
+    "steps": 30,
+    "turbo": true,
+    "resolution": "768x768"
+   },
+   "md5": {
+    "png_path": "240c0f56005420a79fcce30f6de3aaa6"
+   }
+  },
+  "t2i_seed2_30steps": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1",
+   "params": {
+    "seed": 2,
+    "steps": 30,
+    "turbo": true,
+    "resolution": "768x768"
+   },
+   "md5": {
+    "png_path": "7d177743c831a1e5f0567432eeaf0964"
+   }
+  },
+  "t2i_seed3_30steps": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1",
+   "params": {
+    "seed": 3,
+    "steps": 30,
+    "turbo": true,
+    "resolution": "768x768"
+   },
+   "md5": {
+    "png_path": "f4ac24dec0498551a017aaad23e31666"
+   }
+  },
+  "ref2i_seed101": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 (TE_DEVICE なし。ref2va は 20GB GPU では 400 拒否のため)",
+   "params": {
+    "seed": 101,
+    "steps": 8,
+    "turbo": false,
+    "reference": "outputs/probe_first_frame.png 1枚"
+   },
+   "md5": {
+    "png_md5": "25535153f4796feea88d2dd95a2cc720"
+   },
+   "total_s": 206.06
+  },
+  "ref2va_seed102": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 (TE_DEVICE なし。ref2va は 20GB GPU では 400 拒否のため)",
+   "params": {
+    "seed": 102,
+    "steps": 8,
+    "turbo": false,
+    "reference": "outputs/probe_first_frame.png 1枚"
+   },
+   "md5": {
+    "mp4_md5": "111ba1f9865a12938138beff0810d220"
+   },
+   "total_s": 332.53
+  },
+  "refbatch_seed101": {
+   "server": "H3_LOWVRAM=1 H3_TE_PRUNE=1 (TE_DEVICE なし。ref2va は 20GB GPU では 400 拒否のため)",
+   "params": {
+    "seed": 101,
+    "steps": 8,
+    "turbo": false,
+    "reference": "outputs/probe_first_frame.png 1枚"
+   },
+   "md5": {
+    "scene_png_md5": [
+     "ea85d5a13c13c6779eeb0721b433056f",
+     "e5a1a40154bb99a57fedaf3553f1de9c"
+    ]
+   },
+   "total_s": 257.86
+  }
+ }
+}

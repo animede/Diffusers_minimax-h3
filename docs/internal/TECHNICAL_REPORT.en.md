@@ -545,3 +545,113 @@ Lessons from this project worth carrying forward into the next one:
 6. **The order spike → measure → implement.** Rather than entering full implementation on "this should work," each question was resolved with a probe that doesn't touch the main codebase before proceeding. Turbo LoRA's int8 support (§9.2) is a case where following this order made it possible to discover the decisive difference — key format — early.
 
 7. **Read the upstream code.** Most of the pitfalls in this report were only understood by actually reading the implementation of diffusers / transformers / torchao. §4.9 (`tie_last_hidden_states`) and §4.3 (`pin_memory`) in particular could never have been figured out from documentation alone.
+
+---
+
+# Addendum: work on 2026-08-09 (12 commits)
+
+The main body covers 2026-08-04 to 08-08. The pitfalls and lessons that arose after that
+are added here. The content covers "tracking the diffusers merged version", "keeping the
+transformer resident", and "UI reorganization and internationalization".
+**The settled specification lives in [docs/TECHNICAL_OVERVIEW.en.md](../TECHNICAL_OVERVIEW.en.md)**,
+so only pitfalls and lessons are written here.
+
+## A1. `H3_KEEP_TRANSFORMER` -- the estimate was 1.55GB more conservative than the measurement
+
+A configuration that does not release the transformer even during the decode phase. The
+estimate was `transformer 34.3 + fp16 decode peak 11.4 = 45.7GB` against an effective
+budget of 49.8GB, judged to have about 4GB of headroom, and work proceeded on that basis.
+**The measured peak was 44.15GB** (t2va, 5 seconds), 1.55GB smaller than the estimate.
+An estimate skewing conservative is safe, but since "4GB of headroom" was the basis for
+the go/no-go decision, it was still the right call not to declare it viable until measured.
+
+t2i steady state 9.7s/image, t2va 5 seconds = 44.2s. PNG/MP4 MD5 exact match for the same seed.
+
+## A2. Two `_execution_device` pitfalls hit while tracking the merged version (both a recurrence of §4 in the main body)
+
+`_execution_device`, which the main body called "the single biggest source of pitfalls" in
+§4, produced two more incidents on the merged version. A real example that **even when the
+same function is the cause, the shape of the cause is different every time**.
+
+1. **The order of components changed.** Old: `text_encoder, tokenizer, processor, vae,
+   scheduler, audio_scheduler, transformer, video_processor, audio_vae` ->
+   New: `image_processor, text_encoder, tokenizer, processor, vae, **audio_vae**,
+   scheduler, audio_scheduler, transformer_ref, transformer, video_processor`.
+   Because `audio_vae` now comes before transformer, if `_pin_execution_device_to_compute()`
+   only excludes text_encoder and vae, **the CPU-resident audio_vae gets picked up as the
+   first nn.Module** and `_execution_device` returns `cpu`. The new layout step's contract
+   is to place its output on `_execution_device`, so position_ids end up created on CPU,
+   causing a device mismatch inside rope(). -> Fixed by also excluding audio_vae in the window.
+   **Lesson**: this kind of pinning should have been written with the intent of excluding
+   "every nn.Module that comes before transformer", not "modules named so-and-so". Ordering
+   changes at the library's discretion.
+
+2. **On the batch path, `_execution_device` cannot be resolved to begin with.** Batch
+   reorders the phases so that "layout/latents/timesteps are finished during the encode
+   phase, and loading the transformer is deferred until the denoise phase". At that point
+   the transformer is not yet loaded and TE has already been detached, so the scan falls
+   back to whatever CPU-resident module is found, or to a fallback `cpu`. The value itself
+   is built correctly, so it is enough to explicitly carry it via `_scene_state_to_compute()`
+   right before denoise.
+   **Lesson**: a design that reorders phases also shifts the implicit assumptions tied to
+   phase order (here, "the compute GPU can be resolved at this point").
+
+## A3. A constraint of the verification environment -- the preview page does not render while `hidden`
+
+Recorded because UI verification burned 15 minutes on this. The preview browser sits in a
+state where `document.visibilityState === 'hidden'`, and **rendering (compositing) does not
+run**. Consequences:
+
+| Symptom | Cause | Workaround |
+|---|---|---|
+| `preview_screenshot` times out at 30 seconds | Nothing renders, so compositing can't happen. Guaranteed to stall when the gallery has 165 `<video>` elements | Measure the DOM directly via `preview_eval` (text, position, height, visibility) |
+| `IntersectionObserver` never fires | Intersection calculation doesn't run on a hidden page | Verify lazy loading via **network logs** instead (mp4 request count 165->0) |
+| `preview_click` (coordinate click) doesn't land | Hit testing requires layout/compositing | Call `element.click()` from `preview_eval` instead |
+
+**Lesson**: UI verification in this environment must be done via **DOM measurement and
+network logs**, not "appearance". Don't mistake an inability to take a screenshot for a
+code defect (in fact, lazy loading was briefly misjudged as "not working" once because of this).
+
+## A4. An agent-operation incident -- a chain of re-delegation (**recurrence**)
+
+The "grandchild agent incident" already recorded in [[stdgen-spike-verdict]] recurred. An
+agent delegated to investigate did not do the work itself and instead **spawned yet another
+agent**, which then reported completion as nothing more than "spawned an agent" -- this
+chain happened three times. A stop instruction was issued, but one instance survived and
+ran to completion, burning roughly 230,000 tokens redundantly.
+
+**Countermeasure (which actually worked for the later delegations)**: state at the very top
+of the delegation prompt that **"you must complete the work yourself via Read/Edit/Bash.
+Spawning sub-agents (the Agent tool) is forbidden."** Across the six delegations that
+followed, this never recurred once.
+
+**A secondary lesson**: the output of the incident-prone investigation was itself useful (a
+diff-level audit deeper than my own direct investigation, which corrected two points in my
+own report). Still, the token cost was duplicated, so **writing the prohibition before
+delegating is far cheaper**.
+
+## A5. For a migration, take the regression baseline first
+
+Before bumping diffusers, **the old pin was restored and baseline MD5s were captured first**
+(t2i/t2va/batch reused the same-day measurements already on hand; the ref family was
+restored to main + abc5e9b and captured over 15 minutes). Without this ordering, there is no
+way to judge "is the post-migration output correct".
+
+The captured baselines were saved to
+**[docs/internal/regression_baselines.json](regression_baselines.json)** (since scratchpad
+gets wiped). Next time diffusers is bumped, it is enough to regenerate this file's `cases`
+under the same conditions and diff the md5s. Captured at abc5e9b, and after tracking f37ab93
+all cases still matched, so **it also serves as the expected values for the current f37ab93**.
+
+## A6. Layering the documentation
+
+This report has been demoted to a "work log (internal document)", and the outward-facing
+technical description has been split out into
+[docs/TECHNICAL_OVERVIEW.en.md](../TECHNICAL_OVERVIEW.en.md). The two have different
+readers: someone who wants to know the spec and performance shouldn't have to read a
+narrative mixed with failures, while conversely **for a developer who wants to avoid the
+same pitfalls, the narrative itself is the value** -- that's the split.
+
+Japanese/English parity was also done at the same time (separate files with cross-links;
+keeping both languages in a single file was rejected, since in a repository where measured
+values keep getting appended, one language would inevitably go stale).
