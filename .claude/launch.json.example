@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Claude Code の preview ツールがサーバを起動するための設定の雛形。",
+    ".claude/launch.json へコピーして環境に合わせて書き換える (launch.json は .gitignore 済み)。",
+    "H3_LLM_URL のように環境固有のアドレスを書く場所なので、実ファイルは追跡しない。",
+    "起動オプションの意味は README の「現在地と再開の入口」および docs/TECHNICAL_OVERVIEW.md §8 を参照。"
+  ],
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "h3-app",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "H3_LOWVRAM=1",
+        "H3_TE_PRUNE=1",
+        "H3_TE_DEVICE=cuda:1",
+        "H3_VIDEO_VAE_FP16=1",
+        "H3_KEEP_TRANSFORMER=1",
+        "H3_LLM_URL=http://127.0.0.1:64650",
+        "venv/bin/python",
+        "-m",
+        "uvicorn",
+        "app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8611"
+      ],
+      "port": 8611
+    }
+  ]
+}

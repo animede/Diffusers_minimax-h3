@@ -7,3 +7,7 @@ __pycache__/
 .DS_Store
 third_party/
 skills_cache/
+
+# 実行環境ごとの起動設定。LLM サーバのアドレスなど環境固有の値を書くため追跡しない
+# (雛形は .claude/launch.json.example をコピーして使う)
+.claude/launch.json
