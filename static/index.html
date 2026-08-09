@@ -1692,12 +1692,33 @@ async function refreshGallery() {
   }
 }
 
+// サムネイルの遅延読み込み。`<img>` は `loading="lazy"` が効くが **`<video>` には効かない**
+// ため、src を `data-src` に退避しておき、ビューポートに近づいたときだけ実際に設定する。
+// これが無いと、タイル数ぶんの `<video preload="metadata">` がページ表示と同時に全数
+// メタデータを取りに行く(実測: outputs が 165本たまった状態でブラウザの描画が詰まり、
+// スクリーンショットが 30秒でタイムアウトするまで重くなった)。
+// rootMargin で1画面ぶん先読みしておくと、スクロールしても空タイルが見えない。
+const galleryLazyObserver = new IntersectionObserver((entries, obs) => {
+  entries.forEach(entry => {
+    if (!entry.isIntersecting) return;
+    const el = entry.target;
+    if (el.dataset.src) {
+      el.src = el.dataset.src;
+      delete el.dataset.src;
+    }
+    obs.unobserve(el);   // 一度読んだら監視を外す (observer が要素を掴み続けないように)
+  });
+}, { rootMargin: '300px' });
+
 function renderGallery() {
   if (!galleryItems.length) {
     galleryGrid.innerHTML = '<div class="gallery-empty">生成済み動画はまだありません</div>';
     updateGalleryToolbar();
     return;
   }
+  // 作り直す前に監視を解除する。IntersectionObserver は監視中の要素への参照を保持する
+  // ので、これが無いと再描画のたびに古いタイルが解放されずに溜まる。
+  galleryLazyObserver.disconnect();
   galleryGrid.innerHTML = '';
   galleryItems.forEach(item => {
     const selectedIdx = gallerySelectedOrder.indexOf(item.name);
@@ -1717,19 +1738,25 @@ function renderGallery() {
     cb.addEventListener('click', (e) => e.stopPropagation());
     cb.addEventListener('change', () => toggleGallerySelection(item.name));
 
-    // 静止画 (type=image、t2i の PNG) は <img>、動画は <video> でサムネイル表示
+    // 静止画 (type=image、t2i の PNG) は <img>、動画は <video> でサムネイル表示。
+    // どちらも遅延読み込みだが手段が違う: <img> はブラウザ標準の loading="lazy"、
+    // <video> は上の galleryLazyObserver (video は loading 属性を解釈しないため)。
     let thumb;
     if (item.type === 'image') {
       thumb = document.createElement('img');
       thumb.src = item.url;
       thumb.alt = item.name;
       thumb.loading = 'lazy';
+      thumb.decoding = 'async';
     } else {
       thumb = document.createElement('video');
-      thumb.src = item.url + '#t=0.1';
+      // src はまだ設定しない (data-src に退避)。`#t=0.1` は先頭フレームをポスター
+      // 代わりに表示させるためのフラグメント。
+      thumb.dataset.src = item.url + '#t=0.1';
       thumb.muted = true;
       thumb.preload = 'metadata';
       thumb.playsInline = true;
+      galleryLazyObserver.observe(thumb);
     }
 
     thumbWrap.appendChild(thumb);
