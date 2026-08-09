@@ -1,5 +1,7 @@
 # minimax-h3
 
+**日本語** | [English](README.en.md)
+
 MiniMax H3 (Hailuo 3.0) の機能確認用スタンドアロンアプリ。動画+ステレオ音声を1回のデノイズで
 同時生成するオムニモーダル33Bモデルを、diffusers の Modular Diffusers 経路 (PR #14355) で
 動かす。将来 [diffusers-server](https://github.com/animede/diffusers-server) へ統合するための

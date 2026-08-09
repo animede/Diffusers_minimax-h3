@@ -1,5 +1,7 @@
 # コミュニティ改良の取り込み作業一覧(MiniMax H3)
 
+**日本語** | [English](COMMUNITY_IMPROVEMENTS.en.md)
+
 オリジナル(MiniMaxAI/MiniMax-H3 + diffusers PR #14355)を起点に、ComfyUI コミュニティ
 などで出た改良を本アプリ(diffusers 経路)へ取り込んだ作業の記録。2026-08-04〜08-06。
 

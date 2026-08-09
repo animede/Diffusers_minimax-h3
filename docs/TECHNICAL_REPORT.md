@@ -1,5 +1,7 @@
 # MiniMax-H3 を diffusers で動かす — 技術レポート
 
+**日本語** | [English](TECHNICAL_REPORT.en.md)
+
 **対象期間**: 2026-08-04 〜 2026-08-08(44コミット)
 **対象**: 本リポジトリ `minimax-h3`(MiniMax H3 / Hailuo 3.0 の機能確認用スタンドアロンアプリ)
 **実装規模**: 約 10,700 行(`core/runner.py` 4,943 / `static/index.html` 1,839 / `README.md` 1,441 / `app.py` 1,003 / ほか)
