@@ -59,8 +59,10 @@ python3.12 -m venv venv
 # PyTorch (cu128)
 venv/bin/pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 
-# diffusers は PR #14355 の「検証済みコミットに固定」して入れる(下の注意を必ず読むこと)
-venv/bin/pip install "git+https://github.com/huggingface/diffusers.git@abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc"
+# diffusers は「検証済みコミットに固定」して入れる(下の注意を必ず読むこと)。
+# マージ版 f37ab93(PR #14355 の最終形)が前提。全経路(t2i/t2va/バッチ/ref2va/refバッチ)
+# を旧ピン abc5e9b と同一seed MD5 で回帰済み(末尾「追従 第1段/第2段」節)。
+venv/bin/pip install "git+https://github.com/huggingface/diffusers.git@f37ab93e621d5ce206c9662e8291ca8b67d9c555"
 
 # transformers は 5.14.1 以上が必須
 #   (5.1.0 には Qwen3VLProcessor.create_mm_token_type_ids が無く、PR #14355 のエンコーダが動かない)
@@ -78,12 +80,10 @@ venv/bin/pip install torchao==0.17.0
 ```
 
 > **重要: diffusers はコミット固定のまま使うこと。**
-> PR #14355 は **2026-08-05 にマージ済み**だが、本アプリは未追従。Modular のブロック
-> (`MiniMaxH3SetTimestepsStep` / `MiniMaxH3LoopDenoiser` 等)を自前で呼び、
-> `get_block_state()` / `state.get(...)` / `row_timestep_plan` といった state 契約に
-> 強く依存しており、マージ版では **packing.py/packing_ref2va.py の削除を含む大規模
-> リファクタ**が入っているため、上げると ImportError で起動すらしない(2026-08-09 に
-> 影響調査済み)。詳細は末尾「今後の外部イベント待ち」の §1 を参照。
+> PR #14355 は **2026-08-05 にマージ済み**で、本アプリは**マージ最終形 f37ab93 へ
+> 追従完了**(第1段: t2i/t2va/バッチ、第2段: ref2va 系)。全経路が旧ピン abc5e9b の
+> ベースラインと**同一seed MD5 完全一致**で回帰済み(末尾「追従 第1段/第2段」節)。
+> ここからさらに diffusers を上げる場合も、同じ手順(同一seed MD5 回帰)を踏むこと。
 
 ### SageAttention(任意、既定で有効)
 
@@ -1469,6 +1469,77 @@ turboなし 30steps は t2i で 51.1s(上記実測)— 素の 157s に対し、3
 固定費撤廃だけで3倍速い。
 
 詳細な VRAM 収支の導出・位相×常駐表は `docs/RESIDENCY.md` §5.5・§5.6 を参照。
+
+## 2026-08-09: PR #14355 マージ版 (f37ab93) への追従 第1段 — t2i/t2va/バッチ、同一seed MD5 完全一致
+
+ブランチ migrate-pr14355。runner.py の t2i/t2va/still_batch/hires/turbo/FBC 経路を
+マージ版の新契約(§1 の影響調査参照)へ移植し、venv を f37ab93 へ差し替え
+(`--no-deps --force-reinstall`、他の依存は不変)。**ref2va 系は第2段送り**
+(app.py/runner.py 両方にガード、503 + 明確なメッセージ)。
+
+**回帰結果(全て abc5e9b で記録したベースラインと同一 seed で比較)**:
+
+| 経路 | 結果 | MD5 |
+|---|---|---|
+| t2i turbo 4steps seed=11 | 定常 9.24s(移行前 9.7s) | **PNG 完全一致** |
+| t2i turbo 4steps seed=12 | 9.24s | **PNG 完全一致** |
+| t2i 30steps seed=1 | 49.65s | **PNG 完全一致** |
+| t2va 5秒 turbo seed=21 | 41.54s、peak 44.15GB(同値) | **MP4 完全一致** |
+| t2i_batch 2場面 seed=11 | 16.47s(8.2s/枚) | 場面1 = 単発 seed=11 **完全一致** |
+
+数値経路(スケジューラ/transformer/VAE)が無変更という影響調査の結論どおり、
+**移行はビット等価**。性能・VRAM ピークも移行前と同値。
+
+**移植で踏んだ新しい罠2つ(いずれも `_execution_device` の変種)**:
+
+1. **components 順で `audio_vae` が `transformer` より前に移動した**(旧:
+   `text_encoder, tokenizer, processor, vae, scheduler, audio_scheduler, transformer,
+   video_processor, audio_vae` → 新: `image_processor, text_encoder, tokenizer,
+   processor, vae, audio_vae, scheduler, audio_scheduler, transformer_ref, transformer,
+   video_processor`)。`_pin_execution_device_to_compute()` が text_encoder と vae しか
+   外していなかったため、CPU 常駐の audio_vae が最初の nn.Module として拾われ、
+   新レイアウトステップ(出力を `_execution_device` に置く契約)が position_ids を
+   CPU に作り、rope() 内で device mismatch(実測再現)。→ audio_vae も窓の間外す
+2. **バッチの位相並べ替えではレイアウト段の `_execution_device` が解決不能**
+   (TE 外部常駐だと transformer 未ロード+TE デタッチ済み)→ テンソルが CPU に
+   生まれる。値は正しいので、デノイズ直前に `_scene_state_to_compute()` で明示的に
+   計算GPUへ運ぶ(既に GPU なら no-op)
+
+## 2026-08-09: マージ版追従 第2段 — ref2va 系も同一seed MD5 完全一致で完了
+
+第1段(上節)の続き。ref2va / ref2i / refバッチを f37ab93 の新契約へ移植し、
+**旧ピン abc5e9b で採ったベースライン**(一時的に main + abc5e9b へ戻して記録)と
+同一 seed・同一参照画像・同一構成(`H3_LOWVRAM=1 H3_TE_PRUNE=1`、TE_DEVICE なし)で比較:
+
+| 経路 (steps=8) | ベースライン | 移行後 | MD5 |
+|---|---|---|---|
+| ref2i seed=101 | 206.1s | 201.4s | **PNG 完全一致** |
+| ref2va 5秒 seed=102 | 332.5s | 322.5s(定常。初回496.8sはディスクキャッシュ冷え) | **MP4 完全一致** |
+| ref2i_batch 2場面 seed=101(KVプレフィックスキャッシュ経路) | 257.9s | 246.7s | **両場面 PNG 完全一致** |
+
+**設計判断2つ**:
+
+1. **pipe シェルは1つに統合**。マージ版の `MiniMaxH3Blocks` は3ワークフロー
+   (t2va/fl2va/ref2va)のサブブロックを合併した component specs を持ち、
+   `transformer_ref` と `transformer` の両スロットが同一シェルに存在する
+   (`MiniMaxH3AutoDenoiseStep` が**呼び出しごとに** state から分岐)。旧2シェル設計の
+   `_ensure_pipe_ref_shell` / `_sync_shared_components_to_ref` は `self._pipe_ref = self._pipe`
+   のエイリアスだけ残して no-op 化 -- 既存の VRAM 振り付け(`_pipe_ref.transformer_ref` を
+   触る多数の箇所)は無改修で生きる
+2. **KVプレフィックスキャッシュの分割点は不変**。新 `MiniMaxH3Ref2VATextEncoderStep` も
+   プロンプトを presentation 末尾の `emit(text(prompt))` として組むため、
+   「参照プレフィックス共有+プロンプト末尾の継続エンコード」という旧設計がそのまま成立。
+   削除された packing_ref2va の関数群の代わりに、新ステップ自身のインスタンスメソッド
+   (`_gather_vision_features` / `_build_presentation`)の上に再構築した
+   (DynamicCache / rope_deltas / 継続呼び出しの引数規約は旧実装の罠メモをそのまま踏襲)
+
+他の移植内容は第1段と同型(AfterDenoiseStep 挿入、`MiniMaxH3PrepareConditionLatentsStep` /
+`MiniMaxH3Ref2VAPrepareLatentsStep` の新ステップ挿入、`reference_kind()` → `entry.kind` /
+`entry.has_audio`、app.py の参照構築を `MiniMaxH3ImageReference.from_file()` 系へ)。
+`seconds=None` の「音声参照から尺を導出」は新 SetupStep が内部でやらなくなったため
+`_num_frames_from_audio_reference` として runner 側に実装。
+
+これで **全経路がマージ版 f37ab93 上でビット等価**。旧ピン abc5e9b へ戻す理由は無くなった。
 
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
