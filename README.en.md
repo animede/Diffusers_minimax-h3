@@ -1017,13 +1017,18 @@ glance has been placed in **[docs/RESIDENCY.en.md](docs/RESIDENCY.en.md)**. It a
 records an actual case of misreported peak-VRAM breakdown (mistaking the denoise-time peak
 for the decode-time peak) as a "common misunderstanding."
 
-## Technical report
+## Technical documentation
 
-This README is an operational document on "how to use it." If you want to read through
-**"why it was built this way, what pitfalls were hit, and how they were verified"**, see
-**[docs/TECHNICAL_REPORT.en.md](docs/TECHNICAL_REPORT.en.md)** (a summary of all work from
-2026-08-04 to 08-08: diffusers-path design decisions, memory design, 16 pitfalls hit on
-real hardware and their resolutions, verification methodology, and where things stand).
+This README is an operational document on "how to use it." The technical side is split in
+two by purpose.
+
+| Document | Contents | Audience |
+|---|---|---|
+| **[docs/TECHNICAL_OVERVIEW.en.md](docs/TECHNICAL_OVERVIEW.en.md)** | **Technical overview**: capabilities, architecture, how the various techniques are integrated, handling per VRAM tier, performance, configuration reference | Anyone who wants to know what this app does and how |
+| [docs/internal/TECHNICAL_REPORT.en.md](docs/internal/TECHNICAL_REPORT.en.md) | **Internal document (work log)**: all work from 2026-08-04 to 08-08 — the background to design decisions, 16 pitfalls hit on real hardware and their resolutions, verification methodology | Developers who would rather not hit the same traps |
+
+The technical report is **a record of the process, bugs, dead ends and all**, so if you only
+want the specification and the performance, the technical overview is enough.
 
 ## List of community improvements incorporated
 

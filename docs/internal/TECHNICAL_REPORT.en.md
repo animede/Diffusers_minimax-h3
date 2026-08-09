@@ -2,11 +2,17 @@
 
 [日本語](TECHNICAL_REPORT.md) | **English**
 
+> **Internal document (work log).** This records the development process itself, including
+> the bugs, dead ends and detours hit along the way -- it is not the outward-facing
+> technical description. For the specification, design and performance, read
+> **[docs/TECHNICAL_OVERVIEW.en.md](../TECHNICAL_OVERVIEW.en.md)** instead.
+> The value here is "why the design ended up this way" and "so the same trap is not hit twice".
+
 **Period covered**: 2026-08-04 to 2026-08-08 (44 commits)
 **Subject**: this repository `minimax-h3` (a standalone app for verifying MiniMax H3 / Hailuo 3.0 functionality)
 **Implementation size**: approx. 10,700 lines (`core/runner.py` 4,943 / `static/index.html` 1,839 / `README.md` 1,441 / `app.py` 1,003 / others)
 
-Separately from the operational documentation in [README.md](../README.en.md), this report exists to record **not "what was built" but "why it was built that way, what went wrong, and how it was verified."** All numbers are measured on real hardware, with measurement conditions noted alongside. For step-by-step operating instructions, see the README.
+Separately from the operational documentation in [README.md](../../README.en.md), this report exists to record **not "what was built" but "why it was built that way, what went wrong, and how it was verified."** All numbers are measured on real hardware, with measurement conditions noted alongside. For step-by-step operating instructions, see the README.
 
 ---
 
