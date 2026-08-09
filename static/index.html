@@ -58,7 +58,18 @@
   textarea { min-height: 90px; resize: vertical; }
   .row { display: flex; gap: 10px; }
   .row > div { flex: 1; }
-  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tabs { display: flex; gap: 6px; }
+  /* 上段(動画)/下段(静止画)の2段組み。段見出しは幅を固定して両段のタブ左端を揃える */
+  .tab-group { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .tab-group:last-of-type { margin-bottom: 14px; }
+  .tab-group .tabs { flex: 1; }
+  .tab-group-label {
+    width: 3.5em;
+    flex: none;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+  }
   .tab-btn {
     flex: 1;
     padding: 8px;
@@ -70,6 +81,8 @@
     font-size: 13px;
   }
   .tab-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  /* 2行目 = 入力の種別 (1行目はモデル名)。折り返しではなく常に2行なので高さが揃う */
+  .tab-btn small { display: block; font-size: 10px; opacity: 0.7; margin-top: 2px; }
   .file-drop {
     border: 1px dashed var(--border);
     border-radius: 6px;
@@ -446,11 +459,28 @@
 
 <div class="layout">
   <div class="panel">
-    <div class="tabs">
-      <button class="tab-btn active" data-mode="t2va">T2VA (テキスト→動画)</button>
-      <button class="tab-btn" data-mode="fl2va">FL2VA (フレーム指定)</button>
-      <button class="tab-btn" data-mode="ref2va">Ref2VA (参照→動画)</button>
-      <button class="tab-btn" data-mode="t2i">T2I (静止画)</button>
+    <!-- 上段=動画、下段=静止画。静止画は「入力の形」ではなく「出力の尺」で分かれる
+         (どちらの段も左がテキストのみ、右へ行くほど入力が増える並び)。バッチは段では
+         なく各タブ内のチェック (動画バッチ /api/ref2va_batch もあるため、静止画/動画の
+         どちらの軸とも直交する)。 -->
+    <div class="tab-group">
+      <span class="tab-group-label">動画</span>
+      <!-- 段見出しが出力(動画/静止画)を担うので、ボタン2行目には**入力**だけを書く
+           (段×タブで「動画×テキスト=T2VA」と読める)。括弧書きを1行に詰めると
+           パネル幅 378px ではボタン内幅 77px に対し文字 95px で折り返し、ボタンの
+           高さが不揃いになったため、最初から2行構造にして幅に依存しないようにした。 -->
+      <div class="tabs">
+        <button class="tab-btn active" data-mode="t2va">T2VA<small>テキスト</small></button>
+        <button class="tab-btn" data-mode="fl2va">FL2VA<small>フレーム</small></button>
+        <button class="tab-btn" data-mode="ref2va">Ref2VA<small>参照</small></button>
+      </div>
+    </div>
+    <div class="tab-group">
+      <span class="tab-group-label">静止画</span>
+      <div class="tabs">
+        <button class="tab-btn" data-mode="t2i">T2I<small>テキスト</small></button>
+        <button class="tab-btn" data-mode="ref2i">Ref2I<small>参照</small></button>
+      </div>
     </div>
 
     <form id="gen-form">
@@ -547,9 +577,11 @@
         </div>
         <div id="ref-order-line" class="hint" style="margin-top:6px;"></div>
 
-        <div class="checkbox-row" style="margin-top:8px;">
-          <input type="checkbox" id="ref2va-still">
-          <label for="ref2va-still" style="margin:0;">静止画 (超短尺→中央フレームPNG)</label>
+        <!-- フレーム数は Ref2I タブでのみ意味を持つ (Ref2VA は秒数が尺を決める)。
+             以前は同じ場所に「静止画」チェックがあったが、Ref2I をタブに独立させたので
+             タブ選択がそのままモードになる。 -->
+        <div class="checkbox-row" id="ref2i-frames-row" style="margin-top:8px; display:none;">
+          <label for="ref2va-frames" style="margin:0;">フレーム数(超短尺→中央フレームPNG)</label>
           <select id="ref2va-frames" style="width:auto;">
             <option value="22">22フレーム (0.92秒・検証済み)</option>
             <option value="5">5フレーム (0.21秒・実験的)</option>
@@ -739,7 +771,7 @@ const ref2vaFields = document.getElementById('ref2va-fields');
 const t2iFields = document.getElementById('t2i-fields');
 const t2iFramesEl = document.getElementById('t2i-frames');
 const t2iBatchEl = document.getElementById('t2i-batch');
-const ref2vaStillEl = document.getElementById('ref2va-still');
+const ref2iFramesRowEl = document.getElementById('ref2i-frames-row');
 const ref2vaFramesEl = document.getElementById('ref2va-frames');
 const ref2vaBatchRowEl = document.getElementById('ref2va-batch-row');
 const ref2vaBatchEl = document.getElementById('ref2va-batch');
@@ -904,35 +936,39 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.add('active');
     mode = btn.dataset.mode;
     fl2vaFields.style.display = (mode === 'fl2va') ? 'block' : 'none';
-    ref2vaFields.style.display = (mode === 'ref2va') ? 'block' : 'none';
+    // Ref2VA と Ref2I は同じ参照アップロード欄を共有する (違いは尺の決め方だけ)。
+    ref2vaFields.style.display = isRefMode(mode) ? 'block' : 'none';
     t2iFields.style.display = (mode === 't2i') ? 'block' : 'none';
     updateStillControls();
-    // Ref2VA references never bind the target canvas (each is prepared at its own
-    // resolution -- see packing_ref2va.py's module docstring)。既定は H3 自身の 16:9
+    // Ref2VA/Ref2I references never bind the target canvas (each is prepared at its own
+    // resolution -- see references.py の各クラスの docstring)。既定は H3 自身の 16:9
     // (height/width を送らない = "auto")だが、/api/ref2va は height/width を任意で
     // 受け付けるので選択欄は隠さない(以前は行ごと隠しており、同居していた「秒数」まで
     // 消えて「音声参照1本なら空欄可」がUIから到達不能になっていた)。
-    if (mode === 'ref2va' && resolutionEl.value !== 'auto') {
+    if (isRefMode(mode) && resolutionEl.value !== 'auto') {
       resolutionEl.dataset.prevPreset = resolutionEl.value;
       resolutionEl.value = 'auto';
-    } else if (mode !== 'ref2va' && resolutionEl.value === 'auto' && resolutionEl.dataset.prevPreset) {
+    } else if (!isRefMode(mode) && resolutionEl.value === 'auto' && resolutionEl.dataset.prevPreset) {
       resolutionEl.value = resolutionEl.dataset.prevPreset;
     }
     updateCustomSizeVisibility();
   });
 });
 
-// 静止画系の表示制御: T2I タブと「Ref2VA + 静止画チェック」は秒数を使わない
-// (フレーム数が尺を決める)。upscale は T2I では未検証のため隠す。
+// 参照を使うモード (動画=ref2va / 静止画=ref2i)。参照欄・解像度auto・バッチの扱いは共通。
+function isRefMode(m) { return m === 'ref2va' || m === 'ref2i'; }
+// 静止画モード (テキストのみ=t2i / 参照あり=ref2i)。どちらも秒数ではなくフレーム数が尺。
+function isStillMode(m) { return m === 't2i' || m === 'ref2i'; }
+
+// 静止画系の表示制御: 静止画タブ (T2I / Ref2I) は秒数を使わない (フレーム数が尺を決める)。
+// upscale は静止画では未検証のため隠す。バッチは静止画/動画のどちらとも直交するので
+// ここでは触らない (動画バッチ = /api/ref2va_batch もある)。
 function updateStillControls() {
-  const ref2vaStill = (mode === 'ref2va') && ref2vaStillEl.checked;
-  secondsColEl.style.display = (mode === 't2i' || ref2vaStill) ? 'none' : '';
-  upscaleRowEl.style.display = (mode === 't2i') ? 'none' : '';
-  // バッチは静止画と独立 (動画のバッチ = /api/ref2va_batch もある)
-  ref2vaStillHintEl.style.display = ref2vaStill ? '' : 'none';
-  ref2vaFramesEl.style.display = ref2vaStillEl.checked ? '' : 'none';
+  secondsColEl.style.display = isStillMode(mode) ? 'none' : '';
+  upscaleRowEl.style.display = isStillMode(mode) ? 'none' : '';
+  ref2vaStillHintEl.style.display = (mode === 'ref2i') ? '' : 'none';
+  ref2iFramesRowEl.style.display = (mode === 'ref2i') ? '' : 'none';
 }
-ref2vaStillEl.addEventListener('change', updateStillControls);
 updateStillControls();
 
 function _refKindLabel(file) {
@@ -1195,9 +1231,10 @@ enhanceBtn.addEventListener('click', async () => {
     fd.append('text', text);
     fd.append('mode', enhanceModeEl.value);
     fd.append('seconds', secondsEl.value || '10');
-    // t2va/fl2va/ref2va タブ (h3-official モードのみ使用)。T2I タブは超短尺の t2va
-    // なので t2va のプロンプト形式をそのまま使う。
-    fd.append('task', mode === 't2i' ? 't2va' : mode);
+    // サーバが受けるのは t2va/fl2va/ref2va の3つ (core/llm.py VALID_H3_OFFICIAL_TASKS)。
+    // 静止画タブは「超短尺の動画」なので、対応する動画タスクのプロンプト形式を使う:
+    // T2I → t2va、Ref2I → ref2va。
+    fd.append('task', mode === 't2i' ? 't2va' : (mode === 'ref2i' ? 'ref2va' : mode));
     fd.append('lang', enhanceLangEl.value || 'en');
     const res = await fetch('/api/prompt/enhance', { method: 'POST', body: fd });
     const data = await res.json();
@@ -1462,7 +1499,9 @@ form.addEventListener('submit', async (ev) => {
     fd.append('seconds', secondsEl.value);
     if (imageFileEl.files[0]) fd.append('image', imageFileEl.files[0]);
     if (lastImageFileEl.files[0]) fd.append('last_image', lastImageFileEl.files[0]);
-  } else if (mode === 'ref2va') {
+  } else if (isRefMode(mode)) {
+    // Ref2VA (動画) と Ref2I (静止画) は同じ /api/ref2va を叩き、still フラグと
+    // frames/seconds の送り分けだけが違う (バッチ時のみ専用エンドポイントへ)。
     url = '/api/ref2va';
     if (!refItems.length) {
       setStatus('参照ファイルを1つ以上追加してください', true);
@@ -1484,7 +1523,7 @@ form.addEventListener('submit', async (ev) => {
       fd.append('height', h);
       fd.append('width', w);
     }
-    const ref2vaStill = ref2vaStillEl.checked;
+    const ref2vaStill = (mode === 'ref2i');
     const ref2vaBatch = ref2vaBatchEl.checked;
     if (ref2vaStill) {
       // 参照付き静止画 (ref2i): 秒数は送らない (frames が尺を決める)
