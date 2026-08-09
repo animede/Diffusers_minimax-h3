@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MiniMax-H3 検証アプリ</title>
+<title data-i18n="app.title">MiniMax-H3 検証アプリ</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -26,6 +26,25 @@
   }
   h1 { font-size: 20px; margin: 0 0 4px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .header-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  .lang-toggle { display: flex; gap: 6px; flex: none; }
+  .lang-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  .lang-btn:hover { color: var(--text); }
+  .lang-btn.active { color: var(--accent); font-weight: 600; }
   .layout {
     display: grid;
     grid-template-columns: 380px 1fr;
@@ -454,8 +473,16 @@
 </style>
 </head>
 <body>
-<h1>MiniMax-H3 検証アプリ</h1>
-<div class="subtitle">オムニモーダル動画+ステレオ音声生成 (33B, diffusers Modular Pipeline) — port 8611</div>
+<div class="header-row">
+  <div>
+    <h1 data-i18n="app.title">MiniMax-H3 検証アプリ</h1>
+    <div class="subtitle" data-i18n="app.subtitle">オムニモーダル動画+ステレオ音声生成 (33B, diffusers Modular Pipeline) — port 8611</div>
+  </div>
+  <div class="lang-toggle">
+    <button type="button" class="lang-btn" id="lang-ja" data-lang="ja">日本語</button>
+    <button type="button" class="lang-btn" id="lang-en" data-lang="en">English</button>
+  </div>
+</div>
 
 <div class="layout">
   <div class="panel">
@@ -464,49 +491,49 @@
          なく各タブ内のチェック (動画バッチ /api/ref2va_batch もあるため、静止画/動画の
          どちらの軸とも直交する)。 -->
     <div class="tab-group">
-      <span class="tab-group-label">動画</span>
+      <span class="tab-group-label" data-i18n="tab.group.video">動画</span>
       <!-- 段見出しが出力(動画/静止画)を担うので、括弧内には**入力**だけを書く
            (段×タブで「動画×テキスト=T2VA」と読める)。モデル名と括弧書きは
            **明示的に改行**する: 1行に詰めるとパネル幅 378px ではボタン内幅 77px に
            対し文字 95px で自然折り返しが起き、折り返し位置がボタンごとに変わって
            高さが不揃いになる。最初から2行に固定すれば幅に依存しない。 -->
       <div class="tabs">
-        <button class="tab-btn active" data-mode="t2va">T2VA<small>(テキスト)</small></button>
-        <button class="tab-btn" data-mode="fl2va">FL2VA<small>(フレーム)</small></button>
-        <button class="tab-btn" data-mode="ref2va">Ref2VA<small>(参照)</small></button>
+        <button class="tab-btn active" data-mode="t2va">T2VA<small data-i18n="tab.t2va.sub">(テキスト)</small></button>
+        <button class="tab-btn" data-mode="fl2va">FL2VA<small data-i18n="tab.fl2va.sub">(フレーム)</small></button>
+        <button class="tab-btn" data-mode="ref2va">Ref2VA<small data-i18n="tab.ref2va.sub">(参照)</small></button>
       </div>
     </div>
     <div class="tab-group">
-      <span class="tab-group-label">静止画</span>
+      <span class="tab-group-label" data-i18n="tab.group.still">静止画</span>
       <div class="tabs">
-        <button class="tab-btn" data-mode="t2i">T2I<small>(テキスト)</small></button>
-        <button class="tab-btn" data-mode="ref2i">Ref2I<small>(参照)</small></button>
+        <button class="tab-btn" data-mode="t2i">T2I<small data-i18n="tab.t2va.sub">(テキスト)</small></button>
+        <button class="tab-btn" data-mode="ref2i">Ref2I<small data-i18n="tab.ref2va.sub">(参照)</small></button>
       </div>
     </div>
 
     <form id="gen-form">
-      <label>プロンプト</label>
-      <textarea id="prompt" placeholder="例: 夕日の中、ゴールデンレトリバーの子犬が芝生を駆け抜けボールを追いかける。カメラは低い位置から追従。風で葉が揺れ、鳥のさえずり、子犬の楽しそうな鳴き声。"></textarea>
+      <label data-i18n="label.prompt">プロンプト</label>
+      <textarea id="prompt" data-i18n-placeholder="hint.prompt.placeholder" placeholder="例: 夕日の中、ゴールデンレトリバーの子犬が芝生を駆け抜けボールを追いかける。カメラは低い位置から追従。風で葉が揺れ、鳥のさえずり、子犬の楽しそうな鳴き声。"></textarea>
 
       <div class="llm-row">
-        <select id="enhance-mode" title="強化モード">
-          <option value="storyboard">ストーリーボード(カット割り)</option>
-          <option value="brief">ブリーフ詳細化(単一ショット)</option>
-          <option value="h3-official">公式仕様(h3-prompt-writing)</option>
-          <option value="translate">英訳のみ</option>
+        <select id="enhance-mode" title="強化モード" data-i18n-title="label.enhanceMode">
+          <option value="storyboard" data-i18n="enhance.mode.storyboard">ストーリーボード(カット割り)</option>
+          <option value="brief" data-i18n="enhance.mode.brief">ブリーフ詳細化(単一ショット)</option>
+          <option value="h3-official" data-i18n="enhance.mode.official">公式仕様(h3-prompt-writing)</option>
+          <option value="translate" data-i18n="enhance.mode.translate">英訳のみ</option>
         </select>
-        <select id="enhance-lang" title="出力言語" style="display:none;">
-          <option value="en">英語(公式既定)</option>
-          <option value="ja">日本語</option>
+        <select id="enhance-lang" title="出力言語" data-i18n-title="label.enhanceLang" style="display:none;">
+          <option value="en" data-i18n="enhance.lang.en">英語(公式既定)</option>
+          <option value="ja" data-i18n="enhance.lang.ja">日本語</option>
         </select>
-        <button type="button" class="llm-btn" id="enhance-btn">LLM強化</button>
-        <button type="button" class="llm-btn" id="undo-btn" style="display:none;">元に戻す</button>
+        <button type="button" class="llm-btn" id="enhance-btn" data-i18n="btn.enhance">LLM強化</button>
+        <button type="button" class="llm-btn" id="undo-btn" data-i18n="btn.undo" style="display:none;">元に戻す</button>
       </div>
-      <div class="hint" id="enhance-hint">LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。</div>
+      <div class="hint" id="enhance-hint" data-i18n="hint.enhance.storyboard">LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。</div>
 
       <details class="guide">
-        <summary>プロンプトガイド(手書き用チートシート)</summary>
-        <div class="guide-body">
+        <summary data-i18n="guide.summary">プロンプトガイド(手書き用チートシート)</summary>
+        <div class="guide-body" data-i18n-html="guide.body">
           <b>公式ブリーフ構造(再生順):</b> シーン → 被写体 → アクション → カメラ → 音の意図 → 終わり方。上限7,000字。日本語OK。<br>
           <b>マルチショット(実機検証済み):</b> <code>CUT 1 [0-5秒]: …</code> <code>CUT 2 [5-10秒]: ハードカットで…</code> の
           タイムコードブロックで1クリップ内にカットを実行できる。カット位置の精度は±1秒程度。<br>
@@ -517,34 +544,34 @@
       </details>
 
       <div id="fl2va-fields" style="display:none;">
-        <label>先頭フレーム画像 (image, 任意)</label>
+        <label data-i18n="label.firstFrame">先頭フレーム画像 (image, 任意)</label>
         <div class="dropzone" id="dz-image">
           <span class="dropzone-icon">🖼</span>
-          <span class="dropzone-text">ドラッグ&ドロップ、またはクリックして選択</span>
-          <button type="button" class="dropzone-clear" style="display:none;">クリア</button>
+          <span class="dropzone-text" data-i18n="hint.dropzone">ドラッグ&ドロップ、またはクリックして選択</span>
+          <button type="button" class="dropzone-clear" data-i18n="btn.clear" style="display:none;">クリア</button>
           <input type="file" id="image-file" accept="image/*">
         </div>
-        <label>末尾フレーム画像 (last_image, 任意)</label>
+        <label data-i18n="label.lastFrame">末尾フレーム画像 (last_image, 任意)</label>
         <div class="dropzone" id="dz-last-image">
           <span class="dropzone-icon">🖼</span>
-          <span class="dropzone-text">ドラッグ&ドロップ、またはクリックして選択</span>
-          <button type="button" class="dropzone-clear" style="display:none;">クリア</button>
+          <span class="dropzone-text" data-i18n="hint.dropzone">ドラッグ&ドロップ、またはクリックして選択</span>
+          <button type="button" class="dropzone-clear" data-i18n="btn.clear" style="display:none;">クリア</button>
           <input type="file" id="last-image-file" accept="image/*">
         </div>
-        <div class="hint">どちらか一方でも可。両方指定すると先頭→末尾のフレーム間を生成。</div>
+        <div class="hint" data-i18n="hint.fl2vaFrames">どちらか一方でも可。両方指定すると先頭→末尾のフレーム間を生成。</div>
       </div>
 
       <div id="t2i-fields" style="display:none;">
-        <label>フレーム数(超短尺動画を生成し、中央フレームをPNG書き出し)</label>
+        <label data-i18n="label.t2iFrames">フレーム数(超短尺動画を生成し、中央フレームをPNG書き出し)</label>
         <select id="t2i-frames">
-          <option value="22">22フレーム (0.92秒・品質検証済みの既定)</option>
-          <option value="5">5フレーム (0.21秒・実験的)</option>
+          <option value="22" data-i18n="option.frames22">22フレーム (0.92秒・品質検証済みの既定)</option>
+          <option value="5" data-i18n="option.frames5">5フレーム (0.21秒・実験的)</option>
         </select>
         <div class="checkbox-row" style="margin-top:8px;">
           <input type="checkbox" id="t2i-batch">
-          <label for="t2i-batch" style="margin:0;">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面)</label>
+          <label for="t2i-batch" style="margin:0;" data-i18n-html="label.t2iBatch">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面)</label>
         </div>
-        <div class="hint">
+        <div class="hint" data-i18n-html="hint.t2i">
           H3と<b>画風が完全に一致する静止画</b>を、FL2VAの先頭フレームやRef2VAの参照画像用に
           作るモード。生成時間は固定費支配のため専用T2Iモデルより遅い。超短尺mp4も一緒に
           保存され、PNGは中央フレーム(別フレームが欲しい場合はmp4から取り出せる)。
@@ -554,13 +581,13 @@
       </div>
 
       <div id="ref2va-fields" style="display:none;">
-        <label>参照ファイル (references, 画像最大9・動画最大3・音声最大3、計12まで)</label>
+        <label data-i18n="label.refFiles">参照ファイル (references, 画像最大9・動画最大3・音声最大3、計12まで)</label>
         <div class="dropzone" id="dz-ref-files">
           <span class="dropzone-icon">📎</span>
-          <span class="dropzone-text">ドラッグ&ドロップ、またはクリックして選択(複数可・追加されます)</span>
+          <span class="dropzone-text" data-i18n="hint.dropzoneMulti">ドラッグ&ドロップ、またはクリックして選択(複数可・追加されます)</span>
           <input type="file" id="ref-files" multiple accept="image/*,video/*,audio/*">
         </div>
-        <div class="hint">
+        <div class="hint" data-i18n-html="hint.refFiles">
           <b>追加した順序がそのまま参照順になります</b>。各参照はプロンプト内で下のタイルに表示される
           名前(&lt;Picture i&gt;/&lt;Video k&gt;/&lt;Audio j&gt;、種別ごとに1始まり)で参照できます。
           音声を含む参照(音声単体 or 音声付き動画)がちょうど1本のときのみ、下の秒数を
@@ -568,11 +595,11 @@
         </div>
         <div class="ref-cols" id="ref-cols" style="display:none;">
           <div class="ref-col">
-            <div class="ref-col-title">画像 (<span id="ref-count-image">0</span>/9)</div>
+            <div class="ref-col-title"><span data-i18n="ref.kind.image">画像</span> (<span id="ref-count-image">0</span>/9)</div>
             <div id="ref-col-images"></div>
           </div>
           <div class="ref-col">
-            <div class="ref-col-title">動画 (<span id="ref-count-video">0</span>/3)・音声/音楽 (<span id="ref-count-audio">0</span>/3)</div>
+            <div class="ref-col-title"><span data-i18n="ref.kind.video">動画</span> (<span id="ref-count-video">0</span>/3)・<span data-i18n="ref.kind.audioMusic">音声/音楽</span> (<span id="ref-count-audio">0</span>/3)</div>
             <div id="ref-col-media"></div>
           </div>
         </div>
@@ -582,17 +609,17 @@
              以前は同じ場所に「静止画」チェックがあったが、Ref2I をタブに独立させたので
              タブ選択がそのままモードになる。 -->
         <div class="checkbox-row" id="ref2i-frames-row" style="margin-top:8px; display:none;">
-          <label for="ref2va-frames" style="margin:0;">フレーム数(超短尺→中央フレームPNG)</label>
+          <label for="ref2va-frames" style="margin:0;" data-i18n="label.ref2iFrames">フレーム数(超短尺→中央フレームPNG)</label>
           <select id="ref2va-frames" style="width:auto;">
-            <option value="22">22フレーム (0.92秒・検証済み)</option>
-            <option value="5">5フレーム (0.21秒・実験的)</option>
+            <option value="22" data-i18n="option.frames22ref">22フレーム (0.92秒・検証済み)</option>
+            <option value="5" data-i18n="option.frames5">5フレーム (0.21秒・実験的)</option>
           </select>
         </div>
         <div class="checkbox-row" id="ref2va-batch-row">
           <input type="checkbox" id="ref2va-batch">
-          <label for="ref2va-batch" style="margin:0;">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面。参照・seed・尺は全場面共通)</label>
+          <label for="ref2va-batch" style="margin:0;" data-i18n-html="label.ref2vaBatch">バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面。参照・seed・尺は全場面共通)</label>
         </div>
-        <div class="hint" id="ref2va-still-hint" style="display:none;">
+        <div class="hint" id="ref2va-still-hint" style="display:none;" data-i18n-html="hint.ref2iStill">
           キャラクター参照から<b>場面ごとの一貫した静止画</b>を作るモード(参照・seed・
           解像度は全場面共通)。秒数は使いません。作った静止画は FL2VA の先頭フレームや
           次の Ref2VA の参照に回せます。
@@ -601,20 +628,20 @@
 
       <div class="row" id="size-row">
         <div>
-          <label>解像度 (幅×高さ)</label>
+          <label data-i18n="label.resolution">解像度 (幅×高さ)</label>
           <!-- value は app.py の RESOLUTION_PRESETS のキーで、"高さx幅" の順に
                展開される(`height, width = RESOLUTION_PRESETS[...]`)。表示ラベルは
                利用者に馴染む「幅×高さ」で書いてあるため value と順序が逆に見える。 -->
           <select id="resolution">
-            <option value="768x768">768×768 (正方形)</option>
-            <option value="768x1344">1344×768 (横長)</option>
-            <option value="1344x768">768×1344 (縦長)</option>
-            <option value="custom">任意 (32の倍数へ丸め)</option>
-            <option value="auto">自動 (サーバ既定 / Ref2VAは16:9)</option>
+            <option value="768x768" data-i18n="option.res.square">768×768 (正方形)</option>
+            <option value="768x1344" data-i18n="option.res.landscape">1344×768 (横長)</option>
+            <option value="1344x768" data-i18n="option.res.portrait">768×1344 (縦長)</option>
+            <option value="custom" data-i18n="option.res.custom">任意 (32の倍数へ丸め)</option>
+            <option value="auto" data-i18n="option.res.auto">自動 (サーバ既定 / Ref2VAは16:9)</option>
           </select>
         </div>
         <div id="seconds-col">
-          <label>秒数 (5〜15、Ref2VAは音声参照1本なら空欄可)</label>
+          <label data-i18n="label.seconds">秒数 (5〜15、Ref2VAは音声参照1本なら空欄可)</label>
           <input type="number" id="seconds" value="5" min="5" max="15" step="0.5">
         </div>
       </div>
@@ -624,11 +651,11 @@
            範囲外・端数はサーバ(round_canvas_value)とプレビューで丸める。 -->
       <div class="row" id="custom-size-row" style="display:none;">
         <div>
-          <label>幅 (px、256〜2048)</label>
+          <label data-i18n="label.customWidth">幅 (px、256〜2048)</label>
           <input type="number" id="custom-width" value="1024" placeholder="1024">
         </div>
         <div>
-          <label>高さ (px、256〜2048)</label>
+          <label data-i18n="label.customHeight">高さ (px、256〜2048)</label>
           <input type="number" id="custom-height" value="576" placeholder="576">
         </div>
       </div>
@@ -636,11 +663,11 @@
 
       <div class="row">
         <div>
-          <label>ステップ数</label>
+          <label data-i18n="label.steps">ステップ数</label>
           <input type="number" id="steps" value="30" min="4" max="60">
         </div>
         <div>
-          <label>seed (空欄でランダム)</label>
+          <label data-i18n="label.seed">seed (空欄でランダム)</label>
           <input type="number" id="seed" placeholder="12345">
         </div>
       </div>
@@ -648,7 +675,7 @@
       <div class="row" id="upscale-row">
         <label style="display:flex;align-items:center;gap:8px;">
           <input type="checkbox" id="upscale" style="width:auto;">
-          2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ・約3.6倍時間)
+          <span data-i18n="label.upscale">2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ・約3.6倍時間)</span>
         </label>
       </div>
 
@@ -656,7 +683,7 @@
            core/settings.py の resolve_instant_settings() が未指定時はサーバの
            現在の既定にフォールバックするため、ここを一切触らなくても既存の挙動のまま。 -->
       <div class="instant-settings">
-        <div class="instant-settings-title">即反映設定(生成のたびに反映・再ロード不要)</div>
+        <div class="instant-settings-title" data-i18n="settings.instantTitle">即反映設定(生成のたびに反映・再ロード不要)</div>
         <div class="checkbox-row" id="row-cache">
           <input type="checkbox" id="cache-enabled">
           <label style="margin:0;" for="cache-enabled">FirstBlockCache</label>
@@ -669,13 +696,13 @@
         </div>
         <div class="checkbox-row" id="row-turbo">
           <input type="checkbox" id="turbo-enabled">
-          <label style="margin:0;" for="turbo-enabled">Turbo LoRA(4ステップ推奨・lightx2v蒸留)</label>
+          <label style="margin:0;" for="turbo-enabled" data-i18n="label.turbo">Turbo LoRA(4ステップ推奨・lightx2v蒸留)</label>
         </div>
         <div class="hint" id="instant-hint"></div>
       </div>
 
-      <button type="submit" class="generate" id="generate-btn">生成</button>
-      <div class="hint">蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。</div>
+      <button type="submit" class="generate" id="generate-btn" data-i18n="btn.generate">生成</button>
+      <div class="hint" data-i18n="hint.generate">蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。</div>
     </form>
 
     <div class="status-box" id="status-box"></div>
@@ -683,24 +710,24 @@
       <div class="progress-bar-inner" id="progress-inner"></div>
     </div>
 
-    <div class="server-status" id="server-status">サーバ状態を確認中...</div>
+    <div class="server-status" id="server-status" data-i18n="status.checkingServer">サーバ状態を確認中...</div>
 
     <!-- 再ロードが必要な設定: モデルを解放して新設定でロードし直す(サーバプロセスは
          再起動しない。core/settings.py の apply_reload_settings() -> runner.unload_all()
          + runner.preload_all())。variant=option value は core/settings.py の
          RELOAD_*_CHOICES と一致させること。 -->
     <details class="reload-settings" id="reload-settings">
-      <summary>再ロードが必要な設定(transformer量子化・TE量子化・低VRAMモード等)</summary>
+      <summary data-i18n="reload.summary">再ロードが必要な設定(transformer量子化・TE量子化・低VRAMモード等)</summary>
       <div class="reload-body">
         <div class="reload-field">
-          <label>transformer 量子化</label>
+          <label data-i18n="label.transformerQuant">transformer 量子化</label>
           <select id="reload-transformer-quant">
             <option value="none">none (bf16)</option>
             <option value="int8">int8</option>
           </select>
         </div>
         <div class="reload-field">
-          <label>text_encoder 量子化</label>
+          <label data-i18n="label.teQuant">text_encoder 量子化</label>
           <select id="reload-te-quant">
             <option value="bnb-4bit">bnb-4bit (nf4)</option>
             <option value="none">none (bf16)</option>
@@ -708,51 +735,433 @@
         </div>
         <div class="reload-checkbox">
           <input type="checkbox" id="reload-te-prune">
-          <label style="margin:0;" for="reload-te-prune">TEレイヤー削除(51/64層のみ構築)</label>
+          <label style="margin:0;" for="reload-te-prune" data-i18n="label.tePrune">TEレイヤー削除(51/64層のみ構築)</label>
         </div>
         <div class="reload-field">
-          <label>低VRAMモード</label>
+          <label data-i18n="label.lowvram">低VRAMモード</label>
           <select id="reload-lowvram">
-            <option value="0">0 (無効・48GB超級)</option>
-            <option value="1">1 (48GB級・per-request reload)</option>
-            <option value="group">group (24-32GB級・group offload常駐)</option>
+            <option value="0" data-i18n="option.lowvram0">0 (無効・48GB超級)</option>
+            <option value="1" data-i18n="option.lowvram1">1 (48GB級・per-request reload)</option>
+            <option value="group" data-i18n="option.lowvramGroup">group (24-32GB級・group offload常駐)</option>
           </select>
         </div>
         <div class="reload-checkbox">
           <input type="checkbox" id="reload-video-vae-fp16">
-          <label style="margin:0;" for="reload-video-vae-fp16">video VAE を fp16 化(実験的)</label>
+          <label style="margin:0;" for="reload-video-vae-fp16" data-i18n="label.videoVaeFp16">video VAE を fp16 化(実験的)</label>
         </div>
-        <button type="button" class="apply-btn" id="reload-apply-btn">適用(再ロード)</button>
-        <div class="reload-hint" id="reload-hint">変更なし</div>
+        <button type="button" class="apply-btn" id="reload-apply-btn" data-i18n="btn.reloadApply">適用(再ロード)</button>
+        <div class="reload-hint" id="reload-hint" data-i18n="reload.noChange">変更なし</div>
       </div>
     </details>
   </div>
 
   <div class="panel">
-    <h2>結果</h2>
+    <h2 data-i18n="result.heading">結果</h2>
     <div id="result-area">
-      <div class="placeholder">まだ生成していません</div>
+      <div class="placeholder" data-i18n="result.placeholder">まだ生成していません</div>
     </div>
 
     <div class="gallery-panel">
-      <h2>生成済み動画・静止画</h2>
-      <div class="gallery-hint">連結順は「チェックした順」です(ギャラリー表示順は新しい順)。静止画(PNG)は連結対象外。</div>
+      <h2 data-i18n="gallery.heading">生成済み動画・静止画</h2>
+      <div class="gallery-hint" data-i18n-html="gallery.hint">連結順は「チェックした順」です(ギャラリー表示順は新しい順)。静止画(PNG)は連結対象外。</div>
       <div class="gallery-toolbar">
-        <button type="button" id="gallery-select-all">全選択</button>
-        <button type="button" id="gallery-select-none">全解除</button>
-        <button type="button" class="danger" id="gallery-delete-btn" disabled>選択を削除</button>
-        <button type="button" class="primary" id="gallery-concat-btn" disabled>選択を連結</button>
-        <button type="button" id="gallery-refresh-btn">再読込</button>
+        <button type="button" id="gallery-select-all" data-i18n="btn.selectAll">全選択</button>
+        <button type="button" id="gallery-select-none" data-i18n="btn.selectNone">全解除</button>
+        <button type="button" class="danger" id="gallery-delete-btn" disabled data-i18n="btn.deleteSelected">選択を削除</button>
+        <button type="button" class="primary" id="gallery-concat-btn" disabled data-i18n="btn.concatSelected">選択を連結</button>
+        <button type="button" id="gallery-refresh-btn" data-i18n="btn.refresh">再読込</button>
         <span class="gallery-count" id="gallery-count">0件選択</span>
       </div>
       <div class="gallery-grid" id="gallery-grid">
-        <div class="gallery-empty">読み込み中...</div>
+        <div class="gallery-empty" data-i18n="gallery.loading">読み込み中...</div>
       </div>
     </div>
   </div>
 </div>
 
 <script>
+// ============================================================================
+// i18n (日英ランタイム切替)
+// ============================================================================
+const I18N = {
+  ja: {
+    'app.title': 'MiniMax-H3 検証アプリ',
+    'app.subtitle': 'オムニモーダル動画+ステレオ音声生成 (33B, diffusers Modular Pipeline) — port 8611',
+    'tab.group.video': '動画',
+    'tab.group.still': '静止画',
+    'tab.t2va.sub': '(テキスト)',
+    'tab.fl2va.sub': '(フレーム)',
+    'tab.ref2va.sub': '(参照)',
+    'label.prompt': 'プロンプト',
+    'hint.prompt.placeholder': '例: 夕日の中、ゴールデンレトリバーの子犬が芝生を駆け抜けボールを追いかける。カメラは低い位置から追従。風で葉が揺れ、鳥のさえずり、子犬の楽しそうな鳴き声。',
+    'label.enhanceMode': '強化モード',
+    'label.enhanceLang': '出力言語',
+    'enhance.mode.storyboard': 'ストーリーボード(カット割り)',
+    'enhance.mode.brief': 'ブリーフ詳細化(単一ショット)',
+    'enhance.mode.official': '公式仕様(h3-prompt-writing)',
+    'enhance.mode.translate': '英訳のみ',
+    'enhance.lang.en': '英語(公式既定)',
+    'enhance.lang.ja': '日本語',
+    'btn.enhance': 'LLM強化',
+    'btn.enhancing': '強化中...',
+    'btn.undo': '元に戻す',
+    'hint.enhance.storyboard': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
+    'hint.enhance.brief': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
+    'hint.enhance.translate': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
+    'hint.enhance.official': 'MiniMax公式 h3-prompt-writing スキル(SKILL.md + references)のフィールド構造・記法に厳密準拠します。現在選択中のタブ(T2VA/FL2VA/Ref2VA)を task として送ります。skills_cache/ 未取得の場合は scripts/fetch_h3_skill.py の実行を促すエラーになります。',
+    'guide.summary': 'プロンプトガイド(手書き用チートシート)',
+    'guide.body': '<b>公式ブリーフ構造(再生順):</b> シーン → 被写体 → アクション → カメラ → 音の意図 → 終わり方。上限7,000字。日本語OK。<br>' +
+      '<b>マルチショット(実機検証済み):</b> <code>CUT 1 [0-5秒]: …</code> <code>CUT 2 [5-10秒]: ハードカットで…</code> の' +
+      'タイムコードブロックで1クリップ内にカットを実行できる。カット位置の精度は±1秒程度。<br>' +
+      '<b>カメラ:</b> ショットサイズ(ロング/ミディアム/クローズアップ)+ 焦点距離(35/50/65/100mm)+' +
+      'カメラワーク(固定/パン/プッシュイン/トラッキング)。<br>' +
+      '<b>音:</b> 環境音・効果音・セリフの意図をショット単位で書く(動画と同時生成されるため映像と同格に扱う)。',
+    'label.firstFrame': '先頭フレーム画像 (image, 任意)',
+    'label.lastFrame': '末尾フレーム画像 (last_image, 任意)',
+    'hint.dropzone': 'ドラッグ&ドロップ、またはクリックして選択',
+    'hint.dropzoneMulti': 'ドラッグ&ドロップ、またはクリックして選択(複数可・追加されます)',
+    'hint.filesCount': '{n}件: ',
+    'btn.clear': 'クリア',
+    'hint.fl2vaFrames': 'どちらか一方でも可。両方指定すると先頭→末尾のフレーム間を生成。',
+    'label.t2iFrames': 'フレーム数(超短尺動画を生成し、中央フレームをPNG書き出し)',
+    'option.frames22': '22フレーム (0.92秒・品質検証済みの既定)',
+    'option.frames22ref': '22フレーム (0.92秒・検証済み)',
+    'option.frames5': '5フレーム (0.21秒・実験的)',
+    'label.t2iBatch': 'バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面)',
+    'hint.t2i': 'H3と<b>画風が完全に一致する静止画</b>を、FL2VAの先頭フレームやRef2VAの参照画像用に' +
+      '作るモード。生成時間は固定費支配のため専用T2Iモデルより遅い。超短尺mp4も一緒に' +
+      '保存され、PNGは中央フレーム(別フレームが欲しい場合はmp4から取り出せる)。' +
+      'バッチはモデルロードを全場面で1回に償却する(低VRAMモードで特に有効。' +
+      'seed・解像度・ステップは全場面共通)。',
+    'label.refFiles': '参照ファイル (references, 画像最大9・動画最大3・音声最大3、計12まで)',
+    'hint.refFiles': '<b>追加した順序がそのまま参照順になります</b>。各参照はプロンプト内で下のタイルに表示される' +
+      '名前(&lt;Picture i&gt;/&lt;Video k&gt;/&lt;Audio j&gt;、種別ごとに1始まり)で参照できます。' +
+      '音声を含む参照(音声単体 or 音声付き動画)がちょうど1本のときのみ、下の秒数を' +
+      '空欄にしてその音声長を生成尺として使えます。',
+    'ref.kind.image': '画像',
+    'ref.kind.video': '動画',
+    'ref.kind.audioMusic': '音声/音楽',
+    'label.ref2iFrames': 'フレーム数(超短尺→中央フレームPNG)',
+    'label.ref2vaBatch': 'バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面。参照・seed・尺は全場面共通)',
+    'hint.ref2iStill': 'キャラクター参照から<b>場面ごとの一貫した静止画</b>を作るモード(参照・seed・' +
+      '解像度は全場面共通)。秒数は使いません。作った静止画は FL2VA の先頭フレームや' +
+      '次の Ref2VA の参照に回せます。',
+    'label.resolution': '解像度 (幅×高さ)',
+    'option.res.square': '768×768 (正方形)',
+    'option.res.landscape': '1344×768 (横長)',
+    'option.res.portrait': '768×1344 (縦長)',
+    'option.res.custom': '任意 (32の倍数へ丸め)',
+    'option.res.auto': '自動 (サーバ既定 / Ref2VAは16:9)',
+    'label.seconds': '秒数 (5〜15、Ref2VAは音声参照1本なら空欄可)',
+    'label.customWidth': '幅 (px、256〜2048)',
+    'label.customHeight': '高さ (px、256〜2048)',
+    'label.steps': 'ステップ数',
+    'label.seed': 'seed (空欄でランダム)',
+    'label.upscale': '2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ・約3.6倍時間)',
+    'settings.instantTitle': '即反映設定(生成のたびに反映・再ロード不要)',
+    'label.turbo': 'Turbo LoRA(4ステップ推奨・lightx2v蒸留)',
+    'btn.generate': '生成',
+    'btn.generating': '生成中...',
+    'hint.generate': '蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。',
+    'status.checkingServer': 'サーバ状態を確認中...',
+    'reload.summary': '再ロードが必要な設定(transformer量子化・TE量子化・低VRAMモード等)',
+    'label.transformerQuant': 'transformer 量子化',
+    'label.teQuant': 'text_encoder 量子化',
+    'label.tePrune': 'TEレイヤー削除(51/64層のみ構築)',
+    'label.lowvram': '低VRAMモード',
+    'option.lowvram0': '0 (無効・48GB超級)',
+    'option.lowvram1': '1 (48GB級・per-request reload)',
+    'option.lowvramGroup': 'group (24-32GB級・group offload常駐)',
+    'label.videoVaeFp16': 'video VAE を fp16 化(実験的)',
+    'btn.reloadApply': '適用(再ロード)',
+    'btn.reloadApplying': '適用中(再ロード)...',
+    'reload.noChange': '変更なし',
+    'result.heading': '結果',
+    'result.placeholder': 'まだ生成していません',
+    'gallery.heading': '生成済み動画・静止画',
+    'gallery.hint': '連結順は「チェックした順」です(ギャラリー表示順は新しい順)。静止画(PNG)は連結対象外。',
+    'btn.selectAll': '全選択',
+    'btn.selectNone': '全解除',
+    'btn.deleteSelected': '選択を削除',
+    'btn.concatSelected': '選択を連結',
+    'btn.concatenating': '連結中...',
+    'btn.refresh': '再読込',
+    'gallery.selected': '{n}件選択',
+    'gallery.loading': '読み込み中...',
+    'gallery.empty': '生成済み動画はまだありません',
+    'gallery.fetchError': '一覧の取得に失敗しました',
+    'gallery.resUnknown': '解像度不明',
+    'gallery.stillImage': '静止画',
+    'gallery.deleteConfirm': '{n}件のファイルを削除します。この操作は取り消せません。よろしいですか?',
+    'gallery.deleteError': '削除に失敗しました: {msg}',
+    'gallery.concatError': '連結に失敗しました: {msg}',
+    'gallery.concatCannotImage': '静止画(PNG)は連結できません',
+    'ref.deleteTitle': 'この参照を削除(以降の参照名は自動で振り直されます)',
+    'ref.orderLine': '参照順(rotary配置順): {order}',
+    'ref.rejectedUnknown': '種別不明',
+    'ref.rejectedTotalLimit': '計12まで',
+    'ref.rejectedKindLimit': '{kind}は最大{limit}',
+    'ref.rejectedPrefix': '上限のため追加できませんでした: {list}',
+    'err.enterPromptFirst': '先にプロンプトを入力してください',
+    'err.enterPrompt': 'プロンプトを入力してください',
+    'err.addReference': '参照ファイルを1つ以上追加してください',
+    'err.batchVideoNeedsSeconds': 'バッチ動画生成には秒数の指定が必要です(全場面共通)',
+    'err.enhance': 'LLM強化エラー: {msg}',
+    'err.generic': 'エラー: {msg}',
+    'status.enhanceUndone': '強化前のプロンプトに戻しました',
+    'status.enhanceDone': 'LLM強化完了 ({mode}, {sec}s',
+    'status.enhanceRepaired': ', 自動修復 {n}回目',
+    'status.enhanceIssue': ' — 未解決の指摘があります:\n{report}',
+    'status.enhanceReview': ' — 内容を確認・編集してから生成してください',
+    'status.serverFetchError': 'サーバ状態の取得に失敗しました',
+    'status.settingsFetchError': '設定の取得に失敗しました',
+    'status.requestSending': 'リクエスト送信中...',
+    'status.done': '完了',
+    'reload.changedHint': '変更: {fields} — 適用には目安 約{eta}秒(モデル解放+再ロード)',
+    'reload.applying': 'モデルを解放して新設定でロード中です。しばらくお待ちください...',
+    'reload.applied': '適用完了 ({sec}s, 変更: {fields})',
+    'reload.none': 'なし',
+    'reload.error': 'エラー: {msg}',
+    'result.mode': 'モード',
+    'result.reference': '参照',
+    'result.audioTagged': '(音声付)',
+    'result.alt.generatedImage': '生成された静止画',
+    'result.dl.png': 'PNGをダウンロード',
+    'result.dl.origMp4': '元の超短尺mp4',
+    'result.dl.mp4': 'mp4をダウンロード',
+    'result.resolution': '解像度',
+    'result.duration': '長さ',
+    'result.frames': '{n}フレーム',
+    'result.stillFrameIndex': '、PNGは中央フレーム #{idx}',
+    'result.steps': 'ステップ',
+    'result.denoiseTime': 'デノイズ時間',
+    'result.decode': 'デコード',
+    'result.totalTime': '合計時間',
+    'result.peakVram': 'ピークVRAM',
+    'result.audio': '音声',
+    'result.instantSettings': '即反映設定',
+    'result.usedPromptSummary': '使用したプロンプト全文(比較評価用)',
+    'result.batchMode': 'モード',
+    'result.numScenes': '{n}場面',
+    'result.perImage': '1枚あたり',
+    'result.total': '合計',
+    'result.frameCount': 'フレーム数',
+    'result.phaseBreakdown': '位相内訳',
+    'result.encode': 'エンコード',
+    'result.denoise': 'デノイズ',
+    'result.scene': '場面 {n}',
+    'result.altScene': '場面 {n}',
+    'result.concatResult': '連結結果',
+    'result.method': '方式',
+    'result.methodLossless': '無劣化連結(-c copy)',
+    'result.methodReencode': '再エンコード連結',
+    'result.inputsOrder': '入力(連結順)',
+    'turbo.incompatible.lowvramGroup': 'group offload と turbo の併用は未検証のため無効化しています(LoRAバッファがoffload辞書から欠落するリスク。lowvram=1ならturboを使えます)',
+    'turbo.incompatible.lowvram': '低VRAMモード(lowvram={lowvram})と comfy形式 turbo LoRA の組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています',
+    'turbo.incompatible.bothResident': 'transformer/transformer_ref 両方常駐(int8)と comfy形式 turbo LoRA の組み合わせは実測で不可のため無効化しています',
+    'hint.turboDisablesCache': 'turbo有効時はFirstBlockCacheが自動的に無効化されます',
+    'size.actualSize': '実際の生成サイズ: 幅{w}×高さ{h}',
+    'size.rounded': '(入力値を{multiple}の倍数へ丸め)',
+    'size.overNative': ' ※ネイティブ範囲(最大{max})超え・VRAMと品質は未検証',
+    'size.actualDuration': '実際の尺: {n}フレーム ({dur}秒 @{fps}fps、{step}n+{offset}へ切り上げ)',
+  },
+  en: {
+    'app.title': 'MiniMax-H3 Test App',
+    'app.subtitle': 'Omni-modal video + stereo audio generation (33B, diffusers Modular Pipeline) — port 8611',
+    'tab.group.video': 'Video',
+    'tab.group.still': 'Still',
+    'tab.t2va.sub': '(Text)',
+    'tab.fl2va.sub': '(Frame)',
+    'tab.ref2va.sub': '(Reference)',
+    'label.prompt': 'Prompt',
+    'hint.prompt.placeholder': 'e.g. In the sunset, a golden retriever puppy runs across the lawn chasing a ball. The camera follows from a low angle. Leaves rustle in the wind, birds chirp, the puppy barks happily.',
+    'label.enhanceMode': 'Enhance mode',
+    'label.enhanceLang': 'Output language',
+    'enhance.mode.storyboard': 'Storyboard (cut breakdown)',
+    'enhance.mode.brief': 'Brief detailing (single shot)',
+    'enhance.mode.official': 'Official spec (h3-prompt-writing)',
+    'enhance.mode.translate': 'Translation only',
+    'enhance.lang.en': 'English (official default)',
+    'enhance.lang.ja': 'Japanese',
+    'btn.enhance': 'LLM Enhance',
+    'btn.enhancing': 'Enhancing...',
+    'btn.undo': 'Undo',
+    'hint.enhance.storyboard': 'LLM enhancement formats your text into the official H3 guide format using a local gemma (H3_LLM_URL). You can edit the result before generating.',
+    'hint.enhance.brief': 'LLM enhancement formats your text into the official H3 guide format using a local gemma (H3_LLM_URL). You can edit the result before generating.',
+    'hint.enhance.translate': 'LLM enhancement formats your text into the official H3 guide format using a local gemma (H3_LLM_URL). You can edit the result before generating.',
+    'hint.enhance.official': 'Strictly follows the field structure and notation of the official MiniMax h3-prompt-writing skill (SKILL.md + references). The currently selected tab (T2VA/FL2VA/Ref2VA) is sent as the task. If skills_cache/ hasn\'t been fetched yet, you\'ll get an error prompting you to run scripts/fetch_h3_skill.py.',
+    'guide.summary': 'Prompt guide (cheat sheet for manual writing)',
+    'guide.body': '<b>Official brief structure (playback order):</b> Scene → Subject → Action → Camera → Sound intent → Ending. Limit 7,000 characters. Japanese OK.<br>' +
+      '<b>Multi-shot (field-verified):</b> Use timecode blocks like <code>CUT 1 [0-5s]: …</code> <code>CUT 2 [5-10s]: hard cut to…</code> ' +
+      'to perform cuts within a single clip. Cut position accuracy is about ±1 second.<br>' +
+      '<b>Camera:</b> Shot size (long/medium/close-up) + focal length (35/50/65/100mm) + ' +
+      'camera movement (static/pan/push-in/tracking).<br>' +
+      '<b>Sound:</b> Write the intent of ambience, sound effects, and dialogue per shot (it\'s generated alongside the video, so treat it as equal in importance to the visuals).',
+    'label.firstFrame': 'First frame image (image, optional)',
+    'label.lastFrame': 'Last frame image (last_image, optional)',
+    'hint.dropzone': 'Drag & drop, or click to select',
+    'hint.dropzoneMulti': 'Drag & drop, or click to select (multiple allowed, added to the list)',
+    'hint.filesCount': '{n} file(s): ',
+    'btn.clear': 'Clear',
+    'hint.fl2vaFrames': 'Either one alone is fine. Providing both generates the frames between the first and last.',
+    'label.t2iFrames': 'Frame count (generates an ultra-short video and exports the center frame as PNG)',
+    'option.frames22': '22 frames (0.92s, quality-verified default)',
+    'option.frames22ref': '22 frames (0.92s, verified)',
+    'option.frames5': '5 frames (0.21s, experimental)',
+    'label.t2iBatch': 'Batch generation (prompt: <b>1 line = 1 scene</b>, up to 24 scenes)',
+    'hint.t2i': 'A mode for producing <b>stills that match H3\'s look exactly</b>, for use as FL2VA first frames or Ref2VA reference images. ' +
+      'Generation time is dominated by fixed costs, so it\'s slower than a dedicated T2I model. An ultra-short mp4 is saved alongside it, ' +
+      'and the PNG is the center frame (you can extract a different frame from the mp4 if needed). ' +
+      'Batch mode amortizes model loading across all scenes (especially effective in low-VRAM mode; ' +
+      'seed, resolution, and steps are shared across all scenes).',
+    'label.refFiles': 'Reference files (references — up to 9 images, 3 videos, 3 audio, 12 total)',
+    'hint.refFiles': '<b>The order you add files is the reference order.</b> Each reference can be referred to in the prompt by the ' +
+      'name shown on its tile below (&lt;Picture i&gt;/&lt;Video k&gt;/&lt;Audio j&gt;, numbered from 1 per kind). ' +
+      'If there\'s exactly one reference with audio (a standalone audio file or a video with audio), you can leave the ' +
+      'seconds field below blank to use that audio\'s length as the generated duration.',
+    'ref.kind.image': 'Image',
+    'ref.kind.video': 'Video',
+    'ref.kind.audioMusic': 'Audio/Music',
+    'label.ref2iFrames': 'Frame count (ultra-short → center frame PNG)',
+    'label.ref2vaBatch': 'Batch generation (prompt: <b>1 line = 1 scene</b>, up to 24 scenes. References, seed, and duration are shared across all scenes)',
+    'hint.ref2iStill': 'A mode for producing <b>per-scene consistent stills</b> from character references (references, seed, ' +
+      'and resolution are shared across all scenes). Seconds is not used. The stills you create can be reused as FL2VA first ' +
+      'frames or as references for the next Ref2VA.',
+    'label.resolution': 'Resolution (width×height)',
+    'option.res.square': '768×768 (square)',
+    'option.res.landscape': '1344×768 (landscape)',
+    'option.res.portrait': '768×1344 (portrait)',
+    'option.res.custom': 'Custom (rounded to a multiple of 32)',
+    'option.res.auto': 'Auto (server default / 16:9 for Ref2VA)',
+    'label.seconds': 'Duration in seconds (5–15; may be left blank for Ref2VA with a single audio reference)',
+    'label.customWidth': 'Width (px, 256–2048)',
+    'label.customHeight': 'Height (px, 256–2048)',
+    'label.steps': 'Steps',
+    'label.seed': 'Seed (blank for random)',
+    'label.upscale': '2x latent upscale (generate at 768², finish at 1536². T2VA only, ~3.6x time)',
+    'settings.instantTitle': 'Instant-apply settings (applied on every generation, no reload needed)',
+    'label.turbo': 'Turbo LoRA (4 steps recommended, lightx2v distillation)',
+    'btn.generate': 'Generate',
+    'btn.generating': 'Generating...',
+    'hint.generate': 'No CFG needed since this is a distilled model. Default is 50 steps, but 30 is set here as the default for testing.',
+    'status.checkingServer': 'Checking server status...',
+    'reload.summary': 'Settings that require a reload (transformer quantization, TE quantization, low-VRAM mode, etc.)',
+    'label.transformerQuant': 'transformer quantization',
+    'label.teQuant': 'text_encoder quantization',
+    'label.tePrune': 'Prune TE layers (build only 51/64 layers)',
+    'label.lowvram': 'Low-VRAM mode',
+    'option.lowvram0': '0 (disabled, 48GB+ class)',
+    'option.lowvram1': '1 (48GB class, per-request reload)',
+    'option.lowvramGroup': 'group (24-32GB class, group offload resident)',
+    'label.videoVaeFp16': 'Use fp16 for video VAE (experimental)',
+    'btn.reloadApply': 'Apply (reload)',
+    'btn.reloadApplying': 'Applying (reload)...',
+    'reload.noChange': 'No changes',
+    'result.heading': 'Result',
+    'result.placeholder': 'Nothing generated yet',
+    'gallery.heading': 'Generated videos & stills',
+    'gallery.hint': 'Concatenation order follows the order you checked items (gallery display order is newest first). Stills (PNG) are excluded from concatenation.',
+    'btn.selectAll': 'Select all',
+    'btn.selectNone': 'Deselect all',
+    'btn.deleteSelected': 'Delete selected',
+    'btn.concatSelected': 'Concatenate selected',
+    'btn.concatenating': 'Concatenating...',
+    'btn.refresh': 'Refresh',
+    'gallery.selected': '{n} selected',
+    'gallery.loading': 'Loading...',
+    'gallery.empty': 'No generated videos yet',
+    'gallery.fetchError': 'Failed to fetch the list',
+    'gallery.resUnknown': 'resolution unknown',
+    'gallery.stillImage': 'Still',
+    'gallery.deleteConfirm': 'This will delete {n} file(s). This cannot be undone. Continue?',
+    'gallery.deleteError': 'Failed to delete: {msg}',
+    'gallery.concatError': 'Failed to concatenate: {msg}',
+    'gallery.concatCannotImage': 'Stills (PNG) cannot be concatenated',
+    'ref.deleteTitle': 'Remove this reference (later reference names will be renumbered automatically)',
+    'ref.orderLine': 'Reference order (rotary placement order): {order}',
+    'ref.rejectedUnknown': 'unknown type',
+    'ref.rejectedTotalLimit': 'max 12 total',
+    'ref.rejectedKindLimit': '{kind} max is {limit}',
+    'ref.rejectedPrefix': 'Could not add (limit reached): {list}',
+    'err.enterPromptFirst': 'Please enter a prompt first',
+    'err.enterPrompt': 'Please enter a prompt',
+    'err.addReference': 'Please add at least one reference file',
+    'err.batchVideoNeedsSeconds': 'Batch video generation requires a duration (shared across all scenes)',
+    'err.enhance': 'LLM enhancement error: {msg}',
+    'err.generic': 'Error: {msg}',
+    'status.enhanceUndone': 'Reverted to the prompt before enhancement',
+    'status.enhanceDone': 'LLM enhancement complete ({mode}, {sec}s',
+    'status.enhanceRepaired': ', auto-repaired attempt {n}',
+    'status.enhanceIssue': ' — there are unresolved issues:\n{report}',
+    'status.enhanceReview': ' — review and edit the content before generating',
+    'status.serverFetchError': 'Failed to fetch server status',
+    'status.settingsFetchError': 'Failed to fetch settings',
+    'status.requestSending': 'Sending request...',
+    'status.done': 'Done',
+    'reload.changedHint': 'Changed: {fields} — estimated ~{eta}s to apply (unload model + reload)',
+    'reload.applying': 'Unloading the model and loading with the new settings. Please wait...',
+    'reload.applied': 'Applied ({sec}s, changed: {fields})',
+    'reload.none': 'none',
+    'reload.error': 'Error: {msg}',
+    'result.mode': 'Mode',
+    'result.reference': 'References',
+    'result.audioTagged': ' (has audio)',
+    'result.alt.generatedImage': 'Generated still image',
+    'result.dl.png': 'Download PNG',
+    'result.dl.origMp4': 'Original ultra-short mp4',
+    'result.dl.mp4': 'Download mp4',
+    'result.resolution': 'Resolution',
+    'result.duration': 'Duration',
+    'result.frames': '{n} frames',
+    'result.stillFrameIndex': ', PNG is the center frame #{idx}',
+    'result.steps': 'Steps',
+    'result.denoiseTime': 'Denoise time',
+    'result.decode': 'Decode',
+    'result.totalTime': 'Total time',
+    'result.peakVram': 'Peak VRAM',
+    'result.audio': 'Audio',
+    'result.instantSettings': 'Instant-apply settings',
+    'result.usedPromptSummary': 'Full prompt used (for comparison)',
+    'result.batchMode': 'Mode',
+    'result.numScenes': '{n} scenes',
+    'result.perImage': 'Per image',
+    'result.total': 'Total',
+    'result.frameCount': 'Frame count',
+    'result.phaseBreakdown': 'Phase breakdown',
+    'result.encode': 'Encode',
+    'result.denoise': 'Denoise',
+    'result.scene': 'Scene {n}',
+    'result.altScene': 'Scene {n}',
+    'result.concatResult': 'Concatenation result',
+    'result.method': 'Method',
+    'result.methodLossless': 'Lossless concatenation (-c copy)',
+    'result.methodReencode': 'Re-encoded concatenation',
+    'result.inputsOrder': 'Inputs (concatenation order)',
+    'turbo.incompatible.lowvramGroup': 'Disabled because group offload + turbo is unverified (risk of the LoRA buffer being missing from the offload dict; you can use turbo with lowvram=1)',
+    'turbo.incompatible.lowvram': 'Disabled because low-VRAM mode (lowvram={lowvram}) combined with the comfy-format turbo LoRA is known not to work (Int8Tensor does not support aten.cat)',
+    'turbo.incompatible.bothResident': 'Disabled because having both transformer/transformer_ref resident (int8) combined with the comfy-format turbo LoRA is known not to work',
+    'hint.turboDisablesCache': 'FirstBlockCache is automatically disabled while turbo is enabled',
+    'size.actualSize': 'Actual generation size: {w}×{h} (width×height)',
+    'size.rounded': ' (input rounded to a multiple of {multiple})',
+    'size.overNative': ' * Exceeds the native range (max {max}) — VRAM usage and quality are unverified',
+    'size.actualDuration': 'Actual duration: {n} frames ({dur}s @{fps}fps, rounded up to {step}n+{offset})',
+  },
+};
+let lang = localStorage.getItem('h3_lang') || (navigator.language.startsWith('ja') ? 'ja' : 'en');
+function t(key, vars) {
+  let s = (I18N[lang] && I18N[lang][key]) ?? (I18N.ja[key] ?? key);
+  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replaceAll('{' + k + '}', v);
+  return s;
+}
+function applyI18n() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll('[data-i18n-html]').forEach(el => { el.innerHTML = t(el.dataset.i18nHtml); });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => { el.placeholder = t(el.dataset.i18nPlaceholder); });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => { el.title = t(el.dataset.i18nTitle); });
+  document.querySelectorAll('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === lang));
+}
+
 const form = document.getElementById('gen-form');
 const promptEl = document.getElementById('prompt');
 const resolutionEl = document.getElementById('resolution');
@@ -819,13 +1228,13 @@ function turboIncompatibleReason() {
   const c = CURRENT_SETTINGS.constraints || {};
   const r = CURRENT_SETTINGS.reload || {};
   if (c.turbo_incompatible_with_lowvram_group && r.lowvram === 'group') {
-    return 'group offload と turbo の併用は未検証のため無効化しています(LoRAバッファがoffload辞書から欠落するリスク。lowvram=1ならturboを使えます)';
+    return t('turbo.incompatible.lowvramGroup');
   }
   if (c.turbo_incompatible_with_lowvram && r.lowvram && r.lowvram !== '0') {
-    return `低VRAMモード(lowvram=${r.lowvram})と comfy形式 turbo LoRA の組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています`;
+    return t('turbo.incompatible.lowvram', { lowvram: r.lowvram });
   }
   if (c.turbo_incompatible_with_transformer_both_resident && c.transformer_both_resident) {
-    return 'transformer/transformer_ref 両方常駐(int8)と comfy形式 turbo LoRA の組み合わせは実測で不可のため無効化しています';
+    return t('turbo.incompatible.bothResident');
   }
   return null;
 }
@@ -847,7 +1256,7 @@ function updateTurboAvailability() {
 
 function updateInstantHint() {
   const parts = [];
-  if (turboEnabledEl.checked) parts.push('turbo有効時はFirstBlockCacheが自動的に無効化されます');
+  if (turboEnabledEl.checked) parts.push(t('hint.turboDisablesCache'));
   instantHintEl.textContent = parts.join(' / ');
 }
 
@@ -901,19 +1310,19 @@ function updateSizeEffectLine() {
   if (resolutionEl.value === 'custom') {
     const w = roundCanvasValue(customWidthEl.value);
     const h = roundCanvasValue(customHeightEl.value);
-    let sizeText = `実際の生成サイズ: 幅${w}×高さ${h}`;
+    let sizeText = t('size.actualSize', { w, h });
     if (Number(customWidthEl.value) !== w || Number(customHeightEl.value) !== h) {
-      sizeText += `(入力値を${H3_CONSTRAINTS.canvas_multiple}の倍数へ丸め)`;
+      sizeText += t('size.rounded', { multiple: H3_CONSTRAINTS.canvas_multiple });
     }
     if (Math.max(w, h) > H3_CONSTRAINTS.canvas_native_max) {
-      sizeText += ` ※ネイティブ範囲(最大${H3_CONSTRAINTS.canvas_native_max})超え・VRAMと品質は未検証`;
+      sizeText += t('size.overNative', { max: H3_CONSTRAINTS.canvas_native_max });
     }
     parts.push(sizeText);
   }
   if (secondsEl.value) {
     const n = secondsToNumFrames(secondsEl.value);
     const dur = (n / H3_CONSTRAINTS.fps).toFixed(2);
-    parts.push(`実際の尺: ${n}フレーム (${dur}秒 @${H3_CONSTRAINTS.fps}fps、${H3_CONSTRAINTS.frame_step}n+${H3_CONSTRAINTS.frame_offset}へ切り上げ)`);
+    parts.push(t('size.actualDuration', { n, dur, fps: H3_CONSTRAINTS.fps, step: H3_CONSTRAINTS.frame_step, offset: H3_CONSTRAINTS.frame_offset }));
   }
   sizeEffectLineEl.textContent = parts.join(' / ');
 }
@@ -1006,19 +1415,25 @@ function refKindCounts() {
   return c;
 }
 
+// 内部の kind キー ('画像'/'動画'/'音声') は表示用ラベルではなく、ロジック用の
+// 固定識別子として扱う(REF_LIMITS 等のオブジェクトキー)。ユーザーに見せる文言は
+// この対応表経由で t() を通す。
+const REF_KIND_I18N_KEY = { '画像': 'ref.kind.image', '動画': 'ref.kind.video', '音声': 'ref.kind.audioMusic' };
+function refKindLabelText(kind) { return t(REF_KIND_I18N_KEY[kind] || kind); }
+
 function addRefFiles(files) {
   const rejected = [];
   const counts = refKindCounts();
   for (const f of files) {
     const kind = _refKindLabel(f);
-    if (kind === '不明') { rejected.push(`${f.name}(種別不明)`); continue; }
-    if (refItems.length >= REF_TOTAL_LIMIT) { rejected.push(`${f.name}(計12まで)`); continue; }
-    if (counts[kind] >= REF_LIMITS[kind]) { rejected.push(`${f.name}(${kind}は最大${REF_LIMITS[kind]})`); continue; }
+    if (kind === '不明') { rejected.push(`${f.name}(${t('ref.rejectedUnknown')})`); continue; }
+    if (refItems.length >= REF_TOTAL_LIMIT) { rejected.push(`${f.name}(${t('ref.rejectedTotalLimit')})`); continue; }
+    if (counts[kind] >= REF_LIMITS[kind]) { rejected.push(`${f.name}(${t('ref.rejectedKindLimit', { kind: refKindLabelText(kind), limit: REF_LIMITS[kind] })})`); continue; }
     counts[kind]++;
     refItems.push({ file: f, kind, url: URL.createObjectURL(f) });
   }
   if (rejected.length) {
-    setStatus('上限のため追加できませんでした: ' + rejected.join(', '), true);
+    setStatus(t('ref.rejectedPrefix', { list: rejected.join(', ') }), true);
   }
   renderRefItems();
 }
@@ -1082,7 +1497,7 @@ function renderRefItems() {
     del.type = 'button';
     del.className = 'ref-del';
     del.textContent = '×';
-    del.title = 'この参照を削除(以降の参照名は自動で振り直されます)';
+    del.title = t('ref.deleteTitle');
     del.addEventListener('click', () => removeRefItem(idx));
 
     tile.appendChild(thumb);
@@ -1100,7 +1515,7 @@ function renderRefItems() {
   // 上限到達時はD&Dエリア自体を出さない
   refDropzoneEl.style.display = refItems.length >= REF_TOTAL_LIMIT ? 'none' : 'flex';
   refOrderLineEl.textContent = refItems.length
-    ? '参照順(rotary配置順): ' + orderParts.join(' → ')
+    ? t('ref.orderLine', { order: orderParts.join(' → ') })
     : '';
 }
 
@@ -1113,7 +1528,9 @@ function setupDropzone(zoneId, inputEl, opts) {
   if (!zone || !inputEl) return;
   const textEl = zone.querySelector('.dropzone-text');
   const clearBtn = zone.querySelector('.dropzone-clear');
-  const placeholder = textEl.textContent;
+  // プレースホルダは data-i18n 経由で描画されるため、キャッシュせず毎回 t() で引く
+  // (言語切替後の再描画でも正しい文言になるように)。
+  const placeholderKey = textEl.dataset.i18n;
   const multiple = !!(opts && opts.multiple);
 
   function setFiles(files) {
@@ -1126,13 +1543,13 @@ function setupDropzone(zoneId, inputEl, opts) {
   function refresh() {
     const files = Array.from(inputEl.files || []);
     if (!files.length) {
-      textEl.textContent = placeholder;
+      textEl.textContent = t(placeholderKey);
       textEl.classList.remove('filled');
       clearBtn.style.display = 'none';
       return;
     }
     textEl.textContent = multiple
-      ? `${files.length}件: ` + files.map(f => f.name).join(', ')
+      ? t('hint.filesCount', { n: files.length }) + files.map(f => f.name).join(', ')
       : files[0].name;
     textEl.classList.add('filled');
     clearBtn.style.display = '';
@@ -1207,26 +1624,26 @@ const enhanceBtn = document.getElementById('enhance-btn');
 const undoBtn = document.getElementById('undo-btn');
 let promptBackup = null;
 
-const ENHANCE_HINTS = {
-  'storyboard': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
-  'brief': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
-  'translate': 'LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。',
-  'h3-official': 'MiniMax公式 h3-prompt-writing スキル(SKILL.md + references)のフィールド構造・記法に厳密準拠します。現在選択中のタブ(T2VA/FL2VA/Ref2VA)を task として送ります。skills_cache/ 未取得の場合は scripts/fetch_h3_skill.py の実行を促すエラーになります。',
+const ENHANCE_HINT_KEYS = {
+  'storyboard': 'hint.enhance.storyboard',
+  'brief': 'hint.enhance.brief',
+  'translate': 'hint.enhance.translate',
+  'h3-official': 'hint.enhance.official',
 };
 
 function updateEnhanceModeUI() {
   const isOfficial = enhanceModeEl.value === 'h3-official';
   enhanceLangEl.style.display = isOfficial ? '' : 'none';
-  enhanceHintEl.textContent = ENHANCE_HINTS[enhanceModeEl.value] || ENHANCE_HINTS['storyboard'];
+  enhanceHintEl.textContent = t(ENHANCE_HINT_KEYS[enhanceModeEl.value] || ENHANCE_HINT_KEYS['storyboard']);
 }
 enhanceModeEl.addEventListener('change', updateEnhanceModeUI);
 updateEnhanceModeUI();
 
 enhanceBtn.addEventListener('click', async () => {
   const text = promptEl.value.trim();
-  if (!text) { setStatus('先にプロンプトを入力してください', true); return; }
+  if (!text) { setStatus(t('err.enterPromptFirst'), true); return; }
   enhanceBtn.disabled = true;
-  enhanceBtn.textContent = '強化中...';
+  enhanceBtn.textContent = t('btn.enhancing');
   try {
     const fd = new FormData();
     fd.append('text', text);
@@ -1245,22 +1662,22 @@ enhanceBtn.addEventListener('click', async () => {
     undoBtn.style.display = '';
     // h3-official は検証+修復ループ付き (core/prompt_check.py)。残った違反・警告は
     // ここで見せる。生成はブロックしない — プロンプトは編集可能なので人間が最終ゲート。
-    let msg = `LLM強化完了 (${data.mode}, ${data.elapsed_s.toFixed(1)}s`;
-    if (data.repaired) msg += `, 自動修復 ${data.attempts}回目`;
+    let msg = t('status.enhanceDone', { mode: data.mode, sec: data.elapsed_s.toFixed(1) });
+    if (data.repaired) msg += t('status.enhanceRepaired', { n: data.attempts });
     msg += ')';
     const hasIssue = (data.violations && data.violations.length) || (data.warnings && data.warnings.length);
     if (hasIssue) {
-      msg += ` — 未解決の指摘があります:\n${data.check_report}`;
+      msg += t('status.enhanceIssue', { report: data.check_report });
     } else {
-      msg += ' — 内容を確認・編集してから生成してください';
+      msg += t('status.enhanceReview');
     }
     setStatus(msg, false);
     statusBox.style.whiteSpace = 'pre-wrap';
   } catch (e) {
-    setStatus('LLM強化エラー: ' + e.message, true);
+    setStatus(t('err.enhance', { msg: e.message }), true);
   } finally {
     enhanceBtn.disabled = false;
-    enhanceBtn.textContent = 'LLM強化';
+    enhanceBtn.textContent = t('btn.enhance');
   }
 });
 
@@ -1269,7 +1686,7 @@ undoBtn.addEventListener('click', () => {
     promptEl.value = promptBackup;
     promptBackup = null;
     undoBtn.style.display = 'none';
-    setStatus('強化前のプロンプトに戻しました');
+    setStatus(t('status.enhanceUndone'));
   }
 });
 
@@ -1321,7 +1738,7 @@ async function refreshServerStatus() {
       `GPU alloc: ${r.gpu.allocated_gb ?? '-'}GB / peak: ${r.gpu.peak_gb ?? '-'}GB | ` +
       `RAM avail: ${r.ram.avail_gb}GB / swap used: ${r.ram.swap_used_gb}GB`;
   } catch (e) {
-    serverStatusEl.textContent = 'サーバ状態の取得に失敗しました';
+    serverStatusEl.textContent = t('status.serverFetchError');
   }
 }
 refreshServerStatus();
@@ -1360,7 +1777,7 @@ async function loadSettings() {
     const data = await res.json();
     applySettingsToControls(data);
   } catch (e) {
-    reloadHintEl.textContent = '設定の取得に失敗しました';
+    reloadHintEl.textContent = t('status.settingsFetchError');
   }
 }
 loadSettings();
@@ -1395,20 +1812,20 @@ function updateReloadApplyState() {
   const changed = reloadChangedFields();
   if (!changed.length) {
     reloadApplyBtn.disabled = true;
-    reloadHintEl.textContent = '変更なし';
+    reloadHintEl.textContent = t('reload.noChange');
     reloadHintEl.classList.remove('warn');
     return;
   }
   reloadApplyBtn.disabled = false;
   const etaMax = Math.max(...changed.map(f => RELOAD_ETA_S[f] || 30));
-  reloadHintEl.textContent = `変更: ${changed.join(', ')} — 適用には目安 約${etaMax}秒(モデル解放+再ロード)`;
+  reloadHintEl.textContent = t('reload.changedHint', { fields: changed.join(', '), eta: etaMax });
   reloadHintEl.classList.add('warn');
 }
 
 reloadApplyBtn.addEventListener('click', async () => {
   reloadApplyBtn.disabled = true;
-  reloadApplyBtn.textContent = '適用中(再ロード)...';
-  reloadHintEl.textContent = 'モデルを解放して新設定でロード中です。しばらくお待ちください...';
+  reloadApplyBtn.textContent = t('btn.reloadApplying');
+  reloadHintEl.textContent = t('reload.applying');
   const fd = new FormData();
   fd.append('transformer_quant', reloadTransformerQuantEl.value);
   fd.append('te_quant', reloadTeQuantEl.value);
@@ -1421,14 +1838,14 @@ reloadApplyBtn.addEventListener('click', async () => {
     if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
     RELOAD_TOUCHED = false;
     applySettingsToControls(data);
-    reloadHintEl.textContent = `適用完了 (${data.reload_time_s}s, 変更: ${(data.changed_fields || []).join(', ') || 'なし'})`;
+    reloadHintEl.textContent = t('reload.applied', { sec: data.reload_time_s, fields: (data.changed_fields || []).join(', ') || t('reload.none') });
     reloadHintEl.classList.remove('warn');
     refreshServerStatus();
   } catch (e) {
-    reloadHintEl.textContent = 'エラー: ' + e.message;
+    reloadHintEl.textContent = t('reload.error', { msg: e.message });
     reloadHintEl.classList.add('warn');
   } finally {
-    reloadApplyBtn.textContent = '適用(再ロード)';
+    reloadApplyBtn.textContent = t('btn.reloadApply');
     updateReloadApplyState();
   }
 });
@@ -1437,15 +1854,15 @@ form.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const prompt = promptEl.value.trim();
   if (!prompt) {
-    setStatus('プロンプトを入力してください', true);
+    setStatus(t('err.enterPrompt'), true);
     return;
   }
 
   generateBtn.disabled = true;
-  generateBtn.textContent = '生成中...';
+  generateBtn.textContent = t('btn.generating');
   progressOuter.style.display = 'block';
   progressInner.style.width = '0%';
-  setStatus('リクエスト送信中...');
+  setStatus(t('status.requestSending'));
   startPolling();
 
   const fd = new FormData();
@@ -1505,9 +1922,9 @@ form.addEventListener('submit', async (ev) => {
     // frames/seconds の送り分けだけが違う (バッチ時のみ専用エンドポイントへ)。
     url = '/api/ref2va';
     if (!refItems.length) {
-      setStatus('参照ファイルを1つ以上追加してください', true);
+      setStatus(t('err.addReference'), true);
       generateBtn.disabled = false;
-      generateBtn.textContent = '生成';
+      generateBtn.textContent = t('btn.generate');
       if (polling) { clearInterval(polling); polling = null; }
       return;
     }
@@ -1537,9 +1954,9 @@ form.addEventListener('submit', async (ev) => {
       if (!ref2vaStill) {
         // 動画バッチは尺が全場面共通で必須 (音声参照からの尺導出は使えない)
         if (!secondsEl.value) {
-          setStatus('バッチ動画生成には秒数の指定が必要です(全場面共通)', true);
+          setStatus(t('err.batchVideoNeedsSeconds'), true);
           generateBtn.disabled = false;
-          generateBtn.textContent = '生成';
+          generateBtn.textContent = t('btn.generate');
           if (polling) { clearInterval(polling); polling = null; }
           return;
         }
@@ -1560,50 +1977,57 @@ form.addEventListener('submit', async (ev) => {
     if (!res.ok) {
       throw new Error(data.detail || JSON.stringify(data));
     }
-    setStatus('完了');
+    setStatus(t('status.done'));
     progressInner.style.width = '100%';
     if (['t2i_batch', 'ref2i_batch', 'ref2va_batch'].includes(data.mode)) renderBatchResult(data); else renderResult(data);
     refreshGallery();
   } catch (e) {
-    setStatus('エラー: ' + e.message, true);
+    setStatus(t('err.generic', { msg: e.message }), true);
   } finally {
     generateBtn.disabled = false;
-    generateBtn.textContent = '生成';
+    generateBtn.textContent = t('btn.generate');
     if (polling) { clearInterval(polling); polling = null; }
     refreshServerStatus();
   }
 });
 
+// 言語切替時に直近の結果を同じ描画関数で作り直せるよう、最後に描画したデータと
+// 種別 (single/batch) を保持しておく。
+let lastResultData = null;
+let lastResultKind = null;
+
 function renderResult(data) {
+  lastResultData = data;
+  lastResultKind = 'single';
   let refsLine = '';
   if (data.references_summary) {
     const parts = data.references_summary.map(r =>
-      `${r.index + 1}.${r.kind}${r.has_audio ? '(音声付)' : ''}`
+      `${r.index + 1}.${r.kind}${r.has_audio ? t('result.audioTagged') : ''}`
     );
-    refsLine = `<div><b>参照:</b> ${parts.join(' → ')}</div>`;
+    refsLine = `<div><b>${t('result.reference')}:</b> ${parts.join(' → ')}</div>`;
   }
   // 静止画モード (t2i) は PNG を主表示にし、元の超短尺 mp4 も確認用に併置する
   const mediaHtml = data.image_url ? `
-    <img src="${data.image_url}" alt="生成された静止画" style="max-width:100%;border-radius:8px;">
-    <a class="dl-link" href="${data.image_url}" download>PNGをダウンロード</a>
-    <a class="dl-link" href="${data.video_url}" download>元の超短尺mp4</a>` : `
+    <img src="${data.image_url}" alt="${t('result.alt.generatedImage')}" style="max-width:100%;border-radius:8px;">
+    <a class="dl-link" href="${data.image_url}" download>${t('result.dl.png')}</a>
+    <a class="dl-link" href="${data.video_url}" download>${t('result.dl.origMp4')}</a>` : `
     <video controls autoplay loop src="${data.video_url}"></video>
-    <a class="dl-link" href="${data.video_url}" download>mp4をダウンロード</a>`;
+    <a class="dl-link" href="${data.video_url}" download>${t('result.dl.mp4')}</a>`;
   resultArea.innerHTML = `
     ${mediaHtml}
     <div class="result-meta">
-      <div><b>モード:</b> ${data.mode}</div>
+      <div><b>${t('result.mode')}:</b> ${data.mode}</div>
       ${refsLine}
-      <div><b>解像度:</b> ${data.width}×${data.height} / <b>長さ:</b> ${data.duration_s.toFixed(2)}s (${data.num_frames}フレーム${data.still_frame_index != null ? `、PNGは中央フレーム #${data.still_frame_index}` : ''})</div>
-      <div><b>ステップ:</b> ${data.num_inference_steps} / <b>seed:</b> ${data.seed ?? '(random)'}</div>
-      <div><b>デノイズ時間:</b> ${data.denoise_time_s}s (avg ${data.avg_step_time_s}s/step) / <b>デコード:</b> ${data.decode_time_s}s</div>
-      <div><b>合計時間:</b> ${data.total_elapsed_s}s / <b>ピークVRAM:</b> ${data.peak_vram_gb}GB</div>
-      <div><b>音声:</b> rms=${data.audio_rms.toFixed(5)} peak=${data.audio_peak.toFixed(4)} @ ${data.audio_sampling_rate}Hz</div>
-      <div><b>即反映設定:</b> cache=${data.cache ?? data.cache_mode} ${data.cache === 'fbc' && data.cache_skipped_steps != null ? `(skip ${data.cache_skipped_steps}/${data.num_inference_steps})` : ''} /
+      <div><b>${t('result.resolution')}:</b> ${data.width}×${data.height} / <b>${t('result.duration')}:</b> ${data.duration_s.toFixed(2)}s (${t('result.frames', { n: data.num_frames })}${data.still_frame_index != null ? t('result.stillFrameIndex', { idx: data.still_frame_index }) : ''})</div>
+      <div><b>${t('result.steps')}:</b> ${data.num_inference_steps} / <b>seed:</b> ${data.seed ?? '(random)'}</div>
+      <div><b>${t('result.denoiseTime')}:</b> ${data.denoise_time_s}s (avg ${data.avg_step_time_s}s/step) / <b>${t('result.decode')}:</b> ${data.decode_time_s}s</div>
+      <div><b>${t('result.totalTime')}:</b> ${data.total_elapsed_s}s / <b>${t('result.peakVram')}:</b> ${data.peak_vram_gb}GB</div>
+      <div><b>${t('result.audio')}:</b> rms=${data.audio_rms.toFixed(5)} peak=${data.audio_peak.toFixed(4)} @ ${data.audio_sampling_rate}Hz</div>
+      <div><b>${t('result.instantSettings')}:</b> cache=${data.cache ?? data.cache_mode} ${data.cache === 'fbc' && data.cache_skipped_steps != null ? `(skip ${data.cache_skipped_steps}/${data.num_inference_steps})` : ''} /
         attn=${data.attn_backend} / turbo=${data.turbo ?? data.turbo_lora}</div>
     </div>
     <details class="used-prompt">
-      <summary>使用したプロンプト全文(比較評価用)</summary>
+      <summary>${t('result.usedPromptSummary')}</summary>
       <div class="used-prompt-body"></div>
     </details>
   `;
@@ -1612,12 +2036,14 @@ function renderResult(data) {
 }
 
 function renderBatchResult(data) {
+  lastResultData = data;
+  lastResultKind = 'batch';
   const head = document.createElement('div');
   head.className = 'result-meta';
   head.innerHTML = `
-    <div><b>モード:</b> t2i_batch (${data.num_scenes}場面) / <b>1枚あたり:</b> ${data.per_image_s}s / <b>合計:</b> ${data.total_elapsed_s}s</div>
-    <div><b>解像度:</b> ${data.width}×${data.height} / <b>フレーム数:</b> ${data.num_frames} / <b>ステップ:</b> ${data.num_inference_steps} / <b>seed:</b> ${data.seed ?? '(random)'}</div>
-    ${data.encode_time_s != null ? `<div><b>位相内訳:</b> エンコード ${data.encode_time_s}s / デノイズ ${data.denoise_time_s}s / デコード ${data.decode_time_s}s / ピークVRAM ${data.peak_vram_gb}GB</div>` : ''}
+    <div><b>${t('result.batchMode')}:</b> ${data.mode} (${t('result.numScenes', { n: data.num_scenes })}) / <b>${t('result.perImage')}:</b> ${data.per_image_s}s / <b>${t('result.total')}:</b> ${data.total_elapsed_s}s</div>
+    <div><b>${t('result.resolution')}:</b> ${data.width}×${data.height} / <b>${t('result.frameCount')}:</b> ${data.num_frames} / <b>${t('result.steps')}:</b> ${data.num_inference_steps} / <b>seed:</b> ${data.seed ?? '(random)'}</div>
+    ${data.encode_time_s != null ? `<div><b>${t('result.phaseBreakdown')}:</b> ${t('result.encode')} ${data.encode_time_s}s / ${t('result.denoise')} ${data.denoise_time_s}s / ${t('result.decode')} ${data.decode_time_s}s / ${t('result.peakVram')} ${data.peak_vram_gb}GB</div>` : ''}
   `;
   resultArea.innerHTML = '';
   resultArea.appendChild(head);
@@ -1629,7 +2055,7 @@ function renderBatchResult(data) {
     if (s.image_url) {
       media = document.createElement('img');
       media.src = s.image_url;
-      media.alt = `場面 ${i + 1}`;
+      media.alt = t('result.altScene', { n: i + 1 });
     } else {
       media = document.createElement('video');
       media.src = s.video_url;
@@ -1642,7 +2068,7 @@ function renderBatchResult(data) {
     const meta = document.createElement('div');
     meta.className = 'result-meta';
     const pngLink = s.image_url ? `<a class="dl-link" href="${s.image_url}" download>PNG</a> ` : '';
-    meta.innerHTML = `<div><b>場面 ${i + 1}:</b> ${pngLink}<a class="dl-link" href="${s.video_url}" download>mp4</a> / デノイズ ${s.denoise_time_s}s</div>`;
+    meta.innerHTML = `<div><b>${t('result.scene', { n: i + 1 })}:</b> ${pngLink}<a class="dl-link" href="${s.video_url}" download>mp4</a> / ${t('result.denoise')} ${s.denoise_time_s}s</div>`;
     const promptLine = document.createElement('div');
     promptLine.className = 'hint';
     promptLine.textContent = s.prompt;  // プロンプトはテキストとして安全に挿入
@@ -1688,7 +2114,7 @@ async function refreshGallery() {
     gallerySelectedOrder = gallerySelectedOrder.filter(n => names.has(n));
     renderGallery();
   } catch (e) {
-    galleryGrid.innerHTML = '<div class="gallery-empty">一覧の取得に失敗しました</div>';
+    galleryGrid.innerHTML = `<div class="gallery-empty">${t('gallery.fetchError')}</div>`;
   }
 }
 
@@ -1712,7 +2138,7 @@ const galleryLazyObserver = new IntersectionObserver((entries, obs) => {
 
 function renderGallery() {
   if (!galleryItems.length) {
-    galleryGrid.innerHTML = '<div class="gallery-empty">生成済み動画はまだありません</div>';
+    galleryGrid.innerHTML = `<div class="gallery-empty">${t('gallery.empty')}</div>`;
     updateGalleryToolbar();
     return;
   }
@@ -1773,8 +2199,8 @@ function renderGallery() {
 
     const info = document.createElement('div');
     info.className = 'gallery-info';
-    const resLine = (item.width && item.height) ? `${item.width}×${item.height}` : '解像度不明';
-    const headLine = item.type === 'image' ? '静止画' : fmtDuration(item.duration);
+    const resLine = (item.width && item.height) ? `${item.width}×${item.height}` : t('gallery.resUnknown');
+    const headLine = item.type === 'image' ? t('gallery.stillImage') : fmtDuration(item.duration);
     info.innerHTML = `
       <div class="name" title="${item.name}">${item.name}</div>
       <div>${headLine} / ${resLine} / ${fmtBytes(item.size)}</div>
@@ -1819,12 +2245,12 @@ function updateGallerySelectionUI() {
 
 function updateGalleryToolbar() {
   const n = gallerySelectedOrder.length;
-  galleryCountEl.textContent = `${n}件選択`;
+  galleryCountEl.textContent = t('gallery.selected', { n });
   galleryDeleteBtn.disabled = n === 0;
   // 静止画 (PNG) は連結不可(サーバ側 concat_outputs も mp4 以外を 400 で弾く)
   const hasImage = gallerySelectedOrder.some(name => name.toLowerCase().endsWith('.png'));
   galleryConcatBtn.disabled = n < 2 || hasImage;
-  galleryConcatBtn.title = hasImage ? '静止画(PNG)は連結できません' : '';
+  galleryConcatBtn.title = hasImage ? t('gallery.concatCannotImage') : '';
 }
 
 gallerySelectAllBtn.addEventListener('click', () => {
@@ -1846,7 +2272,7 @@ galleryRefreshBtn.addEventListener('click', refreshGallery);
 galleryDeleteBtn.addEventListener('click', async () => {
   const names = [...gallerySelectedOrder];
   if (!names.length) return;
-  const ok = window.confirm(`${names.length}件のファイルを削除します。この操作は取り消せません。よろしいですか?`);
+  const ok = window.confirm(t('gallery.deleteConfirm', { n: names.length }));
   if (!ok) return;
   galleryDeleteBtn.disabled = true;
   try {
@@ -1860,7 +2286,7 @@ galleryDeleteBtn.addEventListener('click', async () => {
     gallerySelectedOrder = [];
     await refreshGallery();
   } catch (e) {
-    alert('削除に失敗しました: ' + e.message);
+    alert(t('gallery.deleteError', { msg: e.message }));
   } finally {
     updateGalleryToolbar();
   }
@@ -1870,7 +2296,7 @@ galleryConcatBtn.addEventListener('click', async () => {
   const names = [...gallerySelectedOrder];
   if (names.length < 2) return;
   galleryConcatBtn.disabled = true;
-  galleryConcatBtn.textContent = '連結中...';
+  galleryConcatBtn.textContent = t('btn.concatenating');
   try {
     const res = await fetch('/api/outputs/concat', {
       method: 'POST',
@@ -1881,25 +2307,58 @@ galleryConcatBtn.addEventListener('click', async () => {
     if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
     resultArea.innerHTML = `
       <video controls autoplay loop src="${data.url}"></video>
-      <a class="dl-link" href="${data.url}" download>mp4をダウンロード</a>
+      <a class="dl-link" href="${data.url}" download>${t('result.dl.mp4')}</a>
       <div class="result-meta">
-        <div><b>連結結果:</b> ${data.name}</div>
-        <div><b>方式:</b> ${data.method === 'concat_demuxer_copy' ? '無劣化連結(-c copy)' : '再エンコード連結'}</div>
-        <div><b>解像度:</b> ${data.width}×${data.height} / <b>長さ:</b> ${data.duration != null ? data.duration.toFixed(2) + 's' : '-'}</div>
-        <div><b>入力(連結順):</b> ${data.inputs.join(' → ')}</div>
+        <div><b>${t('result.concatResult')}:</b> ${data.name}</div>
+        <div><b>${t('result.method')}:</b> ${data.method === 'concat_demuxer_copy' ? t('result.methodLossless') : t('result.methodReencode')}</div>
+        <div><b>${t('result.resolution')}:</b> ${data.width}×${data.height} / <b>${t('result.duration')}:</b> ${data.duration != null ? data.duration.toFixed(2) + 's' : '-'}</div>
+        <div><b>${t('result.inputsOrder')}:</b> ${data.inputs.join(' → ')}</div>
       </div>
     `;
+    lastResultData = null;
+    lastResultKind = null;
     gallerySelectedOrder = [];
     await refreshGallery();
   } catch (e) {
-    alert('連結に失敗しました: ' + e.message);
+    alert(t('gallery.concatError', { msg: e.message }));
   } finally {
     galleryConcatBtn.disabled = false;
-    galleryConcatBtn.textContent = '選択を連結';
+    galleryConcatBtn.textContent = t('btn.concatSelected');
     updateGalleryToolbar();
   }
 });
 
+// --- 言語トグル: 切替時は applyI18n() に加え、動的に組み立てたテキストを持つ
+// 箇所を作り直す (静的な data-i18n 要素は applyI18n() だけで足りるが、
+// JS が文字列を生成する箇所はここで明示的に再描画する)。
+function rerenderDynamicI18n() {
+  updateEnhanceModeUI();
+  updateInstantHint();
+  updateTurboAvailability();
+  updateSizeEffectLine();
+  renderRefItems();
+  updateReloadApplyState();
+  renderGallery();
+  if (lastResultData && lastResultKind === 'single') {
+    renderResult(lastResultData);
+  } else if (lastResultData && lastResultKind === 'batch') {
+    renderBatchResult(lastResultData);
+  } else {
+    resultArea.innerHTML = `<div class="placeholder">${t('result.placeholder')}</div>`;
+  }
+}
+
+document.querySelectorAll('.lang-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.lang === lang) return;
+    lang = btn.dataset.lang;
+    localStorage.setItem('h3_lang', lang);
+    applyI18n();
+    rerenderDynamicI18n();
+  });
+});
+
+applyI18n();
 refreshGallery();
 </script>
 </body>
