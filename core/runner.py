@@ -306,6 +306,59 @@ H3_TE_PREQUANT_DIR = Path(
 # 従来経路で動作を続ける (ディスクを埋めてシステムを巻き添えにしないため)。
 H3_TE_PREQUANT_MIN_FREE_GB = float(os.environ.get("H3_TE_PREQUANT_MIN_FREE_GB", "25"))
 
+# EXPERIMENTAL, opt-in. "" (既定) は無効 -- 以下のブロックは1バイトも既存挙動に触れない。
+#
+# 動機: TE (Qwen3-VL-32B, NF4 で 21.02GB / H3_TE_PRUNE 併用で 17.45GB) と transformer
+# (int8 34GB 級) が 48GB 機で同時常駐できないため、毎リクエストで載せ替えが起きており
+# それが速度の律速になっている (README/RESIDENCY.md 参照)。Qwen3-VL-4B (bf16 で
+# 約5.2GB 見込み) + 学習済み線形投影行列で 32B TE を置き換えれば、TE と transformer が
+# 同時常駐できるようになる。
+#
+# 投影行列は HuggingFace `NicoLab28/ClipProj-MiniMax-H3` の
+# `h3_qwen3vl_4b_tap24.safetensors` (実測確認済み、2026-08-10: W (2560, 5120) fp32,
+# mean_in/std_in (2560,), mean_out/std_out/sink_out (5120,), metadata tap="24") --
+# 4B の `hidden_states[24]` (36層中24層目、post-norm 混入の懸念なし -- 24 は最終層36と
+# 十分離れているため `capture_outputs` の `tie_last_hidden_states` 置換の対象にならない。
+# H3_TE_PRUNE がまさにこの罠を避けるために +1 していたのと同種の確認、ここでは該当しない)
+# を学習済みの `W`/`mean_in`/`std_in`/`mean_out`/`std_out` で 5120 次元 (32B TE と同じ
+# 出力次元) へ写す。適用式・sink_out の扱いは参照実装
+# (https://github.com/nicolab28/ComfyUI-ClipProj の clipproj_projection.py) と同一にする
+# ことが必須 (自前流に変えると学習済み統計とズレて劣化する)。
+#
+# `H3_TE_PROJ` に投影 safetensors のローカルパス、または HF リポジトリID
+# (`NicoLab28/ClipProj-MiniMax-H3` のように) を指定する。パスとして存在すればローカル
+# ファイル扱い、そうでなければ `hf_hub_download(H3_TE_PROJ, H3_TE_PROJ_FILE)` として
+# 解決する (H3_TURBO_LORA の `_download_turbo_lora_if_needed` と同じパターン)。
+H3_TE_PROJ = os.environ.get("H3_TE_PROJ", "").strip()
+# `H3_TE_PROJ` が HF リポジトリIDのときに読むファイル名。ローカルパス指定時は無視される。
+H3_TE_PROJ_FILE = os.environ.get("H3_TE_PROJ_FILE", "h3_qwen3vl_4b_tap24.safetensors").strip()
+# 投影に使う小型 TE 本体。既定は投影行列が学習された対象 (safetensors メタデータの
+# `source_model` = qwen3vl_4b_bf16) と同系列の Instruct 版。
+H3_TE_PROJ_MODEL = os.environ.get("H3_TE_PROJ_MODEL", "Qwen/Qwen3-VL-4B-Instruct").strip()
+
+if H3_TE_PROJ:
+    # 小型モデルを別途量子化・層削除する意味がない (そもそも 4B は 32B より遥かに軽い上、
+    # 投影行列は特定の tap 層・特定の重み分布に対して学習されているため、量子化や層削除で
+    # 数値がずれると学習済み統計 (mean_in/std_in 等) との整合が崩れる恐れがある) ので、
+    # 既存の TE 量子化/層削除/事前量子化キャッシュ系フラグとは排他とする。「明示指定」の
+    # 判定は `"X" in os.environ` (H3_LOWVRAM の `_explicit_transformer_quant` と同じ書き方)
+    # -- デフォルト値のまま (何も指定していない) なら黙って無視し、オペレーターが実際に
+    # 何かを指定していたときだけ矛盾として落とす。
+    _proj_conflicts = [
+        f"{name}={os.environ[name]!r}"
+        for name in ("H3_TE_QUANT", "H3_TE_PRUNE", "H3_TE_PREQUANT")
+        if name in os.environ
+    ]
+    if _proj_conflicts:
+        raise RuntimeError(
+            "H3_TE_PROJ is set (Qwen3-VL-4B + learned projection replaces the 32B TE "
+            "entirely) and is mutually exclusive with 32B-TE-specific quantization/pruning "
+            f"flags, but these were also explicitly set: {', '.join(_proj_conflicts)}. "
+            "Quantizing or layer-pruning a small model that is not what the projection "
+            "matrix was trained against makes no sense and risks silently drifting from "
+            "the trained mean_in/std_in statistics. Drop these flags (or unset H3_TE_PROJ)."
+        )
+
 # EXPERIMENTAL, opt-in, probe for 16GB-class support. "0" (default) = video VAE loads
 # float32, byte-for-byte identical to pre-this-flag behaviour. "1" = the video VAE
 # (`vae`, NOT `audio_vae` -- audio_vae must stay float32 end-to-end, see module
@@ -839,6 +892,115 @@ if H3_VAE_SMALLCLIP_FIX:
 H3_REF_PREFIX_CACHE = os.environ.get("H3_REF_PREFIX_CACHE", "1").strip() == "1"
 
 
+# H3_TE_PROJ 有効時、H3 トークナイザ固有の特殊トークン (`<d>`=151669 / `</d>`=151670)
+# はここから拒否する。理由: これらは H3 の 32B TE 用チェックポイントの語彙にだけ追加
+# されたトークンで、Qwen3-VL-4B-Instruct の埋め込み表 (vocab_size=151669、有効IDは
+# 0..151668) には存在しない -- 実測確認済み (2026-08-10)。素通しすると埋め込みテーブル
+# の範囲外アクセスになるか、たまたま無関係な埋め込みを引いて黙って壊れた条件付けに
+# なる。台詞 (`<d>...</d>`) は音声参照 (fully_copy) 側で入れるか、H3_TE_PROJ を無効化
+# した通常経路 (32B TE) を使うこと。
+H3_TE_PROJ_UNSUPPORTED_TOKEN_ID_START = 151669
+
+
+def _reject_unsupported_proj_tokens(token_ids: list[int]) -> None:
+    """H3_TE_PROJ 有効時、4B の語彙に無いトークン (id >= 151669、`<d>`/`</d>` 等) を
+    含むプロンプトを明示的に拒否する。呼び出し側 (`_encode_h3_prompt` /
+    `_encode_ref2va_prompt` / `_encode_ref_prompts_shared_prefix`) はトークン化
+    (H3 トークナイザ、通常語彙は 4B とID完全一致) の直後にこれを呼ぶ。"""
+    bad = sorted({t for t in token_ids if t >= H3_TE_PROJ_UNSUPPORTED_TOKEN_ID_START})
+    if bad:
+        raise ValueError(
+            f"投影TE (H3_TE_PROJ) は H3 固有の特殊トークン (台詞タグ <d>/</d> 等、"
+            f"id>={H3_TE_PROJ_UNSUPPORTED_TOKEN_ID_START}) を扱えません "
+            f"(このプロンプトに含まれる該当トークンID: {bad})。"
+            "台詞は音声参照 (fully_copy) で入れるか、H3_TE_PROJ を無効にすること。"
+        )
+
+
+class _TeProjection:
+    """`H3_TE_PROJ` の学習済み線形投影 (Qwen3-VL-4B の `hidden_states[tap]`, 2560次元
+    を 32B TE と同じ 5120次元へ写す) を1度だけロードしてキャッシュする。
+
+    適用式は参照実装 (https://github.com/nicolab28/ComfyUI-ClipProj の
+    clipproj_projection.py / clipproj_nodes.py) と同一にする必要がある:
+
+        cond = ((h - mean_in) / std_in) @ W * std_out + mean_out
+        cond[:, 0] = sink_out
+
+    token 0 (先頭トークン) だけ実測値 `sink_out` で置き換えるのは、この位置がアテン
+    ション・シンク (Qwen3-VL の因果アテンションで常に強く参照される先頭トークン) で、
+    そのノルム/分布が他トークンと桁違いなため -- 投影行列は他の (シンクでない) トーク
+    ンの統計だけで学習されており、token 0 に同じ写像を適用すると学習範囲外の外挿になる
+    (参照実装が明示的に `sink_out` で上書きしているのはこのため、自前の統計に置き換え
+    てはいけない)。
+    """
+
+    def __init__(self, path: str, device: torch.device):
+        from safetensors import safe_open
+
+        with safe_open(path, framework="pt") as f:
+            meta = f.metadata() or {}
+            tensors = {key: f.get_tensor(key) for key in f.keys()}
+
+        required = {"W", "mean_in", "std_in", "mean_out", "std_out", "sink_out"}
+        missing = required - tensors.keys()
+        if missing:
+            raise RuntimeError(f"H3_TE_PROJ checkpoint {path!r} is missing tensor(s): {sorted(missing)}")
+
+        self.tap = int(meta.get("tap", MINIMAX_H3_TEXT_ENCODER_LAYER))
+        # 演算精度は fp32 で保持する (チェックポイント自体も fp32 -- normalize/matmul を
+        # bf16 に落とすと、学習時の統計とずれた丸め誤差が入るため)。呼び出し側の最終
+        # dtype への変換は `project()` の戻り値で行う。
+        self.device = device
+        self.W = tensors["W"].to(device=device, dtype=torch.float32)
+        self.mean_in = tensors["mean_in"].to(device=device, dtype=torch.float32)
+        self.std_in = tensors["std_in"].to(device=device, dtype=torch.float32)
+        self.mean_out = tensors["mean_out"].to(device=device, dtype=torch.float32)
+        self.std_out = tensors["std_out"].to(device=device, dtype=torch.float32)
+        self.sink_out = tensors["sink_out"].to(device=device, dtype=torch.float32)
+        logger.info(
+            "H3_TE_PROJ: loaded projection %s (tap=%d, d_in=%d, d_out=%d) to %s",
+            path, self.tap, self.W.shape[0], self.W.shape[1], device,
+        )
+
+    def _project_raw(self, hidden: torch.Tensor) -> torch.Tensor:
+        """token 0 の sink_out 置換を行わない素の投影。KVキャッシュ継続 (`_encode_ref_
+        prompts_shared_prefix`) の suffix セグメントのように、渡された `hidden` の
+        位置0がシーケンス全体の先頭 (アテンションシンク) ではない場合に使う。"""
+        h = hidden.to(device=self.device, dtype=torch.float32)
+        return ((h - self.mean_in) / self.std_in) @ self.W * self.std_out + self.mean_out
+
+    def project(self, hidden: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """`hidden`: `(1, num_tokens, d_in)`, 4B の `hidden_states[self.tap]` で、
+        位置0がシーケンス全体の先頭であるもの。戻り値: `(1, num_tokens, d_out)`,
+        32B TE と同じ形/dtype 契約。"""
+        cond = self._project_raw(hidden)
+        # token 0 (先頭、アテンションシンク) は投影が学習していない -- クラスdocstring参照。
+        cond[:, 0] = self.sink_out
+        return cond.to(dtype=dtype)
+
+    def project_continuation(self, hidden: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """KVキャッシュ継続の続き部分 (シーケンス先頭を含まない断片) を写す。
+        sink_out 置換をしない点だけが `project()` と異なる -- 続き部分の位置0は
+        シーケンス全体で見れば先頭トークンではないため、置換すると誤り。"""
+        return self._project_raw(hidden).to(dtype=dtype)
+
+
+def _te_projection_for(components) -> "_TeProjection | None":
+    """有効な `H3_TE_PROJ` 投影インスタンスを返す (`_load_text_encoder_proj` がロード時に
+    一度だけ `components._te_projection` へセットする)。無効なら None -- 呼び出し側は
+    None のとき従来経路 (32B TE, `components.text_encoder_layer`=50) をそのまま使う。"""
+    return getattr(components, "_te_projection", None)
+
+
+def _te_encoder_layer_for(components) -> int:
+    """`get_qwen3vl_prompt_embeds` / 直接呼び出しへ渡す `text_encoder_layer`。投影が
+    有効なら 4B 側の tap (既定24)、無効なら従来どおり `components.text_encoder_layer`
+    (32B TE の50)。"""
+    proj = _te_projection_for(components)
+    return proj.tap if proj is not None else components.text_encoder_layer
+
+
 def _encode_ref_prompts_shared_prefix(
     pipe,
     prompts: list[str],
@@ -893,12 +1055,21 @@ def _encode_ref_prompts_shared_prefix(
     components = pipe
     step = MiniMaxH3Ref2VATextEncoderStep()
 
+    te_proj = _te_projection_for(components)
+    te_layer = _te_encoder_layer_for(components)
     num_layers = components.text_encoder.config.text_config.num_hidden_layers
-    if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
+    if num_layers <= te_layer:
         raise ValueError(
-            f"MiniMax-H3 conditions on `hidden_states[{MINIMAX_H3_TEXT_ENCODER_LAYER}]` of its Qwen3-VL "
-            f"conditioner, which needs more than {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
+            f"MiniMax-H3 conditions on `hidden_states[{te_layer}]` of its Qwen3-VL "
+            f"conditioner, which needs more than {te_layer} decoder layers, but "
             f"`text_encoder` has {num_layers}."
+        )
+    if te_proj is not None:
+        # 投影TE + 参照経路 (ref2va) は 4B の vision tower の特徴が同じ行列で正しく
+        # 写るか未検証 -- 一度だけ警告する (H3_TE_PROJ のモジュールコメント参照)。
+        logger.warning(
+            "H3_TE_PROJ + ref2va (reference) path is UNVERIFIED -- the projection matrix "
+            "was only checked against 4B text hidden states, not vision tower features."
         )
 
     # --- MiniMaxH3Ref2VATextEncoderStep.__call__ と同一の画像/動画参照の前処理 ---
@@ -920,6 +1091,8 @@ def _encode_ref_prompts_shared_prefix(
         text_tag=components.text_tag,
         video_tag=components.video_tag,
     )
+    if te_proj is not None:
+        _reject_unsupported_proj_tokens(prefix_ids)
     prefix_input = torch.tensor([prefix_ids], dtype=torch.long, device=device)
     mm_token_type_ids = torch.tensor(
         components.processor.create_mm_token_type_ids([prefix_ids]), dtype=torch.long, device=device
@@ -950,7 +1123,9 @@ def _encode_ref_prompts_shared_prefix(
             use_cache=True,
             output_hidden_states=True,
         )
-    prefix_hidden = prefix_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(device=device, dtype=dtype)
+    prefix_hidden = prefix_out.hidden_states[te_layer].to(device=device, dtype=dtype)
+    if te_proj is not None:
+        prefix_hidden = te_proj.project(prefix_hidden, dtype=dtype)
     prefix_len = cache.get_seq_length()
     logger.info(
         "shared-prefix encode: prefix %d tokens in %.1fs, continuing %d scene prompt(s)",
@@ -960,6 +1135,8 @@ def _encode_ref_prompts_shared_prefix(
     results: list[tuple[torch.Tensor, torch.Tensor]] = []
     for prompt in prompts:
         suffix_ids = components.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if te_proj is not None:
+            _reject_unsupported_proj_tokens(suffix_ids)
         suffix_input = torch.tensor([suffix_ids], dtype=torch.long, device=device)
         with torch.no_grad():
             suffix_out = model(
@@ -974,7 +1151,14 @@ def _encode_ref_prompts_shared_prefix(
                 use_cache=True,
                 output_hidden_states=True,
             )
-        suffix_hidden = suffix_out.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(device=device, dtype=dtype)
+        suffix_hidden = suffix_out.hidden_states[te_layer].to(device=device, dtype=dtype)
+        if te_proj is not None:
+            # suffix はキャッシュ継続で得た「シーケンス先頭を含まない」断片なので
+            # sink_out 置換をしない `project_continuation` を使う (`project()` は常に
+            # 位置0を置換するため、そのまま使うと suffix の先頭トークンを誤って
+            # sink_out に差し替えてしまう -- `_TeProjection.project_continuation` の
+            # docstring参照)。
+            suffix_hidden = te_proj.project_continuation(suffix_out.hidden_states[te_layer], dtype=dtype)
         cache.crop(prefix_len)
 
         prompt_embeds = torch.cat([prefix_hidden, suffix_hidden], dim=1)
@@ -1146,15 +1330,31 @@ def _encode_h3_prompt(
     token_ids += prompt_ids
     token_tags += [text_tag] * len(prompt_ids)
 
+    te_proj = _te_projection_for(components)
+    if te_proj is not None:
+        # H3 固有の特殊トークン (`<d>`/`</d>`) は 4B の語彙に無い -- `_te_projection_for`
+        # のモジュールコメント/`_reject_unsupported_proj_tokens` docstring参照。
+        # トークナイザ自体は H3 のものを使い続ける (通常語彙は 4B とID完全一致、
+        # H3_TE_PROJ のモジュールコメント参照) -- `tokenizer`/`processor` はどちらも
+        # `components` (=H3 の pipe shell) 由来のまま、変更なし。
+        _reject_unsupported_proj_tokens(token_ids)
+
     prompt_embeds = get_qwen3vl_prompt_embeds(
         components.text_encoder,
         processor,
         token_ids,
         vision_inputs,
-        text_encoder_layer=components.text_encoder_layer,
+        text_encoder_layer=_te_encoder_layer_for(components),
         device=device,
         dtype=dtype,
     )
+    if te_proj is not None:
+        # `get_qwen3vl_prompt_embeds` はここでは 4B の `hidden_states[tap]` (2560次元、
+        # 生の hidden state) を返す -- それを学習済み線形投影で 5120次元 (32B TE と同じ
+        # 出力次元) へ写す。この呼び出しは常に1つの自己完結したシーケンスを渡すので
+        # (KVキャッシュ継続はしない)、位置0は本当にシーケンス先頭 = sink_out 置換が
+        # 正しい `project()` (継続専用の `project_continuation()` ではない)。
+        prompt_embeds = te_proj.project(prompt_embeds, dtype=dtype or prompt_embeds.dtype)
     return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
 
@@ -1202,6 +1402,14 @@ def _encode_ref2va_prompt(
     )
 
     step = MiniMaxH3Ref2VATextEncoderStep()
+    te_proj = _te_projection_for(components)
+    if te_proj is not None:
+        # 投影TE + 参照経路 (ref2va) は 4B の vision tower の特徴が同じ行列で正しく
+        # 写るか未検証 -- 一度だけ警告する (H3_TE_PROJ のモジュールコメント参照)。
+        logger.warning(
+            "H3_TE_PROJ + ref2va (reference) path is UNVERIFIED -- the projection matrix "
+            "was only checked against 4B text hidden states, not vision tower features."
+        )
     vision_inputs, image_token_counts, video_token_counts, video_timestamps = step._gather_vision_features(
         components.processor, normalized_references, components.fps
     )
@@ -1215,15 +1423,24 @@ def _encode_ref2va_prompt(
         text_tag=components.text_tag,
         video_tag=components.video_tag,
     )
+    if te_proj is not None:
+        # H3 固有の特殊トークン (`<d>`/`</d>`) は 4B の語彙に無い -- トークナイザ自体は
+        # H3 のものを使い続ける (`components.tokenizer`、通常語彙は 4B とID完全一致)。
+        _reject_unsupported_proj_tokens(token_ids)
     prompt_embeds = get_qwen3vl_prompt_embeds(
         components.text_encoder,
         components.processor,
         token_ids,
         vision_inputs,
-        text_encoder_layer=components.text_encoder_layer,
+        text_encoder_layer=_te_encoder_layer_for(components),
         device=device,
         dtype=dtype,
     )
+    if te_proj is not None:
+        # 常に1つの自己完結したシーケンス (KVキャッシュ継続なし) なので位置0は本当に
+        # シーケンス先頭 -- sink_out 置換込みの `project()` が正しい
+        # (`_encode_h3_prompt` の同箇所コメント参照)。
+        prompt_embeds = te_proj.project(prompt_embeds, dtype=dtype or prompt_embeds.dtype)
     return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
 
@@ -1868,6 +2085,12 @@ class MiniMaxH3Runner:
         # H3_TURBO_LORA only: cached local path of the downloaded turbo LoRA safetensors,
         # resolved once per process by `_download_turbo_lora_if_needed()`.
         self._turbo_lora_path: str | None = None
+        # H3_TE_PROJ only: cached local path of the resolved projection safetensors,
+        # resolved once per process by `_resolve_te_proj_path()`. The projection
+        # instance itself is cached on `self._pipe._te_projection` (not here), since
+        # encode-side helpers (`_encode_h3_prompt` etc.) only receive `components`
+        # (the pipe shell), never `self`.
+        self._te_proj_path: str | None = None
         # TE 外部常駐 (H3_TE_DEVICE) のときの TE 実体。パイプからは普段外しておき
         # (`_te_attached()` 参照)、この属性が唯一の強参照になる。
         self._te_module = None
@@ -3018,6 +3241,77 @@ class MiniMaxH3Runner:
             except Exception:
                 pass
 
+    def _resolve_te_proj_path(self) -> str:
+        """`H3_TE_PROJ` の実ファイルパスを解決する (キャッシュ、初回のみ)。
+
+        ローカルパスとして存在すればそのまま使う。存在しなければ HF リポジトリID
+        として扱い、`hf_hub_download(H3_TE_PROJ, H3_TE_PROJ_FILE)` で取得する --
+        `_download_turbo_lora_if_needed` と同じパターン (通常の HF キャッシュ経由、
+        2回目以降はローカルヒット)。
+        """
+        if getattr(self, "_te_proj_path", None) is not None:
+            return self._te_proj_path
+        if Path(H3_TE_PROJ).is_file():
+            self._te_proj_path = H3_TE_PROJ
+            logger.info("H3_TE_PROJ: using local projection file %s", self._te_proj_path)
+            return self._te_proj_path
+        from huggingface_hub import hf_hub_download
+
+        t0 = time.time()
+        self._te_proj_path = hf_hub_download(H3_TE_PROJ, H3_TE_PROJ_FILE)
+        logger.info(
+            "H3_TE_PROJ: projection checkpoint resolved: %s (%.1fs, repo=%s file=%s)",
+            self._te_proj_path, time.time() - t0, H3_TE_PROJ, H3_TE_PROJ_FILE,
+        )
+        return self._te_proj_path
+
+    def _load_text_encoder_proj(self, progress: ProgressState | None = None):
+        """`H3_TE_PROJ` 有効時の text_encoder ロード経路: 32B TE の代わりに
+        `H3_TE_PROJ_MODEL` (既定 Qwen3-VL-4B-Instruct) を bf16 でロードし、学習済み
+        投影行列を一度だけロードしてキャッシュする。トークナイザ/プロセッサは H3 の
+        ものを使い続ける (通常語彙は 4B とID完全一致 -- モジュール冒頭コメント参照)ので
+        通常経路と同じく `self._pipe.load_components(names=["tokenizer", "processor"])`
+        で取得し、`text_encoder` だけこの経路で個別にロードして差し替える
+        (`_load_te_from_prequant` が量子化済みキャッシュの `text_encoder` を差し替える
+        のと同じ形)。
+
+        `H3_TE_DEVICE` (TE 別GPU常駐) とは併用可能: 4B も 32B 同様、指定があれば
+        そちらへ直接ロードし、`_detach_te_if_external`/`_te_attached` の窓開閉に
+        そのまま乗る (この2つはモデルの中身を問わない汎用ロジックのため)。
+        """
+        if progress:
+            progress.update(
+                phase="loading_text_encoder",
+                message=f"text_encoder ({H3_TE_PROJ_MODEL}, 投影TE) をロード中...",
+            )
+        t0 = time.time()
+        from transformers import AutoModelForImageTextToText
+
+        te = AutoModelForImageTextToText.from_pretrained(
+            H3_TE_PROJ_MODEL,
+            dtype=torch.bfloat16,
+            device_map=H3_TE_DEVICE if self._te_external else "cuda",
+        )
+        # tokenizer/processor は H3 のもの (通常ロード経路と同一) -- text_encoder だけ
+        # 4B に差し替える。
+        self._pipe.load_components(names=["tokenizer", "processor"])
+        self._pipe.text_encoder = te
+        self._text_encoder_loaded = True
+        logger.info(
+            "text_encoder (%s, H3_TE_PROJ) loaded to GPU%s in %.1fs. gpu=%s ram=%s",
+            H3_TE_PROJ_MODEL, f" ({H3_TE_DEVICE})" if self._te_external else "",
+            time.time() - t0, gpu_mem_gb(), ram_gb(),
+        )
+        self._detach_te_if_external()
+
+        # 投影行列は一度だけロードしてキャッシュする (`self._pipe._te_projection`,
+        # `_te_projection_for()` が読む場所)。ロード先デバイスは TE と同じ
+        # (`_encode_device` -- 外部常駐なら TE 側GPU) にして、エンコード時に
+        # デバイスまたぎのコピーが発生しないようにする。
+        if getattr(self._pipe, "_te_projection", None) is None:
+            proj_path = self._resolve_te_proj_path()
+            self._pipe._te_projection = _TeProjection(proj_path, device=self._encode_device)
+
     def _load_text_encoder(self, progress: ProgressState | None = None):
         """Load the text_encoder to GPU.
 
@@ -3032,9 +3326,20 @@ class MiniMaxH3Runner:
         `_text_encoder_config_kwargs()`'s docstring for why 51 and why this is exact,
         not an approximation. Measured savings: ~3.6GB (bnb-4bit nf4, 21.0GB -> 17.4GB)
         or ~13.6GB (bf16, 66.7GB -> 53.1GB).
+
+        `H3_TE_PROJ` (opt-in, mutually exclusive with `H3_TE_QUANT`/`H3_TE_PRUNE`/
+        `H3_TE_PREQUANT` -- import-time guard, see the module comment): the 32B TE is not
+        loaded at all. Instead `H3_TE_PROJ_MODEL` (Qwen3-VL-4B-Instruct, bf16, ~5.2GB) is
+        loaded onto `self._pipe.text_encoder`, and the learned projection matrix
+        (`H3_TE_PROJ`) is loaded once and cached on `self._pipe._te_projection`. The
+        tokenizer/processor stay H3's own (loaded normally below) -- only the conditioner
+        model itself is swapped.
         """
         self._ensure_pipe_shell()
         if self._text_encoder_loaded:
+            return
+        if H3_TE_PROJ:
+            self._load_text_encoder_proj(progress)
             return
         # 量子化済みキャッシュがあればそこから読む (実測 66.9s -> 2.6s、出力はビット一致。
         # H3_TE_PREQUANT のモジュールコメント参照)。bnb-4bit のときだけ意味がある --
@@ -3129,11 +3434,17 @@ class MiniMaxH3Runner:
         if self._te_external:
             logger.debug("text_encoder は %s に常駐しているため解放しない", H3_TE_DEVICE)
             return
-        if TE_QUANT == "bnb-4bit" and not force:
+        if (H3_TE_PROJ or TE_QUANT == "bnb-4bit") and not force:
             # Permanently resident in this mode -- never freed mid-run (see
             # _load_text_encoder docstring). Guard so a stray call is a harmless no-op
-            # rather than silently dropping the model.
-            logger.debug("bnb-4bit text_encoder is permanently resident; ignoring free request")
+            # rather than silently dropping the model. `H3_TE_PROJ` (4B TE) is small
+            # enough that it is meant to stay resident alongside the transformer just
+            # like bnb-4bit's nf4 TE -- same "load once, keep forever" steady state,
+            # just with a much smaller model.
+            logger.debug(
+                "text_encoder (%s) is permanently resident; ignoring free request",
+                "H3_TE_PROJ" if H3_TE_PROJ else "bnb-4bit",
+            )
             return
         # Drop the CUDA model directly: releasing the last reference frees the VRAM in
         # place. Do NOT stage through .to("cpu") first -- the text_encoder is ~21-66GB
@@ -3262,6 +3573,13 @@ class MiniMaxH3Runner:
             "text_encoder_loaded": self._text_encoder_loaded,
             "te_quant": TE_QUANT,
             "te_prune": H3_TE_PRUNE,
+            "te_proj": bool(H3_TE_PROJ),
+            "te_proj_model": H3_TE_PROJ_MODEL if H3_TE_PROJ else None,
+            "te_proj_tap": (
+                getattr(self._pipe, "_te_projection", None).tap
+                if self._pipe is not None and getattr(self._pipe, "_te_projection", None) is not None
+                else None
+            ),
             "video_vae_fp16": H3_VIDEO_VAE_FP16,
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
