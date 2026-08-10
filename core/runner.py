@@ -1929,6 +1929,26 @@ class MiniMaxH3Runner:
         # audio VAE must stay fp32 end-to-end (bf16 causes ~20dB volume loss, see
         # module docstring / handoff doc).
         self._pipe.load_components(names=["vae", "audio_vae"], dtype=torch.float32)
+        # audio_vae の attention は「native」に固定する。
+        #
+        # `MiniMaxH3AudioAttnProcessor` は `backend=self._attention_backend`(既定 None)で
+        # `dispatch_attention_fn` を呼ぶため、**バックエンドがグローバルに解決される**。
+        # このアプリは transformer / transformer_ref にだけ `set_attention_backend()` を
+        # 呼んでいるが、`H3_ATTN_BACKEND=sage` で起動すると audio_vae の attention まで
+        # sage に流れる。ところが audio_vae は上のとおり**設計上 fp32 固定**(bf16 にすると
+        # 音量が約20dB落ちる)で、sage は fp16/bf16 しか受け付けない:
+        #
+        #   sageattention/core.py: assert dtype in [torch.float16, torch.bfloat16]
+        #   -> AssertionError: Input tensors must be in dtype of torch.float16 or torch.bfloat16
+        #
+        # このモジュールだけ明示的に native へ固定すれば、fp32 のまま矛盾なく動く。
+        # 精度も native(SDPA)のほうが素直で、音声 VAE は計算量が小さく sage の利得もない。
+        #
+        # **踏んだ経緯**: 音声を含む参照 (`fully_copy` のリップシンク検証, 2026-08-10) で
+        # 初めて発火した。この経路は「音声つき参照」でしか通らないため、それまでの
+        # ref2va 回帰(画像参照のみ)を全てすり抜けていた。リクエストの `attn=` 上書きも
+        # transformer 系にしか効かず回避できない、という点も含めて記録しておく。
+        self._pipe.audio_vae.set_attention_backend("native")
         if H3_VIDEO_VAE_FP16:
             # `dtype=torch.float16` on the load_components call above would be a no-op
             # for this VAE (see H3_VIDEO_VAE_FP16's module comment) -- has to be a

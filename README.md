@@ -1653,6 +1653,66 @@ observe し直す(observer は監視中の要素への参照を保持するた�
 `/api/ref2va_batch`, `/api/ref2va`, `/api/t2va`)が切替後も不変であること、
 コンソールエラーが無いことを確認済み。
 
+## 2026-08-10: 音声参照でリップシンク(`fully_copy`)— 実測と、そこで見つかったバグ
+
+**動機**: テキストエンコーダを小型モデル+投影行列で置き換える手法
+([ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3))は TE を
+15.7GB → 5.2GB にできるが、作者の実測では**発話が劣化する**(4B は不明瞭、8B は言語を
+捨てて英語で喋る)。ならば台詞を**音声参照から入れれば TE の発話能力に依存しない**、
+という仮説の検証。
+
+**結果: 仮説は成立した。**
+
+| 検証項目 | 結果 |
+|---|---|
+| 台詞の内容が音声参照から伝わるか | **成立** — 検出言語 ja (0.964)、認識「今日は良い天気だね」、**文字一致 100%** |
+| リップシンク | **成立** — 口の開閉と音声包絡の相関 **+0.745**(ずれ 0ms) |
+| キャラクター一貫性 | 成立(顔・髪型・制服が参照どおり) |
+| 音声の 1:1 コピー | **不成立** — 波形相関 0.112、尺 5.22s → 5.88s |
+
+決定的なのは、**プロンプトに日本語の台詞を1文字も書いていない**こと(`<d>` タグ不使用、
+「`<Audio 1>` の台詞に口を合わせる」とだけ指示)。それで同じ日本語が出た =
+**台詞がテキストエンコーダを経由していない**。
+
+**`fully_copy` は名前に反して信号のコピーではない。** 公式ガイドは
+*"The complete source audio serves as the target video's complete final audio track"* /
+*"reused 1:1"* と書いているが、実際の挙動は「**同じ内容を再生成する**」。声質は変わり、
+尺もモデル側の都合(141フレーム=5.88秒)で決まる。元音声をそのまま使いたいなら生成後に
+差し替える必要がある(相関 +0.745 のシンク精度があるので実用的と思われる。未検証)。
+
+なお口が開いている区間 4.1秒に対し音声のある区間は 1.6秒で、発話後も口が動く傾向がある。
+アニメ表現としては許容範囲だが、音素レベルの厳密な一致ではない。
+
+条件: 96GB機、TE nf4 + transformer bf16(非量子化)、768×1344・141フレーム、30steps、
+seed 777、総所要 553.9s、ピーク 87.67GB。
+
+### 【バグ修正】音声参照つき ref2va が sage attention で必ず落ちていた
+
+上記の検証で発火した。**音声を含む参照を渡すと確実にクラッシュする**:
+
+```
+sageattention/core.py: assert dtype in [torch.float16, torch.bfloat16]
+AssertionError: Input tensors must be in dtype of torch.float16 or torch.bfloat16
+  (発生源: autoencoder_kl_minimax_h3_audio.py -> dispatch_attention_fn)
+```
+
+**原因**: `MiniMaxH3AudioAttnProcessor` は `backend=self._attention_backend`(既定 `None`)で
+`dispatch_attention_fn` を呼ぶため、**バックエンドがグローバルに解決される**。本アプリは
+`set_attention_backend()` を transformer / transformer_ref にしか呼んでいないが、
+`H3_ATTN_BACKEND=sage`(既定)だと audio_vae の attention まで sage に流れる。ところが
+audio_vae は**設計上 fp32 固定**(bf16 にすると音量が約20dB落ちるため)で、sage は
+fp16/bf16 しか受け付けない。**リクエストの `attn=` 上書きでも回避できない**
+(transformer 系にしか効かないため)。
+
+**修正**: audio_vae のロード直後に `audio_vae.set_attention_backend("native")` を呼び、
+このモジュールだけ native に固定する。音声 VAE は計算量が小さく sage の利得もない。
+
+**テストの穴だった**: この経路は「音声つき参照」でしか通らないため、既存の ref2va 回帰
+(**48GB機・int8・画像参照のみ**)を全てすり抜けていた。96GB機の非量子化 ref2va も
+マージ版追従後は未検証だった。修正の確認は sage 既定のまま音声参照つき ref2va が通ること
+(186.3s、日本語 ja 0.976・文字一致100%)と、画像参照のみの ref2i が壊れていないこと
+(133.9s)の両方で行った。
+
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
 ### 1. diffusers PR #14355 — **マージ済み(2026-08-05)、追従も完了(2026-08-09)**
