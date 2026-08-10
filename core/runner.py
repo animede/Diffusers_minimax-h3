@@ -329,6 +329,12 @@ H3_TE_PREQUANT_MIN_FREE_GB = float(os.environ.get("H3_TE_PREQUANT_MIN_FREE_GB", 
 # (`NicoLab28/ClipProj-MiniMax-H3` のように) を指定する。パスとして存在すればローカル
 # ファイル扱い、そうでなければ `hf_hub_download(H3_TE_PROJ, H3_TE_PROJ_FILE)` として
 # 解決する (H3_TURBO_LORA の `_download_turbo_lora_if_needed` と同じパターン)。
+#
+# UI の「再ロード設定」パネルから te_proj を ON にしたとき (H3_TE_PROJ が env で未設定の
+# 場合) に使う既定リポジトリID。`core/settings.py` の `apply_reload_settings()` が
+# te_proj=True かつ `runner.H3_TE_PROJ` が空文字のときだけこれを書き込む -- env で
+# 明示的にローカルパス等を指定している場合はそちらを優先し、上書きしない。
+H3_TE_PROJ_DEFAULT_REPO = "NicoLab28/ClipProj-MiniMax-H3"
 H3_TE_PROJ = os.environ.get("H3_TE_PROJ", "").strip()
 # `H3_TE_PROJ` が HF リポジトリIDのときに読むファイル名。ローカルパス指定時は無視される。
 H3_TE_PROJ_FILE = os.environ.get("H3_TE_PROJ_FILE", "h3_qwen3vl_4b_tap24.safetensors").strip()
@@ -340,21 +346,32 @@ H3_TE_PROJ_MODEL = os.environ.get("H3_TE_PROJ_MODEL", "Qwen/Qwen3-VL-4B-Instruct
 # 下の排他ガードが `H3_TE_QUANT` 等を弾くのは「32B 向けの設定を 4B に流用させない」ため
 # であって、4B を量子化してはいけないという意味ではない -- 混同しないこと。
 #
-#   "none"      (既定) bf16 のまま。常駐 8.88GB
-#   "bnb-4bit"  NF4。常駐 3.11GB (-65%)、投影後の条件付けのズレは相対RMS 0.61〜0.96%
-#   "bnb-8bit"  int8。常駐 4.84GB (-46%)、ズレは相対RMS 0.24〜0.53%
+#   "bnb-4bit"  (既定、2026-08-10 実測に基づき変更) NF4。常駐 3.11GB (bf16比 -65%)、
+#               投影後の条件付けのズレは相対RMS 0.61〜0.96% (cosine 1.0000)。動画出力
+#               でも劣化は確認されていない (README「追記(同日)」節参照)。
+#   "bnb-8bit"  int8。常駐 4.84GB (-46%)、ズレは相対RMS 0.24〜0.53% (NF4よりさらに小さい)
+#   "none"      bf16 のまま。常駐 8.88GB
 #
-# **なぜ量子化が要るか**: 48GB 機で TE と transformer(int8 34.03GB)を同時常駐させ、
+# **なぜ量子化が既定か**: 48GB 機で TE と transformer(int8 34.03GB)を同時常駐させ、
 # 位相ごとの載せ替え(このリポジトリの速度の律速)を消すため。bf16 の 8.88GB だと
 # 8.88 + 34.03 + デノイズ活性化 6.6 = 49.5GB で実効予算 49.8GB に対し余裕 0.3GB しかなく、
 # 20GB カードで「導出上は入るが実測 OOM」を踏んだ前例からして期待できない。NF4 なら
-# 37.1 + 6.6 = 43.7GB で余裕 6.1GB。
-H3_TE_PROJ_QUANT = os.environ.get("H3_TE_PROJ_QUANT", "none").strip()
+# 37.1 + 6.6 = 43.7GB で余裕 6.1GB。上記の実測(劣化ほぼ無し)から、H3_TE_PROJ 利用時は
+# 既定で量子化する方が安全側に倒れていると判断した。
+H3_TE_PROJ_QUANT = os.environ.get("H3_TE_PROJ_QUANT", "bnb-4bit").strip()
 if H3_TE_PROJ_QUANT not in ("none", "bnb-4bit", "bnb-8bit"):
     raise RuntimeError(
         f"H3_TE_PROJ_QUANT must be one of none/bnb-4bit/bnb-8bit, got {H3_TE_PROJ_QUANT!r}"
     )
-if H3_TE_PROJ_QUANT != "none" and not H3_TE_PROJ:
+# 既定を "bnb-4bit" に変えたため、素朴に「H3_TE_PROJ_QUANT != 'none' かつ H3_TE_PROJ
+# 未設定」で弾くと **H3_TE_PROJ を使わない全ユーザー**がこのガードに引っかかって即死する
+# (投影OFFのまま H3_TE_PROJ_QUANT の既定値だけが有効値になっているだけなので、実際には
+# 何も壊れていない)。「明示指定」の判定は `"H3_TE_PROJ_QUANT" in os.environ` -- 他の
+# 排他ガード (`_proj_conflicts` 下記、H3_LOWVRAM の `_explicit_transformer_quant`) と
+# 同じイディオム。オペレーターが実際に H3_TE_PROJ_QUANT を触っていて、なおかつ
+# H3_TE_PROJ が未設定のときだけ矛盾として落とす。既定値のまま (未指定) なら投影OFF時は
+# 黙って無視する (量子化対象の4B自体がロードされないので、値があっても単に使われない)。
+if H3_TE_PROJ_QUANT != "none" and not H3_TE_PROJ and "H3_TE_PROJ_QUANT" in os.environ:
     raise RuntimeError(
         "H3_TE_PROJ_QUANT quantizes the projected 4B text encoder, but H3_TE_PROJ is not "
         "set, so there is no 4B to quantize. Set H3_TE_PROJ (or drop H3_TE_PROJ_QUANT)."
@@ -3563,6 +3580,17 @@ class MiniMaxH3Runner:
         if self._pipe_ref is not None and getattr(self._pipe_ref, "text_encoder", None) is not None:
             del self._pipe_ref.text_encoder
             self._pipe_ref.text_encoder = None
+        # H3_TE_PROJ の投影行列キャッシュ (`_load_text_encoder_proj` が
+        # `self._pipe._te_projection` へセットしたもの) もここで捨てる。`self._pipe`
+        # シェル自体は unload_all()/preload_all() の間も生き続ける (_ensure_pipe_shell
+        # 参照) ので、消さないと te_proj を OFF にした後も古い投影行列が
+        # `_te_projection_for()` から見え続け、32B TE に戻ったはずの経路が投影を使う
+        # 「静かな残留」になる。逆に ON にする再ロードでも、直前の TE 設定 (bnb-4bit 等)
+        # と混同しないよう常に作り直させるのが安全 (`_load_text_encoder_proj` は
+        # `getattr(..., None) is None` のときだけ作るため、消しておかないと使い回されて
+        # しまう)。
+        if getattr(self._pipe, "_te_projection", None) is not None:
+            self._pipe._te_projection = None
         self._text_encoder_loaded = False
         gc.collect()
         torch.cuda.empty_cache()
@@ -3647,7 +3675,16 @@ class MiniMaxH3Runner:
                 self._ensure_transformer()
             elif not H3_LOWVRAM:
                 self._ensure_transformer()
-                if TE_QUANT == "bnb-4bit":
+                # H3_TE_PROJ (4B+投影) は bnb-4bit の 32B NF4 TE と同じ「一度ロードして
+                # 常駐させ続ける」対象 (`_free_text_encoder` の force=False no-op ガード
+                # 参照)。preload しないと最初のリクエストまで4Bロードが遅延するだけで
+                # 壊れはしないが、bnb-4bit と扱いを揃えて起動時に済ませておく (UI から
+                # te_proj を ON にする apply_reload_settings() の直後もこの preload_all()
+                # を通るので、この分岐がないと ON 切替の「再ロード」がTEをロードしない
+                # まま終わってしまう)。
+                if H3_TE_PROJ:
+                    self._load_text_encoder()
+                elif TE_QUANT == "bnb-4bit":
                     self._load_text_encoder()
 
     def status(self) -> dict:

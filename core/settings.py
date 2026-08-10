@@ -20,11 +20,12 @@ Two independent groups (see the task brief this file implements):
   (falls back to whatever the process-wide env-var defaults are when a request field is
   left unset) and applied by `MiniMaxH3Runner.apply_instant_settings()`.
 - Reload (process-wide, needs every big model dropped and reloaded under the new
-  config): transformer int8, TE quant, TE layer prune, lowvram mode, video VAE fp16.
-  Changed via `apply_reload_settings()`, which validates the new combination using the
-  exact same rules `core/runner.py`'s own import-time validation uses (kept in sync by
-  hand -- see that function's docstring), then unloads everything and calls
-  `runner.preload_all()` under the new config.
+  config): transformer int8, TE quant, TE layer prune, lowvram mode, video VAE fp16,
+  projected TE (te_proj, 4B+learned linear map replacing the 32B TE) on/off and its own
+  quantization (te_proj_quant). Changed via `apply_reload_settings()`, which validates
+  the new combination using the exact same rules `core/runner.py`'s own import-time
+  validation uses (kept in sync by hand -- see that function's docstring), then unloads
+  everything and calls `runner.preload_all()` under the new config.
 """
 from __future__ import annotations
 
@@ -45,6 +46,10 @@ INSTANT_CACHE_CHOICES = ("fbc", "none")
 RELOAD_TRANSFORMER_QUANT_CHOICES = ("none", "int8")
 RELOAD_TE_QUANT_CHOICES = ("none", "bnb-4bit")
 RELOAD_LOWVRAM_CHOICES = ("0", "1", "group")
+# 投影TE (H3_TE_PROJ, Qwen3-VL-4B + 学習済み線形写像) 自身の量子化。既定は
+# core/runner.py の H3_TE_PROJ_QUANT と同じ "bnb-4bit" (2026-08-10 実測: 相対RMS
+# 0.61〜0.96%、cosine 1.0000、動画劣化なし)。
+RELOAD_TE_PROJ_QUANT_CHOICES = ("none", "bnb-4bit", "bnb-8bit")
 
 
 def resolve_instant_settings(
@@ -222,17 +227,19 @@ def current_settings_snapshot() -> dict:
             "te_prune": runner.H3_TE_PRUNE,
             "lowvram": runner.H3_LOWVRAM_RAW,
             "video_vae_fp16": runner.H3_VIDEO_VAE_FP16,
-            # 投影TE は現状 env 専用 (H3_TE_PROJ / H3_TE_PROJ_QUANT)。この API からは
-            # 変更できない**読み取り専用**の状態として載せる -- 有効時は te_quant /
-            # te_prune の変更が apply 側で 400 拒否されるため、UI がその理由を
-            # 表示できるように状態自体は見えている必要がある。
+            # 投影TE (H3_TE_PROJ) はこの API から変更可能 (te_proj bool)。ON にすると
+            # `runner.H3_TE_PROJ` が既定リポジトリID (apply_reload_settings 参照) へ
+            # 書き換えられ、32B TE の代わりに 4B+投影を使う。ON のとき te_quant/
+            # te_prune の変更は apply 側で 400 拒否される (32B 自体をロードしないため
+            # 意味を持たない) -- UI はその理由を表示できるよう、状態自体は常に見える。
             "te_proj": bool(runner.H3_TE_PROJ),
-            "te_proj_quant": runner.H3_TE_PROJ_QUANT if runner.H3_TE_PROJ else None,
+            "te_proj_quant": runner.H3_TE_PROJ_QUANT,
         },
         "choices": {
             "cache": list(INSTANT_CACHE_CHOICES),
             "transformer_quant": list(RELOAD_TRANSFORMER_QUANT_CHOICES),
             "te_quant": list(RELOAD_TE_QUANT_CHOICES),
+            "te_proj_quant": list(RELOAD_TE_PROJ_QUANT_CHOICES),
             "lowvram": list(RELOAD_LOWVRAM_CHOICES),
         },
         "constraints": {
@@ -251,6 +258,12 @@ def current_settings_snapshot() -> dict:
             "turbo_incompatible_with_transformer_both_resident": runner.turbo_lora_expected_format() == "comfy",
             "turbo_incompatible_with_upscale": False,
             "transformer_both_resident": runner.H3_TRANSFORMER_BOTH_RESIDENT,
+            # te_proj (H3_TE_PROJ, 4B+投影) が ON のとき te_quant/te_prune は無効:
+            # 32B TE 自体をロードしないため、この2つを変えても何も起きない (適用しても
+            # 静かに無視されるだけになる、という事故を防ぐため apply 側は 400 で拒否する
+            # -- apply_reload_settings() 参照)。UI はこのフラグを見て te_quant/te_prune
+            # のコントロールを disable する。
+            "te_quant_te_prune_incompatible_with_te_proj": bool(runner.H3_TE_PROJ),
         },
         "reload_eta_s": RELOAD_ETA_S,
     }
@@ -267,6 +280,13 @@ RELOAD_ETA_S = {
     "te_prune": 5,
     "lowvram": 90,
     "video_vae_fp16": 5,
+    # te_proj は 32B (66GB級) の代わりに 4B (~5-9GB) をロードするだけなので、
+    # te_quant (32B NF4 量子化、40s) より軽い見込み -- 4Bロード + 量子化 + 投影行列
+    # ロードの合計として te_prune 相当に寄せる (未実測、実機で要調整)。
+    # 実測 (2026-08-10, 96GB機): OFF→ON 47.9s (4Bロード+投影行列)、ON→OFF 29.4s
+    # (32B TE nf4 再ロード)、ON→ON量子化変更相当 27.3s。控えめに大きい方へ丸める。
+    "te_proj": 50,
+    "te_proj_quant": 50,
 }
 
 
@@ -283,10 +303,11 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
     machinery is used -- no os.execv, no self-kill).
 
     `fields` may contain any of: transformer_quant, te_quant, te_prune, lowvram,
-    video_vae_fp16. Fields not present keep their current value (partial updates are
-    fine -- the caller, `POST /api/settings/apply`, only sends what the user actually
-    changed via its diff-against-current-snapshot logic, but this function itself does
-    not require that; passing every field with its unchanged value is equally valid).
+    video_vae_fp16, te_proj, te_proj_quant. Fields not present keep their current value
+    (partial updates are fine -- the caller, `POST /api/settings/apply`, only sends what
+    the user actually changed via its diff-against-current-snapshot logic, but this
+    function itself does not require that; passing every field with its unchanged value
+    is equally valid).
 
     Validation mirrors `core/runner.py`'s own import-time rules for the equivalent env
     vars (H3_LOWVRAM/H3_TRANSFORMER_QUANT/H3_TE_QUANT interactions -- see that module's
@@ -306,23 +327,15 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
     with _reload_lock:
         t0 = time.time()
 
-        # ---- 投影TE (H3_TE_PROJ) 有効時は TE 系の変更を拒否する ----
-        # runner 側の import 時ガード (H3_TE_PROJ と H3_TE_QUANT/H3_TE_PRUNE の排他) は
-        # env の組み合わせしか見ていないため、この API から te_quant/te_prune を送ると
-        # **ガードを素通り**する。しかも実際のロードは `_load_text_encoder` が投影経路へ
-        # 先に分岐するので値は適用されず、スナップショットだけが「変わった」と報告する
-        # -- 静かな嘘になる。適用されない変更は受け取った時点で 400 で返すのが正しい。
-        # (2026-08-10 のレビューで発見。投影TE 自体をこの API から切り替えられるように
-        # するのは別作業 -- 現状は env 専用。)
-        if runner.H3_TE_PROJ:
-            _te_fields = [k for k in ("te_quant", "te_prune") if k in fields]
-            if _te_fields:
-                raise ValueError(
-                    "投影TE (H3_TE_PROJ) が有効なため、te_quant / te_prune はこの API から"
-                    f"変更できません (指定されたフィールド: {', '.join(_te_fields)})。"
-                    "TE の構成は環境変数 H3_TE_PROJ / H3_TE_PROJ_QUANT で管理されています。"
-                    "32B TE に戻すにはサーバーを H3_TE_PROJ なしで再起動してください。"
-                )
+        # ---- resolve new te_proj / te_proj_quant first: the te_quant/te_prune conflict
+        # guard further down needs to know the *post-request* te_proj state (new_te_proj),
+        # not the current one (runner.H3_TE_PROJ) -- see that guard's own comment for why.
+        new_te_proj = bool(fields.get("te_proj", runner.H3_TE_PROJ))
+        new_te_proj_quant = str(fields.get("te_proj_quant", runner.H3_TE_PROJ_QUANT)).strip().lower()
+        if new_te_proj_quant not in RELOAD_TE_PROJ_QUANT_CHOICES:
+            raise ValueError(
+                f"te_proj_quant must be one of {RELOAD_TE_PROJ_QUANT_CHOICES}, got {new_te_proj_quant!r}"
+            )
 
         # ---- resolve new values (unset fields keep the current one) ----
         new_transformer_quant = fields.get("transformer_quant", runner.H3_TRANSFORMER_QUANT)
@@ -346,6 +359,38 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
             raise ValueError(f"te_quant must be one of {RELOAD_TE_QUANT_CHOICES}, got {new_te_quant!r}")
         if new_lowvram_raw not in RELOAD_LOWVRAM_CHOICES:
             raise ValueError(f"lowvram must be one of {RELOAD_LOWVRAM_CHOICES}, got {new_lowvram_raw!r}")
+
+        # ---- 投影TE (te_proj) 有効化後は TE 系 (32B 用) の変更を拒否する ----
+        # 判定は「このリクエスト適用後の値」(new_te_proj) で行う -- 「現在の値」
+        # (runner.H3_TE_PROJ) で判定すると、te_proj を OFF にしながら同時に
+        # te_quant/te_prune も変える (32B に戻すのだから意味がある) 正当なリクエストが
+        # 誤って拒否されてしまう。逆に、te_proj を ON にする (または ON のまま) リクエスト
+        # で te_quant/te_prune が実際に**現在値と違う値へ変わる**場合は、実際のロードが
+        # `_load_text_encoder` の投影分岐で 32B 側をそもそも見ないため、変更しても
+        # 静かに無視される -- 適用されない変更を受け取った時点で 400 にする。
+        #
+        # 判定基準は `k in fields` (フィールドが送られてきたか) ではなく「新しい値が
+        # 現在値と違うか」にすること: app.py/static側は既存フィールドと同じパターンで
+        # te_quant/te_prune を**毎回送る** (変更の有無に関わらずフォーム全体を POST
+        # する) ため、`k in fields` で判定すると te_proj を ON にする度に
+        # (te_quant/te_prune の値を一切変えていなくても) 誤って 400 になってしまう。
+        if new_te_proj:
+            _te_fields = [
+                name
+                for name, old, new in (
+                    ("te_quant", runner.TE_QUANT, new_te_quant),
+                    ("te_prune", runner.H3_TE_PRUNE, new_te_prune),
+                )
+                if old != new
+            ]
+            if _te_fields:
+                raise ValueError(
+                    "投影TE (te_proj) を有効にする(または有効のままにする)リクエストで "
+                    f"te_quant / te_prune の値も変更されています ({', '.join(_te_fields)})。"
+                    "投影TE 有効時は 32B TE 自体をロードしないため、これらの変更は適用されず"
+                    "無視されるだけになります。先に te_proj=false で適用してから "
+                    "te_quant/te_prune を変更してください。"
+                )
 
         new_lowvram = new_lowvram_raw == "1"
         new_lowvram_group = new_lowvram_raw == "group"
@@ -395,6 +440,18 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                 "validate_instant_settings())."
             )
 
+        # ---- resolve the actual H3_TE_PROJ string to commit ----
+        # ON (new_te_proj=True): if `runner.H3_TE_PROJ` is already non-empty (operator
+        # set a local path or a different repo via env), keep it as-is -- only fill in
+        # the default repo ID when it was empty (i.e. env-unconfigured), so an env
+        # override is never silently clobbered by the UI's own default.
+        # OFF (new_te_proj=False): clear to "" so `_load_text_encoder`'s `if H3_TE_PROJ:`
+        # branch is skipped and the 32B path (TE_QUANT-driven) runs instead.
+        if new_te_proj:
+            new_te_proj_repo = runner.H3_TE_PROJ or runner.H3_TE_PROJ_DEFAULT_REPO
+        else:
+            new_te_proj_repo = ""
+
         changed_fields = [
             name
             for name, old, new in (
@@ -403,6 +460,8 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                 ("te_prune", runner.H3_TE_PRUNE, new_te_prune),
                 ("lowvram", runner.H3_LOWVRAM_RAW, new_lowvram_raw),
                 ("video_vae_fp16", runner.H3_VIDEO_VAE_FP16, new_video_vae_fp16),
+                ("te_proj", runner.H3_TE_PROJ, new_te_proj_repo),
+                ("te_proj_quant", runner.H3_TE_PROJ_QUANT, new_te_proj_quant),
             )
             if old != new
         ]
@@ -412,13 +471,19 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
 
         logger.info(
             "apply_reload_settings: changed=%s -> transformer_quant=%s te_quant=%s "
-            "te_prune=%s lowvram=%s video_vae_fp16=%s",
+            "te_prune=%s lowvram=%s video_vae_fp16=%s te_proj=%s te_proj_quant=%s",
             changed_fields, new_transformer_quant, new_te_quant, new_te_prune,
-            new_lowvram_raw, new_video_vae_fp16,
+            new_lowvram_raw, new_video_vae_fp16, bool(new_te_proj_repo), new_te_proj_quant,
         )
 
         # ---- unload everything (models only -- pipe shells are cheap/idempotent to
         # rebuild and are left alone) ----
+        # `unload_all()` -> `_free_text_encoder(force=True)` also clears any stale
+        # `self._pipe._te_projection` cache (see that method's comment) -- important for
+        # both directions of the te_proj toggle: OFF must not leave a stale projection
+        # matrix that a later `_te_projection_for()` call could accidentally pick back
+        # up, and ON must not reuse a projection loaded under a *different* repo/tap
+        # from a previous ON period.
         runner_instance.unload_all()
 
         # ---- commit new globals (module attribute assignment -- every other function
@@ -434,6 +499,8 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
         runner.H3_LOWVRAM_ANY = new_lowvram_any
         runner.H3_TRANSFORMER_BOTH_RESIDENT = new_transformer_both_resident
         runner.H3_VIDEO_VAE_FP16 = new_video_vae_fp16
+        runner.H3_TE_PROJ = new_te_proj_repo
+        runner.H3_TE_PROJ_QUANT = new_te_proj_quant
 
         # ---- reload steady-state residents under the new config ----
         runner_instance.preload_all()

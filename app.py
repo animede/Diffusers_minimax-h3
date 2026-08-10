@@ -158,6 +158,8 @@ def api_settings_apply(
     te_prune: Optional[bool] = Form(None),
     lowvram: Optional[str] = Form(None),
     video_vae_fp16: Optional[bool] = Form(None),
+    te_proj: Optional[bool] = Form(None),
+    te_proj_quant: Optional[str] = Form(None),
 ):
     """Apply a new reload-group configuration: unloads every big model and reloads
     under the new settings (core.settings.apply_reload_settings -> runner.unload_all()
@@ -178,6 +180,10 @@ def api_settings_apply(
         fields["lowvram"] = lowvram
     if video_vae_fp16 is not None:
         fields["video_vae_fp16"] = video_vae_fp16
+    if te_proj is not None:
+        fields["te_proj"] = te_proj
+    if te_proj_quant is not None:
+        fields["te_proj_quant"] = te_proj_quant
 
     acquired = _generation_lock.acquire(blocking=False)
     if not acquired:

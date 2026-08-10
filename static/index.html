@@ -454,6 +454,8 @@
     margin-bottom: 8px;
   }
   .reload-checkbox input[type=checkbox] { width: auto; margin: 0; }
+  .reload-field.disabled, .reload-checkbox.disabled { opacity: 0.45; cursor: not-allowed; }
+  .reload-field.disabled label, .reload-checkbox.disabled label { cursor: not-allowed; }
   button.apply-btn {
     width: 100%;
     padding: 8px;
@@ -726,16 +728,32 @@
             <option value="int8">int8</option>
           </select>
         </div>
-        <div class="reload-field">
+        <div class="reload-field" id="row-reload-te-quant">
           <label data-i18n="label.teQuant">text_encoder 量子化</label>
           <select id="reload-te-quant">
             <option value="bnb-4bit">bnb-4bit (nf4)</option>
             <option value="none">none (bf16)</option>
           </select>
         </div>
-        <div class="reload-checkbox">
+        <div class="reload-checkbox" id="row-reload-te-prune">
           <input type="checkbox" id="reload-te-prune">
           <label style="margin:0;" for="reload-te-prune" data-i18n="label.tePrune">TEレイヤー削除(51/64層のみ構築)</label>
+        </div>
+        <div class="reload-checkbox">
+          <input type="checkbox" id="reload-te-proj">
+          <label style="margin:0;" for="reload-te-proj" data-i18n="label.teProj">投影TE(Qwen3-VL-4B + 学習済み線形写像で32B TEを置換)</label>
+        </div>
+        <div class="reload-field" id="row-reload-te-proj-quant">
+          <label data-i18n="label.teProjQuant">投影TE量子化</label>
+          <select id="reload-te-proj-quant">
+            <option value="bnb-4bit">bnb-4bit (nf4)</option>
+            <option value="bnb-8bit">bnb-8bit (int8)</option>
+            <option value="none">none (bf16)</option>
+          </select>
+        </div>
+        <div class="reload-hint" id="te-proj-hint">
+          <div data-i18n="hint.teProjTags">投影TEは台詞タグ &lt;d&gt;...&lt;/d&gt; を扱えません(台詞は音声参照で入れてください)。</div>
+          <div data-i18n="hint.teProjQuality">品質はプロンプトの大意を保持しますが、細部は近似になります。</div>
         </div>
         <div class="reload-field">
           <label data-i18n="label.lowvram">低VRAMモード</label>
@@ -868,6 +886,11 @@ const I18N = {
     'label.transformerQuant': 'transformer 量子化',
     'label.teQuant': 'text_encoder 量子化',
     'label.tePrune': 'TEレイヤー削除(51/64層のみ構築)',
+    'label.teProj': '投影TE(Qwen3-VL-4B + 学習済み線形写像で32B TEを置換)',
+    'label.teProjQuant': '投影TE量子化',
+    'hint.teProjTags': '投影TEは台詞タグ &lt;d&gt;...&lt;/d&gt; を扱えません(台詞は音声参照で入れてください)。',
+    'hint.teProjQuality': '品質はプロンプトの大意を保持しますが、細部は近似になります。',
+    'hint.teProjDisablesTeQuant': '投影TE(te_proj)が有効なため、text_encoder量子化 / TEレイヤー削除は無効です(32B TE自体をロードしないため変更しても適用されません)。',
     'label.lowvram': '低VRAMモード',
     'option.lowvram0': '0 (無効・48GB超級)',
     'option.lowvram1': '1 (48GB級・per-request reload)',
@@ -1049,6 +1072,11 @@ const I18N = {
     'label.transformerQuant': 'transformer quantization',
     'label.teQuant': 'text_encoder quantization',
     'label.tePrune': 'Prune TE layers (build only 51/64 layers)',
+    'label.teProj': 'Projected TE (Qwen3-VL-4B + learned linear map replacing the 32B TE)',
+    'label.teProjQuant': 'Projected TE quantization',
+    'hint.teProjTags': 'The projected TE cannot handle dialogue tags &lt;d&gt;...&lt;/d&gt; (put dialogue in an audio reference instead).',
+    'hint.teProjQuality': 'Quality preserves the prompt\'s overall intent, but fine detail is approximate.',
+    'hint.teProjDisablesTeQuant': 'Disabled because the projected TE (te_proj) is on: text_encoder quantization / TE layer pruning would not apply since the 32B TE is not loaded at all in this mode.',
     'label.lowvram': 'Low-VRAM mode',
     'option.lowvram0': '0 (disabled, 48GB+ class)',
     'option.lowvram1': '1 (48GB class, per-request reload)',
@@ -1206,6 +1234,12 @@ const instantHintEl = document.getElementById('instant-hint');
 const reloadTransformerQuantEl = document.getElementById('reload-transformer-quant');
 const reloadTeQuantEl = document.getElementById('reload-te-quant');
 const reloadTePruneEl = document.getElementById('reload-te-prune');
+const reloadTeProjEl = document.getElementById('reload-te-proj');
+const reloadTeProjQuantEl = document.getElementById('reload-te-proj-quant');
+const rowReloadTeQuantEl = document.getElementById('row-reload-te-quant');
+const rowReloadTePruneEl = document.getElementById('row-reload-te-prune');
+const rowReloadTeProjQuantEl = document.getElementById('row-reload-te-proj-quant');
+const teProjHintEl = document.getElementById('te-proj-hint');
 const reloadLowvramEl = document.getElementById('reload-lowvram');
 const reloadVideoVaeFp16El = document.getElementById('reload-video-vae-fp16');
 const reloadApplyBtn = document.getElementById('reload-apply-btn');
@@ -1763,11 +1797,14 @@ function applySettingsToControls(data) {
     reloadTransformerQuantEl.value = r.transformer_quant;
     reloadTeQuantEl.value = r.te_quant;
     reloadTePruneEl.checked = r.te_prune;
+    reloadTeProjEl.checked = r.te_proj;
+    reloadTeProjQuantEl.value = r.te_proj_quant;
     reloadLowvramEl.value = r.lowvram;
     reloadVideoVaeFp16El.checked = r.video_vae_fp16;
   }
   if (data.reload_eta_s) RELOAD_ETA_S = data.reload_eta_s;
   updateTurboAvailability();
+  updateTeProjAvailability();
   updateReloadApplyState();
 }
 
@@ -1782,8 +1819,8 @@ async function loadSettings() {
 }
 loadSettings();
 
-[reloadTransformerQuantEl, reloadTeQuantEl, reloadTePruneEl, reloadLowvramEl, reloadVideoVaeFp16El].forEach(el => {
-  el.addEventListener('change', () => { RELOAD_TOUCHED = true; updateReloadApplyState(); });
+[reloadTransformerQuantEl, reloadTeQuantEl, reloadTePruneEl, reloadTeProjEl, reloadTeProjQuantEl, reloadLowvramEl, reloadVideoVaeFp16El].forEach(el => {
+  el.addEventListener('change', () => { RELOAD_TOUCHED = true; updateTeProjAvailability(); updateReloadApplyState(); });
 });
 
 function reloadChangedFields() {
@@ -1793,9 +1830,38 @@ function reloadChangedFields() {
   if (reloadTransformerQuantEl.value !== r.transformer_quant) changed.push('transformer_quant');
   if (reloadTeQuantEl.value !== r.te_quant) changed.push('te_quant');
   if (reloadTePruneEl.checked !== r.te_prune) changed.push('te_prune');
+  if (reloadTeProjEl.checked !== r.te_proj) changed.push('te_proj');
+  if (reloadTeProjQuantEl.value !== r.te_proj_quant) changed.push('te_proj_quant');
   if (reloadLowvramEl.value !== r.lowvram) changed.push('lowvram');
   if (reloadVideoVaeFp16El.checked !== r.video_vae_fp16) changed.push('video_vae_fp16');
   return changed;
+}
+
+// te_proj (投影TE) が ON のとき te_quant/te_prune は無効(32B TE自体をロードしない
+// ため変更しても適用されない -- core/settings.py の apply_reload_settings() が同じ
+// 組み合わせを400で拒否する。サーバの constraints.te_quant_te_prune_incompatible_
+// with_te_proj を読む既存パターン(turboIncompatibleReason 参照)ではなく、ここでは
+// フォーム自身の(まだ未送信の)チェック状態から判定する -- ユーザーがこの場で
+// te_proj をトグルした結果を即座に反映する必要があるため。
+function updateTeProjAvailability() {
+  const disabled = reloadTeProjEl.checked;
+  reloadTeQuantEl.disabled = disabled;
+  reloadTePruneEl.disabled = disabled;
+  rowReloadTeQuantEl.classList.toggle('disabled', disabled);
+  rowReloadTePruneEl.classList.toggle('disabled', disabled);
+  rowReloadTeProjQuantEl.classList.toggle('disabled', !disabled);
+  reloadTeProjQuantEl.disabled = !disabled;
+  teProjHintEl.classList.toggle('warn', disabled);
+  const disabledHintEl = document.getElementById('te-proj-disables-te-quant-hint');
+  if (disabled && !disabledHintEl) {
+    const div = document.createElement('div');
+    div.id = 'te-proj-disables-te-quant-hint';
+    div.dataset.i18n = 'hint.teProjDisablesTeQuant';
+    div.textContent = t('hint.teProjDisablesTeQuant');
+    teProjHintEl.prepend(div);
+  } else if (!disabled && disabledHintEl) {
+    disabledHintEl.remove();
+  }
 }
 
 function updateReloadApplyState() {
@@ -1830,6 +1896,8 @@ reloadApplyBtn.addEventListener('click', async () => {
   fd.append('transformer_quant', reloadTransformerQuantEl.value);
   fd.append('te_quant', reloadTeQuantEl.value);
   fd.append('te_prune', reloadTePruneEl.checked ? '1' : '');
+  fd.append('te_proj', reloadTeProjEl.checked ? '1' : '');
+  fd.append('te_proj_quant', reloadTeProjQuantEl.value);
   fd.append('lowvram', reloadLowvramEl.value);
   fd.append('video_vae_fp16', reloadVideoVaeFp16El.checked ? '1' : '');
   try {
