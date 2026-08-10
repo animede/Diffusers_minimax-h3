@@ -1886,6 +1886,48 @@ def seconds_to_num_frames(seconds: float) -> int:
     return align_num_frames(round(seconds * FPS))
 
 
+# デコード結果 (fp32 の全長テンソル) を uint8 の numpy 配列にするときの、一度に処理する
+# フレーム数。8 は「削減がほぼ頭打ちになる最小」を実測で選んだ値 (下記)。
+_FRAMES_TO_UINT8_CHUNK = 8
+
+
+def frames_to_uint8(video_tensor: torch.Tensor, chunk: int = _FRAMES_TO_UINT8_CHUNK) -> np.ndarray:
+    """`(F, C, H, W)` の fp32 デコード結果を `(F, H, W, C)` の uint8 numpy 配列にする。
+
+    **なぜチャンクに分けるのか**: 素直に書くと
+    `(v.permute(...).float().clamp(0,1) * 255).round().to(torch.uint8).cpu().numpy()` になるが、
+    これは**全長ぶんの中間テンソルを何本も GPU 上に作る** (`float()` / `clamp` / `*255` /
+    `round()` が各々新しいテンソルを返し、最後に uint8 版も作られる)。768x1344・107フレームで
+    **+2.65GB** を積んでいた (2026-08-10 実測)。デコード位相のピーク 16.29GB のうち 15% が
+    ここだった、という内訳の分解から見つけたもの。
+
+    フレームを少しずつ変換して CPU 側の出力配列へ直接書き込めば、GPU に同時に存在するのは
+    `chunk` フレームぶんだけになる。**実測 +2.65GB → +0.03GB (-99%)、出力は
+    `np.array_equal` でバイト完全一致**。演算順序は現行と同一 (permute → float → clamp →
+    ×255 → round → uint8) なので丸めも変わらない。
+
+    `chunk` を大きくしても速度はほぼ変わらず (転送はどのみち全長ぶん)、小さくしすぎると
+    Python ループのオーバーヘッドが出る。8 で削減はほぼ飽和する。
+    """
+    if video_tensor.dim() == 5:
+        video_tensor = video_tensor[0]
+    num_frames, _, height, width = video_tensor.shape
+    out = np.empty((num_frames, height, width, 3), dtype=np.uint8)
+    for i in range(0, num_frames, chunk):
+        part = (
+            video_tensor[i : i + chunk]
+            .permute(0, 2, 3, 1)
+            .float()
+            .clamp_(0, 1)
+            .mul_(255)
+            .round_()
+            .to(torch.uint8)
+        )
+        out[i : i + chunk] = part.cpu().numpy()
+        del part
+    return out
+
+
 def _num_frames_from_audio_reference(references: list, fps: int) -> int:
     r"""ref2va の `seconds=None` を、ちょうど1本の音声を持つ参照 (単体の
     `MiniMaxH3AudioReference`、または音声付きの `MiniMaxH3VideoReference`) の長さから
@@ -4780,11 +4822,9 @@ class MiniMaxH3Runner:
             sampling_rate = state.get("sampling_rate")
 
             video_tensor = videos[0] if isinstance(videos, list) else videos
-            if video_tensor.dim() == 5:
-                video_tensor = video_tensor[0]
-            frames_uint8 = (
-                (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
-            )
+            # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
+            # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
+            frames_uint8 = frames_to_uint8(video_tensor)
             audio_np = audio[0].float().cpu().numpy()
             rms = float(np.sqrt(np.mean(audio_np**2)))
             peak = float(np.max(np.abs(audio_np)))
@@ -5147,11 +5187,9 @@ class MiniMaxH3Runner:
                 audio = state.get("audio")
                 sampling_rate = state.get("sampling_rate")
                 video_tensor = videos[0] if isinstance(videos, list) else videos
-                if video_tensor.dim() == 5:
-                    video_tensor = video_tensor[0]
-                frames_uint8 = (
-                    (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
-                )
+                # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
+                # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
+                frames_uint8 = frames_to_uint8(video_tensor)
                 audio_np = audio[0].float().cpu().numpy()
                 del video_tensor, videos, audio
                 gc.collect()
@@ -5823,11 +5861,9 @@ class MiniMaxH3Runner:
             sampling_rate = state.get("sampling_rate")
 
             video_tensor = videos[0] if isinstance(videos, list) else videos
-            if video_tensor.dim() == 5:
-                video_tensor = video_tensor[0]
-            frames_uint8 = (
-                (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
-            )
+            # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
+            # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
+            frames_uint8 = frames_to_uint8(video_tensor)
             audio_np = audio[0].float().cpu().numpy()
             rms = float(np.sqrt(np.mean(audio_np**2)))
             peak = float(np.max(np.abs(audio_np)))
@@ -6214,11 +6250,9 @@ class MiniMaxH3Runner:
                 audio = state.get("audio")
                 sampling_rate = state.get("sampling_rate")
                 video_tensor = videos[0] if isinstance(videos, list) else videos
-                if video_tensor.dim() == 5:
-                    video_tensor = video_tensor[0]
-                frames_uint8 = (
-                    (video_tensor.permute(0, 2, 3, 1).float().clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
-                )
+                # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
+                # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
+                frames_uint8 = frames_to_uint8(video_tensor)
                 audio_np = audio[0].float().cpu().numpy()
                 del video_tensor, videos, audio
                 gc.collect()
