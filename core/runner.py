@@ -588,11 +588,21 @@ if H3_KEEP_TRANSFORMER:
             "keeps its transformer resident via a different (CPU+block-offload) design "
             "and is unrelated"
         )
-    if not H3_TE_DEVICE:
+    if not H3_TE_DEVICE and not H3_TE_PROJ:
+        # この条件は **32B TE を前提にした収支** から来ている: TE-nf4 17.45GB +
+        # 常駐 transformer-int8 34.3GB = 51.75GB で、実効予算 ~49.8GB を超えるため
+        # デコードより先に**エンコード位相**が破綻する。だから「TE は別GPUへ」が必須だった。
+        #
+        # **投影TE (H3_TE_PROJ) はこの前提を満たさない**: NF4 で常駐 3.11GB (実測) なので
+        # 3.11 + 34.03 = 37.1GB、デノイズ活性化 6.6GB を足しても 43.7GB で予算内に収まる。
+        # つまり同一GPU上で TE と transformer を同時常駐させられる — H3_TE_DEVICE を
+        # 要求する理由がない。投影TEのときはこのガードを免除する。
         _keep_transformer_missing.append(
             "H3_TE_DEVICE must be set (TE on a separate GPU) -- otherwise the *encode* "
             "phase (not decode) breaks first: TE-nf4 17.45GB + resident transformer-int8 "
-            "34.3GB = 51.75GB, over the ~49.8GB effective budget"
+            "34.3GB = 51.75GB, over the ~49.8GB effective budget. "
+            "(Not required when H3_TE_PROJ is set: the projected TE is 3.11GB at NF4, so "
+            "it fits on the same GPU alongside the transformer.)"
         )
     if not H3_VIDEO_VAE_FP16:
         _keep_transformer_missing.append(
