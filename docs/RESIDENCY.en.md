@@ -163,17 +163,42 @@ Decode  : decode peak (16.29 / 11.4 with fp16)        ≤ effective budget
 - Want the TE to stay resident through denoise → `TE + transformer + activations ≤ capacity`
 - Want the transformer to stay resident through decode → `transformer + decode peak ≤ capacity`
 
-### 5.3 Modes derived from capacity
+### 5.3 Modes derived from capacity (fully revised 2026-08-10)
 
-| Capacity | Configuration that works | Bottleneck (why you can't go further) |
+**Three premises changed** (all measured the same day): (1) the projected TE at NF4 is
+**3.11GB** resident (replacing the pruned 32B nf4's 17.45GB; caveats: no `<d>` dialogue
+tags — use an audio reference instead — approximate detail, and the ref2va vision path is
+unverified), (2) the decode phase is **7.53GB** (video VAE fp16 + the uint8 fix; 14.2GB
+even at fp32), (3) denoise stays 34.03+6.6=**40.6GB**. The tables below are re-derived
+from those. **Everything not marked "measured" is a derivation.**
+
+**Single GPU (no 2nd card)**
+
+| Capacity (effective) | 32B TE route | Projected TE (NF4) route |
 |---|---|---|
-| **96GB** | bf16 as-is, TE+transformer resident (87.5GB) | at decode time all three at once (98.5GB) don't fit, so the transformer has to give way |
-| **80GB** | int8, TE+transformer+transformer_ref resident (89GB) | same as above |
-| **48GB** | `H3_LOWVRAM=1`. TE(17.45)+transformer(34)+activations(6.6) = **58GB, doesn't fit** → swap every time | **having nowhere to park the TE** is the cause of the fixed cost |
-| **32GB** | `H3_LOWVRAM=group`. transformer resident in RAM, streamed block by block | TE(21)+decode(16.3)=37GB > 32GB, so TE gives way at decode time |
-| **24GB** | `group` + `H3_TE_PRUNE=1` | TE-nf4 17.45GB is most of the budget. Won't fit without pruning |
-| **18GB** | same as above (measured floor) | **the pruned TE-nf4's 17.45GB itself is the floor** |
-| 16GB | **not possible** | OOMs near the end of the TE load. Breaking through this would require streaming execution of the TE |
+| 96GB | bf16 TE+transformer resident (measured) | unnecessary (plenty of room) |
+| 48GB (~49.8) | `H3_LOWVRAM=1`, swap every request (measured) | **everything resident at once, expected**: 3.11+34.03+7.53=**44.7GB** (margin ~5.1GB) → fixed cost gone. **Unmeasured**, needs a guard change (below) |
+| 32GB (~30.5) | `group` (nf4 21 + blocks 1.4 + activations 6.6 = 29, barely) | `group` with room to spare (~11.1GB incl. TE) |
+| 24GB (~22.4) | `group`+`H3_TE_PRUNE=1` required (measured, the old floor) | `group` with room to spare (~11.1GB) |
+| **16GB (~15.2)** | **not possible** (the 17.45GB TE doesn't fit) | **`group` expected to work**: TE 3.11 + blocks 1.4 + activations 6.6 = **11.1GB**, decode 7.53GB. Opens up the previously-impossible 16GB tier. **Unmeasured** |
+
+> **48GB single-GPU caveat**: `H3_KEEP_TRANSFORMER`'s import-time guard currently requires
+> `H3_TE_DEVICE` (it was designed around the 32B TE). Housing the projected TE **on the
+> same GPU** needs a guard change (implementation task, not started). Until then the
+> projected TE still runs in the swap-per-request shape (the TE part of which is now cheap).
+
+**With a 2nd GPU (`H3_TE_DEVICE` parks the TE off-card)**
+
+| Main | 2nd GPU requirement | What works |
+|---|---|---|
+| 48GB | 20GB (32B pruned, 17.76 measured) | t2va/t2i at **9.7s / 44.2s (measured)**. ref2va needs a 24GB 2nd card |
+| 48GB | **8GB-class** (projected NF4, 3.11) | the same residency on a much cheaper card (derived) |
+| 32GB | 20GB (32B) / 8GB-class (projected NF4) | still `group`, just with more headroom. **Non-group stays impossible even with a 2nd card** (denoise 40.6 > 30.5 is the main GPU's problem) |
+| 24/16GB | **6–8GB-class** (projected NF4) | the main GPU runs `group` alone (blocks + activations ~8GB); parking the TE elsewhere lowers the main-GPU floor further |
+
+ref2va needs care at every tier: with the 32B TE, reference encoding adds **≥3.22GB
+(measured)** on the TE's GPU. The projected TE's vision path is **unverified** (the
+projection matrix was calibrated on text only).
 
 ### 5.4 Putting the TE on a separate GPU (`H3_TE_DEVICE`)
 
@@ -181,10 +206,12 @@ The capacity needed for the TE's GPU depends on the use case.
 
 The current 20GB card's **effective budget is about 19.7GB** (catalog 21.47GB − unit gap 0.5 − non-PyTorch ~1).
 
-| Use case | Required (measured) | Fits on 20GB? |
+| TE | Required | Card that fits |
 |---|---|---|
-| t2va / fl2va / t2i | 17.76GB | **Fits** (margin ~1.9GB) |
-| ref2va | **20.67GB or more** (TE 17.45 + reference encoding 3.22 or more) | **Doesn't fit** (OOM, short by 204MB) |
+| 32B pruned nf4 / t2va-family | 17.76GB (measured) | **20GB+** (margin ~1.9GB) |
+| 32B pruned nf4 / ref2va | **20.67GB+** (measured: TE 17.45 + reference encoding ≥3.22) | **24GB+** (20GB OOMs, short by 204MB; multiple references not guaranteed even at 24GB) |
+| Projected 4B bf16 | 8.88GB (measured) + ε | 12GB (thin) / **16GB+** |
+| **Projected 4B NF4** | **3.11GB (measured) + ε** | **expected to fit a 6–8GB-class card** (derived, unmeasured; the ref2va vision path is also unverified) |
 
 **→ ref2va needs an effective 20.7GB or more, i.e. a catalog capacity of 22.2GB or more.** A 24GB card
 (effective ~22.4GB) is expected to fit with a margin of ~1.7GB. This is the concrete basis for swapping
