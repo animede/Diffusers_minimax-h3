@@ -151,7 +151,7 @@ decode   : [vae ペア ~11GB + デコードバッファ]
 **症状**: group offload モードで、デノイズの**最初の** transformer ブロックの forward が
 `RuntimeError: cannot pin 'torch.cuda.CharTensor' only dense CPU tensors can be pinned` で失敗。
 
-**原因**: `low_cpu_mem_usage=True`(diffusers の既定)は `enable_group_offload()` 時点での事前ピンをスキップし、**毎回の onload 時にピンする**経路に切り替わる。torchao の `Int8Tensor` に対してこの遅延ピン経路は機能しない。`use_stream=True` と組み合わさったときだけ発火する。
+**原因**: `low_cpu_mem_usage=True`(API 既定は False)は `enable_group_offload()` 時点での事前ピンをスキップし、**毎回の onload 時にピンする**経路に切り替わる。torchao の `Int8Tensor` に対してこの遅延ピン経路は機能しない。`use_stream=True` と組み合わさったときだけ発火する。
 
 **解決**: `low_cpu_mem_usage=False` を既定にした。名前に反して**これが安全側**である。実機を使った最小再現(int8 量子化した nn.Linear のスタック)まで落として、この組み合わせが無条件のトリガであることを確認した。
 

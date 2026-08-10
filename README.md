@@ -593,7 +593,7 @@ diffusers-server(姉妹プロジェクト)の CLAUDE.md #33/#34/#37 で確立さ
   TEはリクエストをまたいで常駐する(transformerがそもそも常駐するため、
   TEも常駐させておいた方がリクエストごとの再ロードコストを避けられる)。
 
-### 【重大な発見】`use_stream=True` + `low_cpu_mem_usage=True`(diffusers既定)は
+### 【重大な発見】`use_stream=True` + `low_cpu_mem_usage=True` の併用は
 torchao Int8Tensorに対してバグがあり動かない
 
 `scripts/probe_group_offload_forward.py` で実際にforwardを走らせたところ、
@@ -610,7 +610,9 @@ pinned` で denoise の最初のブロックで必ず失敗することを実機
 
 | 設定 | 結果 | 1ブロックあたりonload/offload |
 |---|---|---|
-| `use_stream=True, low_cpu_mem_usage=True`(diffusers既定) | **クラッシュ** | - |
+| `use_stream=True, low_cpu_mem_usage=True`(併用時) | **クラッシュ** | - |
+
+(2026-08-10 訂正: 当初この組み合わせを「diffusers既定」と記載していたが誤り。`apply_group_offloading` の API 既定値は `use_stream=False, low_cpu_mem_usage=False` で、省メモリ目的で両方をオプトインしたときに踏む)
 | `use_stream=False, low_cpu_mem_usage=True` | 動作OK | onload 0.1-0.26s / offload ~0.22s |
 | `use_stream=True, low_cpu_mem_usage=False` | 動作OK | **onload 0.04-0.07s** / offload ~0s |
 

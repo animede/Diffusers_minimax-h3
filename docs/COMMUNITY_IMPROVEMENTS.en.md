@@ -74,7 +74,7 @@ down to mp4 MD5/byte match.
 | Measured | **peak 28.7GB** under a 32GB cap, denoise 220.8s (~2.1x the resident-mode figure) |
 | Equivalence | **mp4 MD5 match** with the normal int8 mode |
 | Verdict | **opt-in** |
-| Gotcha | **`use_stream=True` combined with `low_cpu_mem_usage=True` (the diffusers default) crashes on torchao `Int8Tensor`'s pin_memory** (`cannot pin 'torch.cuda.CharTensor'`). Worked around with `low_cpu_mem_usage=False` (also speeds up onload 4–5x). → A real bug worth reporting upstream to diffusers |
+| Gotcha | **`use_stream=True` combined with `low_cpu_mem_usage=True` crashes on torchao `Int8Tensor`'s pin_memory** (`cannot pin 'torch.cuda.CharTensor'`). Worked around with `low_cpu_mem_usage=False` (also speeds up onload 4–5x). → A real bug worth reporting upstream to diffusers |
 | Commit | `26bf434` |
 
 ---

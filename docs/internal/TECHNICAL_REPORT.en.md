@@ -152,7 +152,7 @@ This pitfall was nastier under `H3_LOWVRAM=1`. In that mode, the trick of "just 
 **Symptom**: in group offload mode, the forward pass of the **very first** transformer block during denoising fails with
 `RuntimeError: cannot pin 'torch.cuda.CharTensor' only dense CPU tensors can be pinned`.
 
-**Cause**: `low_cpu_mem_usage=True` (diffusers' default) skips pre-pinning at `enable_group_offload()` time and switches to a path that **pins on every onload instead**. This deferred-pinning path does not work for torchao's `Int8Tensor`. It only fires when combined with `use_stream=True`.
+**Cause**: `low_cpu_mem_usage=True` (the API default is False) skips pre-pinning at `enable_group_offload()` time and switches to a path that **pins on every onload instead**. This deferred-pinning path does not work for torchao's `Int8Tensor`. It only fires when combined with `use_stream=True`.
 
 **Fix**: default to `low_cpu_mem_usage=False`. Despite its name, **this is the safe side**. A minimal real-hardware reproduction (a stack of int8-quantized nn.Linear layers) confirmed that this combination triggers the bug unconditionally.
 

@@ -158,7 +158,7 @@ FirstBlockCache は、ステップ間で transformer 最初のブロックの残
 
 `H3_LOWVRAM=group`(24-32GB級)は、diffusers の `enable_group_offload(offload_type="block_level", num_blocks_per_group=1, use_stream=...)` を用い、int8 量子化した transformer を**ホスト RAM に常駐**させたまま、denoise の各ステップで必要なブロック(50層中1〜2層、約0.68GB/個)だけを都度 GPU へ出し入れする block-level group offload である。transformer はプロセス起動時に一度だけロードされ、リクエストをまたいで常駐し続ける。
 
-`device_map={"transformer": "cpu"}` で CPU 上にロードした場合でも int8 量子化は正しく適用される(370/370層が `Int8Tensor` 化されることを実機確認済み)。diffusers 既定の `use_stream=True` + `low_cpu_mem_usage=True` の組み合わせは torchao の `Int8Tensor` に対して `cannot pin 'torch.cuda.CharTensor'` で確実にクラッシュするバグがあり、`low_cpu_mem_usage=False`(`H3_GROUP_OFFLOAD_LOW_CPU_MEM`、既定0=False)を採用することで回避している。この設定は onload が4〜5倍速くなる副次効果もある(0.04〜0.07s/ブロック 対 0.1〜0.26s/ブロック)。
+`device_map={"transformer": "cpu"}` で CPU 上にロードした場合でも int8 量子化は正しく適用される(370/370層が `Int8Tensor` 化されることを実機確認済み)。`use_stream=True` + `low_cpu_mem_usage=True` の組み合わせ(API の既定値はどちらも False。省メモリ目的で両方を有効にすると踏む)は torchao の `Int8Tensor` に対して `cannot pin 'torch.cuda.CharTensor'` で確実にクラッシュするバグがあり、`low_cpu_mem_usage=False`(`H3_GROUP_OFFLOAD_LOW_CPU_MEM`、既定0=False)を採用することで回避している。この設定は onload が4〜5倍速くなる副次効果もある(0.04〜0.07s/ブロック 対 0.1〜0.26s/ブロック)。
 
 ### 固定費の削減3段
 

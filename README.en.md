@@ -670,7 +670,7 @@ without issue**.
   state, TE stays resident across requests too (since the transformer is resident in the
   first place, it's better to keep TE resident as well and avoid per-request reload cost).
 
-### [Major finding] `use_stream=True` + `low_cpu_mem_usage=True` (diffusers default) has a bug that breaks torchao Int8Tensor
+### [Major finding] `use_stream=True` + `low_cpu_mem_usage=True` combined has a bug that breaks torchao Int8Tensor
 
 Actually running a forward pass in `scripts/probe_group_offload_forward.py` confirmed on
 real hardware that it always fails at the first denoise block with
@@ -686,7 +686,9 @@ of a controlled comparison in `scripts/probe_group_offload_fix.py`:
 
 | Setting | Result | Onload/offload per block |
 |---|---|---|
-| `use_stream=True, low_cpu_mem_usage=True` (diffusers default) | **crash** | - |
+| `use_stream=True, low_cpu_mem_usage=True` (combined) | **crash** | - |
+
+(Corrected 2026-08-10: this combination was originally described here as "the diffusers default", which was wrong — the `apply_group_offloading` API defaults are `use_stream=False, low_cpu_mem_usage=False`; the crash is hit when both are opted into for a memory-constrained setup.)
 | `use_stream=False, low_cpu_mem_usage=True` | works | onload 0.1-0.26s / offload ~0.22s |
 | `use_stream=True, low_cpu_mem_usage=False` | works | **onload 0.04-0.07s** / offload ~0s |
 

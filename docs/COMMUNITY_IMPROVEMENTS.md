@@ -73,7 +73,7 @@
 | 実測 | 32GB 制限で **peak 28.7GB**、デノイズ 220.8s(常駐比 ~2.1倍) |
 | 等価性 | 通常 int8 モードと **mp4 MD5 一致** |
 | 判定 | **opt-in** |
-| 罠 | **`use_stream=True` + `low_cpu_mem_usage=True`(diffusers 既定)は torchao `Int8Tensor` の pin_memory でクラッシュ**(`cannot pin 'torch.cuda.CharTensor'`)。`low_cpu_mem_usage=False` で回避(onload も4〜5倍高速化)。→ diffusers 本体に報告する価値のある実バグ |
+| 罠 | **`use_stream=True` + `low_cpu_mem_usage=True` の併用は torchao `Int8Tensor` の pin_memory でクラッシュ**(`cannot pin 'torch.cuda.CharTensor'`)。`low_cpu_mem_usage=False` で回避(onload も4〜5倍高速化)。→ diffusers 本体に報告する価値のある実バグ |
 | コミット | `26bf434` |
 
 ---
