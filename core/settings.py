@@ -222,6 +222,12 @@ def current_settings_snapshot() -> dict:
             "te_prune": runner.H3_TE_PRUNE,
             "lowvram": runner.H3_LOWVRAM_RAW,
             "video_vae_fp16": runner.H3_VIDEO_VAE_FP16,
+            # 投影TE は現状 env 専用 (H3_TE_PROJ / H3_TE_PROJ_QUANT)。この API からは
+            # 変更できない**読み取り専用**の状態として載せる -- 有効時は te_quant /
+            # te_prune の変更が apply 側で 400 拒否されるため、UI がその理由を
+            # 表示できるように状態自体は見えている必要がある。
+            "te_proj": bool(runner.H3_TE_PROJ),
+            "te_proj_quant": runner.H3_TE_PROJ_QUANT if runner.H3_TE_PROJ else None,
         },
         "choices": {
             "cache": list(INSTANT_CACHE_CHOICES),
@@ -299,6 +305,24 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
 
     with _reload_lock:
         t0 = time.time()
+
+        # ---- 投影TE (H3_TE_PROJ) 有効時は TE 系の変更を拒否する ----
+        # runner 側の import 時ガード (H3_TE_PROJ と H3_TE_QUANT/H3_TE_PRUNE の排他) は
+        # env の組み合わせしか見ていないため、この API から te_quant/te_prune を送ると
+        # **ガードを素通り**する。しかも実際のロードは `_load_text_encoder` が投影経路へ
+        # 先に分岐するので値は適用されず、スナップショットだけが「変わった」と報告する
+        # -- 静かな嘘になる。適用されない変更は受け取った時点で 400 で返すのが正しい。
+        # (2026-08-10 のレビューで発見。投影TE 自体をこの API から切り替えられるように
+        # するのは別作業 -- 現状は env 専用。)
+        if runner.H3_TE_PROJ:
+            _te_fields = [k for k in ("te_quant", "te_prune") if k in fields]
+            if _te_fields:
+                raise ValueError(
+                    "投影TE (H3_TE_PROJ) が有効なため、te_quant / te_prune はこの API から"
+                    f"変更できません (指定されたフィールド: {', '.join(_te_fields)})。"
+                    "TE の構成は環境変数 H3_TE_PROJ / H3_TE_PROJ_QUANT で管理されています。"
+                    "32B TE に戻すにはサーバーを H3_TE_PROJ なしで再起動してください。"
+                )
 
         # ---- resolve new values (unset fields keep the current one) ----
         new_transformer_quant = fields.get("transformer_quant", runner.H3_TRANSFORMER_QUANT)

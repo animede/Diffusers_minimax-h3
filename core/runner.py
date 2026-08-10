@@ -336,6 +336,30 @@ H3_TE_PROJ_FILE = os.environ.get("H3_TE_PROJ_FILE", "h3_qwen3vl_4b_tap24.safeten
 # `source_model` = qwen3vl_4b_bf16) と同系列の Instruct 版。
 H3_TE_PROJ_MODEL = os.environ.get("H3_TE_PROJ_MODEL", "Qwen/Qwen3-VL-4B-Instruct").strip()
 
+# 投影TE (4B) 自身の量子化。**32B 用の `H3_TE_QUANT` とは別フラグ**にしてある。
+# 下の排他ガードが `H3_TE_QUANT` 等を弾くのは「32B 向けの設定を 4B に流用させない」ため
+# であって、4B を量子化してはいけないという意味ではない -- 混同しないこと。
+#
+#   "none"      (既定) bf16 のまま。常駐 8.88GB
+#   "bnb-4bit"  NF4。常駐 3.11GB (-65%)、投影後の条件付けのズレは相対RMS 0.61〜0.96%
+#   "bnb-8bit"  int8。常駐 4.84GB (-46%)、ズレは相対RMS 0.24〜0.53%
+#
+# **なぜ量子化が要るか**: 48GB 機で TE と transformer(int8 34.03GB)を同時常駐させ、
+# 位相ごとの載せ替え(このリポジトリの速度の律速)を消すため。bf16 の 8.88GB だと
+# 8.88 + 34.03 + デノイズ活性化 6.6 = 49.5GB で実効予算 49.8GB に対し余裕 0.3GB しかなく、
+# 20GB カードで「導出上は入るが実測 OOM」を踏んだ前例からして期待できない。NF4 なら
+# 37.1 + 6.6 = 43.7GB で余裕 6.1GB。
+H3_TE_PROJ_QUANT = os.environ.get("H3_TE_PROJ_QUANT", "none").strip()
+if H3_TE_PROJ_QUANT not in ("none", "bnb-4bit", "bnb-8bit"):
+    raise RuntimeError(
+        f"H3_TE_PROJ_QUANT must be one of none/bnb-4bit/bnb-8bit, got {H3_TE_PROJ_QUANT!r}"
+    )
+if H3_TE_PROJ_QUANT != "none" and not H3_TE_PROJ:
+    raise RuntimeError(
+        "H3_TE_PROJ_QUANT quantizes the projected 4B text encoder, but H3_TE_PROJ is not "
+        "set, so there is no 4B to quantize. Set H3_TE_PROJ (or drop H3_TE_PROJ_QUANT)."
+    )
+
 if H3_TE_PROJ:
     # 小型モデルを別途量子化・層削除する意味がない (そもそも 4B は 32B より遥かに軽い上、
     # 投影行列は特定の tap 層・特定の重み分布に対して学習されているため、量子化や層削除で
@@ -1911,8 +1935,10 @@ def frames_to_uint8(video_tensor: torch.Tensor, chunk: int = _FRAMES_TO_UINT8_CH
     """
     if video_tensor.dim() == 5:
         video_tensor = video_tensor[0]
-    num_frames, _, height, width = video_tensor.shape
-    out = np.empty((num_frames, height, width, 3), dtype=np.uint8)
+    # チャネル数は実テンソルから取る (H3 は常に RGB=3 だが、置き換え前のコードは
+    # チャネル数に依存しない書き方だったので、その一般性を保つ)。
+    num_frames, channels, height, width = video_tensor.shape
+    out = np.empty((num_frames, height, width, channels), dtype=np.uint8)
     for i in range(0, num_frames, chunk):
         part = (
             video_tensor[i : i + chunk]
@@ -3329,11 +3355,38 @@ class MiniMaxH3Runner:
         t0 = time.time()
         from transformers import AutoModelForImageTextToText
 
-        te = AutoModelForImageTextToText.from_pretrained(
-            H3_TE_PROJ_MODEL,
+        load_kwargs = dict(
             dtype=torch.bfloat16,
             device_map=H3_TE_DEVICE if self._te_external else "cuda",
         )
+        if H3_TE_PROJ_QUANT != "none":
+            # 4B 自体の量子化。**投影行列は bf16 用のものをそのまま使う**のが正しい
+            # (2026-08-10 実測、下記)。
+            #
+            # 投影は 4B (bf16) の隠れ状態の統計 (mean_in/std_in) に合わせて校正されて
+            # いるので、「量子化すると統計がずれて行列が使えないのでは」という懸念は
+            # 当然ある。3プロンプト (英語/公式記法/日本語) で投影後の条件付けを実測した
+            # 結果、**ズレは 1% 未満**で cosine は 1.0000 だった:
+            #
+            #   NF4  : 相対RMS 0.61〜0.96%   常駐 3.11GB (bf16 8.88GB から -65%)
+            #   int8 : 相対RMS 0.24〜0.53%   常駐 4.84GB
+            #
+            # 配布元は `h3_qwen3vl_4b_int8convrot_tap24.safetensors` という量子化版
+            # 専用の行列も出しているが、**あれを使うとかえってズレが大きくなる**
+            # (相対RMS 1.02〜2.97%)。ComfyUI の `int8_convrot` 方式に合わせて校正された
+            # もので、bitsandbytes の量子化とは別物だから。**bf16 用行列を使うこと。**
+            from transformers import BitsAndBytesConfig
+
+            if H3_TE_PROJ_QUANT == "bnb-4bit":
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+            else:  # "bnb-8bit"
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+
+        te = AutoModelForImageTextToText.from_pretrained(H3_TE_PROJ_MODEL, **load_kwargs)
         # tokenizer/processor は H3 のもの (通常ロード経路と同一) -- text_encoder だけ
         # 4B に差し替える。
         self._pipe.load_components(names=["tokenizer", "processor"])
@@ -3617,6 +3670,7 @@ class MiniMaxH3Runner:
             "te_prune": H3_TE_PRUNE,
             "te_proj": bool(H3_TE_PROJ),
             "te_proj_model": H3_TE_PROJ_MODEL if H3_TE_PROJ else None,
+            "te_proj_quant": H3_TE_PROJ_QUANT if H3_TE_PROJ else None,
             "te_proj_tap": (
                 getattr(self._pipe, "_te_projection", None).tap
                 if self._pipe is not None and getattr(self._pipe, "_te_projection", None) is not None
