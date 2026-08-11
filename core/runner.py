@@ -337,7 +337,14 @@ H3_TE_PREQUANT_MIN_FREE_GB = float(os.environ.get("H3_TE_PREQUANT_MIN_FREE_GB", 
 H3_TE_PROJ_DEFAULT_REPO = "NicoLab28/ClipProj-MiniMax-H3"
 H3_TE_PROJ = os.environ.get("H3_TE_PROJ", "").strip()
 # `H3_TE_PROJ` が HF リポジトリIDのときに読むファイル名。ローカルパス指定時は無視される。
-H3_TE_PROJ_FILE = os.environ.get("H3_TE_PROJ_FILE", "h3_qwen3vl_4b_tap24.safetensors").strip()
+# 既定ファイル名の変遷 (2026-08-12): 配布元が `h3_qwen3vl_4b_tap24.safetensors` を
+# `obsolete/` へ移動し、**再校正版** `mmh3-4b-ClipProj.safetensors` に置き換えた
+# (学習 1,666→5,664 プロンプト / 289K→1.14M トークン、cos_test 0.711→0.717。
+# W の cosine は旧比 0.9596 = 実質別の関数)。旧名のままでは新規取得が 404 になるため
+# 既定を新名へ更新。**注意: 2026-08-10 の品質実測 (PSNR 22.49dB 等) は旧行列での値**。
+# 旧行列はローカル HF キャッシュ (snapshot 3f762f19) に残っており、必要なら
+# H3_TE_PROJ にその絶対パスを渡せば再現できる。
+H3_TE_PROJ_FILE = os.environ.get("H3_TE_PROJ_FILE", "mmh3-4b-ClipProj.safetensors").strip()
 # 投影に使う小型 TE 本体。既定は投影行列が学習された対象 (safetensors メタデータの
 # `source_model` = qwen3vl_4b_bf16) と同系列の Instruct 版。
 H3_TE_PROJ_MODEL = os.environ.get("H3_TE_PROJ_MODEL", "Qwen/Qwen3-VL-4B-Instruct").strip()
@@ -4485,20 +4492,23 @@ class MiniMaxH3Runner:
             # branch -- wrapped anyway for the same reason every other branch is, so the
             # scoping rule ("min_duration only relaxed around MiniMaxH3PrepareLayoutStep")
             # holds uniformly across all branches rather than as a special case.
-            with _relaxed_min_duration() if still else _NullContext():
-                layout_step = MiniMaxH3PrepareLayoutStep()
-                _, state = layout_step(pipe, state)
-            # `is_fl2va` is always True on this branch (see the comment above), so these
-            # two run unconditionally -- see the `H3_LOWVRAM_GROUP` branch's own comment
-            # for why fl2va needs them now.
-            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
-            _, state = condition_latents_step(pipe, state)
-            latents_step = MiniMaxH3PrepareLatentsStep()
-            _, state = latents_step(pipe, state)
-            fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
-            _, state = fl2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
-            _, state = timesteps_step(pipe, state)
+            # `_te_external` のときは catch-all 分岐と同じ理由でピン窓が要る(そちらの
+            # コメント参照)。transformer は直上でロード済みなので前提を満たす。
+            with self._pin_execution_device_to_compute() if self._te_external else _NullContext():
+                with _relaxed_min_duration() if still else _NullContext():
+                    layout_step = MiniMaxH3PrepareLayoutStep()
+                    _, state = layout_step(pipe, state)
+                # `is_fl2va` is always True on this branch (see the comment above), so these
+                # two run unconditionally -- see the `H3_LOWVRAM_GROUP` branch's own comment
+                # for why fl2va needs them now.
+                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                _, state = condition_latents_step(pipe, state)
+                latents_step = MiniMaxH3PrepareLatentsStep()
+                _, state = latents_step(pipe, state)
+                fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
+                _, state = fl2va_latents_step(pipe, state)
+                timesteps_step = MiniMaxH3SetTimestepsStep()
+                _, state = timesteps_step(pipe, state)
         else:
             # `none` mode: TE's job is done for this request -- free it and bring in the
             # transformer (which stays resident until the next request's encode phase
@@ -4528,21 +4538,32 @@ class MiniMaxH3Runner:
                 _, state = keyframe_step(pipe, state)
 
             # --- layout / latents / timesteps ---
-            with _relaxed_min_duration() if still else _NullContext():
-                layout_step = MiniMaxH3PrepareLayoutStep()
-                _, state = layout_step(pipe, state)
-            # See the `H3_LOWVRAM_GROUP` branch above for why fl2va needs these two extra
-            # steps now (condition-noise moved out of `MiniMaxH3PrepareLatentsStep`).
-            if is_fl2va:
-                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
-                _, state = condition_latents_step(pipe, state)
-            latents_step = MiniMaxH3PrepareLatentsStep()
-            _, state = latents_step(pipe, state)
-            if is_fl2va:
-                fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
-                _, state = fl2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
-            _, state = timesteps_step(pipe, state)
+            # `_te_external` (H3_TE_DEVICE): この分岐の前提「TE が常駐しているので
+            # `_execution_device` は text_encoder 経由で正しく解決する」が崩れる --
+            # 外部常駐の TE はパイプからデタッチされているため、スキャンが CPU 常駐の
+            # audio_vae に落ち、レイアウトの position_ids が CPU に作られて rope() 内で
+            # device mismatch になる(2026-08-12、96GB機の plain モード + H3_TE_DEVICE で
+            # 初めてこの組み合わせが叩かれ実機再現。従来 H3_TE_DEVICE は H3_LOWVRAM=1 と
+            # のみ併用されており、この分岐は未カバーだった)。transformer は直上の
+            # `_ensure_transformer` でロード済みなので、lowvram=1 の te_external 分岐と
+            # 同じピン窓がそのまま前提を満たす。通常構成(TE 同居)では従来どおり
+            # 窓なし -- 検証済み経路をバイト単位で変えないため。
+            with self._pin_execution_device_to_compute() if self._te_external else _NullContext():
+                with _relaxed_min_duration() if still else _NullContext():
+                    layout_step = MiniMaxH3PrepareLayoutStep()
+                    _, state = layout_step(pipe, state)
+                # See the `H3_LOWVRAM_GROUP` branch above for why fl2va needs these two extra
+                # steps now (condition-noise moved out of `MiniMaxH3PrepareLatentsStep`).
+                if is_fl2va:
+                    condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                    _, state = condition_latents_step(pipe, state)
+                latents_step = MiniMaxH3PrepareLatentsStep()
+                _, state = latents_step(pipe, state)
+                if is_fl2va:
+                    fl2va_latents_step = MiniMaxH3FL2VAPrepareLatentsStep()
+                    _, state = fl2va_latents_step(pipe, state)
+                timesteps_step = MiniMaxH3SetTimestepsStep()
+                _, state = timesteps_step(pipe, state)
 
         # `num_frames` is only resolved (aligned to `17*n+5`) by `MiniMaxH3PrepareLayoutStep`
         # now, which runs inside the branch above -- moved here (out of every branch) so it
