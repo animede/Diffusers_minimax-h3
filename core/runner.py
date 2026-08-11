@@ -2337,6 +2337,24 @@ class MiniMaxH3Runner:
             self._pipe.vae = self._pipe.vae.to(torch.float16)
             logger.info("video vae cast to float16 in %.2fs (H3_VIDEO_VAE_FP16=1)",
                         time.time() - t_cast)
+            # デコードは上流ステップ自身が fp16 autocast を張る (decoders.py) が、
+            # **エンコード**側 (encoders.py の encode_vae_condition -- ref2va の参照と
+            # fl2va のキーフレーム条件付けが使う) は autocast なしで、内部で明示的に
+            # `pixels.to(torch.float32)` してから `vae.encode()` を呼ぶ。fp16 化した VAE
+            # では conv_in の bias (Half) と入力 (float) の不一致で必ず落ちる --
+            # `H3_VIDEO_VAE_FP16=1 × 参照あり` は 2026-08-11 の 8GB×2 ref2va 検証で
+            # 初めて併用され、そこで発覚した (それまでの ref2va 回帰は fp32 VAE 構成)。
+            # デコード側と対称の fp16 autocast を encode だけに被せて吸収する。精度は
+            # 設計内: encode_vae_condition は結果を `latents.to(torch.float16).float()` と
+            # **自分で fp16 に丸めてから返す**ので、fp16 計算はその丸めと同格。
+            _orig_vae_encode = self._pipe.vae.encode
+
+            def _fp16_autocast_encode(sample, *args, **kwargs):
+                with torch.autocast(device_type="cuda", dtype=torch.float16,
+                                    enabled=sample.is_cuda):
+                    return _orig_vae_encode(sample, *args, **kwargs)
+
+            self._pipe.vae.encode = _fp16_autocast_encode
         if TE_QUANT == "bnb-4bit":
             # Parked on CPU by default in this mode -- moved to GPU only for the phase
             # that needs them (keyframe encode / decode). See module docstring.
@@ -2742,6 +2760,25 @@ class MiniMaxH3Runner:
         self._turbo_lora_wrapped = False
         gc.collect()
         torch.cuda.empty_cache()
+        if H3_LOWVRAM_GROUP:
+            # group offload (use_stream=True, low_cpu_mem_usage=False) pins the whole
+            # ~34GB CPU weight copy. del+gc returns those pages to torch's *host*
+            # caching allocator, and `torch.cuda.empty_cache()` (device-side only)
+            # never releases them to the OS -- so MemAvailable stays ~34GB short and
+            # the RAM guard in `_ensure_transformer_ref_group` refuses the
+            # t2va->ref2va switch. Found in the 2026-08-11 8GB×2 ref2va verification:
+            # after "transformer freed" avail stayed ~38GB (RssShmem still held the
+            # full pinned copy) instead of recovering to ~72GB. `_host_emptyCache`
+            # releases the *unused* cached pinned blocks back to the OS; the next
+            # group-offload load simply re-pins (a re-registration cost, not a
+            # correctness issue). Private API (verified on this venv's torch 2.9) --
+            # guarded so a future torch that drops it degrades to the old behaviour
+            # (RAM stays cached, mode switch may hit the RAM guard) instead of dying.
+            _host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+            if _host_empty_cache is not None:
+                _host_empty_cache()
+            else:
+                logger.warning("torch._C._host_emptyCache missing -- pinned host cache not released")
         logger.info("transformer freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
 
     # ------------------------------------------------------------------
@@ -2923,6 +2960,15 @@ class MiniMaxH3Runner:
         self._turbo_lora_wrapped_ref = False
         gc.collect()
         torch.cuda.empty_cache()
+        if H3_LOWVRAM_GROUP:
+            # Same pinned-host-cache release as _free_transformer (see its comment):
+            # without this the ref2va->t2va switch strands ~34GB in torch's host
+            # caching allocator and the t2va side's own RAM guard hits the same wall.
+            _host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+            if _host_empty_cache is not None:
+                _host_empty_cache()
+            else:
+                logger.warning("torch._C._host_emptyCache missing -- pinned host cache not released")
         logger.info("transformer_ref freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
 
     # ------------------------------------------------------------------
