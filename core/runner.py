@@ -1988,6 +1988,61 @@ def frames_to_uint8(video_tensor: torch.Tensor, chunk: int = _FRAMES_TO_UINT8_CH
     return out
 
 
+# `MiniMaxH3VideoDecodeStep.__call__` (decoders.py, f37ab93) の置き換え。venv の diffusers は
+# 無改変のまま、サブクラスで __call__ だけを差し替える (frames_to_uint8 と同族の対策)。
+#
+# 上流の最終行 `video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)` は、VAE が
+# fp16 で出した全長テンソルを **GPU 上で一括 fp32 化**する。768²・124フレームで
+# 124x768x768x3x4B = 838MiB の一時確保が `float()` / mul / add / clamp の各段で発生し、
+# 8GB カード検証 (2026-08-11、ゴールB) では**デノイズは完走したのにこの1行で OOM** した。
+# ここでは fp16 のまま CPU へ移してから逆正規化する。要素毎の fp32 mul/add/clamp は
+# CPU/GPU で IEEE754 の丸めが一致する (縮約も FMA 融合もない) ので**出力はビット単位で
+# 同一** -- 適用直後に同一 seed の PNG MD5 一致で実証済み (README 2026-08-11 の節)。
+# 追加コストは fp16 全長 (~420MiB) の PCIe 転送1回と CPU 演算のみ。後段の
+# postprocess_video / frames_to_uint8 はデバイス非依存で、CPU テンソルのまま処理できる。
+_CPU_NORM_DECODE_STEP_CLS = None
+
+
+def _cpu_norm_video_decode_step():
+    global _CPU_NORM_DECODE_STEP_CLS
+    if _CPU_NORM_DECODE_STEP_CLS is None:
+        from diffusers.modular_pipelines.minimax_h3.decoders import MiniMaxH3VideoDecodeStep
+
+        class _CpuNormVideoDecodeStep(MiniMaxH3VideoDecodeStep):
+            @torch.no_grad()
+            def __call__(self, components, state):
+                block_state = self.get_block_state(state)
+                device = components._execution_device
+
+                if block_state.output_type not in ("pil", "np", "pt"):
+                    raise ValueError(
+                        f"`output_type` must be one of 'pil', 'np' or 'pt', got {block_state.output_type!r}. To keep the "
+                        "latents instead of decoding them, run a pipeline that does not include the decode blocks."
+                    )
+
+                latents_mean = torch.tensor(components.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+                latents_std = torch.tensor(components.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+                latents = block_state.latents * latents_std + latents_mean
+
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                    video = components.vae.decode(latents, return_dict=False)[0]
+                # ここからが上流との差分: fp16 のまま CPU へ降ろし、逆正規化を CPU で行う
+                # (上流は GPU 上で video.float() から一括生成する)。
+                video = video.cpu()
+                pixel_mean = torch.tensor(components.pixel_mean).view(1, -1, 1, 1, 1)
+                pixel_std = torch.tensor(components.pixel_std).view(1, -1, 1, 1, 1)
+                video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+                block_state.videos = components.video_processor.postprocess_video(
+                    video, output_type=block_state.output_type
+                )
+
+                self.set_block_state(state, block_state)
+                return components, state
+
+        _CPU_NORM_DECODE_STEP_CLS = _CpuNormVideoDecodeStep
+    return _CPU_NORM_DECODE_STEP_CLS()
+
+
 def _num_frames_from_audio_reference(references: list, fps: int) -> int:
     r"""ref2va の `seconds=None` を、ちょうど1本の音声を持つ参照 (単体の
     `MiniMaxH3AudioReference`、または音声付きの `MiniMaxH3VideoReference`) の長さから
@@ -4933,7 +4988,7 @@ class MiniMaxH3Runner:
             # 復旧シナリオをサーバ再起動なしで検証できる)。通常運用では未設定。
             if os.environ.pop("H3_DEBUG_FAIL_DECODE", None) == "1":
                 raise RuntimeError("H3_DEBUG_FAIL_DECODE=1: intentional decode failure (one-shot, cleanup-path test)")
-            video_decode_step = MiniMaxH3VideoDecodeStep()
+            video_decode_step = _cpu_norm_video_decode_step()
             _, state = video_decode_step(pipe, state)
             audio_decode_step = MiniMaxH3AudioDecodeStep()
             _, state = audio_decode_step(pipe, state)
@@ -5300,7 +5355,7 @@ class MiniMaxH3Runner:
                 if progress:
                     progress.update(phase="decoding", message=f"場面 {idx + 1}/{n_scenes} をデコード中...")
                 state = scene["state"]
-                video_decode_step = MiniMaxH3VideoDecodeStep()
+                video_decode_step = _cpu_norm_video_decode_step()
                 _, state = video_decode_step(pipe, state)
                 audio_decode_step = MiniMaxH3AudioDecodeStep()
                 _, state = audio_decode_step(pipe, state)
@@ -5972,7 +6027,7 @@ class MiniMaxH3Runner:
         self._vae_to_gpu()
         t_decode = time.time()
         try:
-            video_decode_step = MiniMaxH3VideoDecodeStep()
+            video_decode_step = _cpu_norm_video_decode_step()
             _, state = video_decode_step(pipe, state)
             audio_decode_step = MiniMaxH3AudioDecodeStep()
             _, state = audio_decode_step(pipe, state)
@@ -6363,7 +6418,7 @@ class MiniMaxH3Runner:
                 if progress:
                     progress.update(phase="decoding", message=f"場面 {idx + 1}/{n_scenes} をデコード中...")
                 state = scene["state"]
-                video_decode_step = MiniMaxH3VideoDecodeStep()
+                video_decode_step = _cpu_norm_video_decode_step()
                 _, state = video_decode_step(pipe, state)
                 audio_decode_step = MiniMaxH3AudioDecodeStep()
                 _, state = audio_decode_step(pipe, state)
