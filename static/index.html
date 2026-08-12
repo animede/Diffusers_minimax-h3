@@ -351,6 +351,92 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .gallery-type-badge {
+    position: absolute;
+    bottom: 6px;
+    left: 6px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 12px;
+    line-height: 1;
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2;
+    pointer-events: none;
+  }
+  .gallery-download-btn {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 12px;
+    line-height: 1;
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2;
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .gallery-download-btn:hover { background: var(--accent); }
+  .gallery-lightbox {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.85);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+  }
+  .gallery-lightbox.open { display: flex; }
+  .gallery-lightbox-bar {
+    width: 100%;
+    max-width: 95vw;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 4px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .gallery-lightbox-bar .name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .gallery-lightbox-bar a, .gallery-lightbox-bar button {
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .gallery-lightbox-bar a:hover, .gallery-lightbox-bar button:hover { border-color: var(--accent); color: var(--accent); }
+  .gallery-lightbox-body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    max-width: 95vw;
+    max-height: 90vh;
+  }
+  .gallery-lightbox-body img, .gallery-lightbox-body video {
+    max-width: 95vw;
+    max-height: 90vh;
+    object-fit: contain;
+  }
   .server-status {
     font-size: 11px;
     color: var(--muted);
@@ -801,6 +887,15 @@
   </div>
 </div>
 
+<div class="gallery-lightbox" id="gallery-lightbox">
+  <div class="gallery-lightbox-bar">
+    <span class="name" id="gallery-lightbox-name"></span>
+    <a id="gallery-lightbox-download" href="#" download data-i18n-title="action.download" title="ダウンロード">⬇</a>
+    <button type="button" id="gallery-lightbox-close" data-i18n-title="action.close" title="閉じる">×</button>
+  </div>
+  <div class="gallery-lightbox-body" id="gallery-lightbox-body"></div>
+</div>
+
 <script>
 // ============================================================================
 // i18n (日英ランタイム切替)
@@ -924,6 +1019,11 @@ const I18N = {
     'gallery.deleteError': '削除に失敗しました: {msg}',
     'gallery.concatError': '連結に失敗しました: {msg}',
     'gallery.concatCannotImage': '静止画(PNG)は連結できません',
+    'gallery.typeVideo': '動画 / Video',
+    'gallery.typeImage': '静止画 / Still image',
+    'gallery.dropImageOnly': 'このゾーンは画像のみドロップできます',
+    'action.download': 'ダウンロード / Download',
+    'action.close': '閉じる',
     'ref.deleteTitle': 'この参照を削除(以降の参照名は自動で振り直されます)',
     'ref.orderLine': '参照順(rotary配置順): {order}',
     'ref.rejectedUnknown': '種別不明',
@@ -1112,6 +1212,11 @@ const I18N = {
     'gallery.deleteError': 'Failed to delete: {msg}',
     'gallery.concatError': 'Failed to concatenate: {msg}',
     'gallery.concatCannotImage': 'Stills (PNG) cannot be concatenated',
+    'gallery.typeVideo': '動画 / Video',
+    'gallery.typeImage': '静止画 / Still image',
+    'gallery.dropImageOnly': 'This zone only accepts images',
+    'action.download': 'ダウンロード / Download',
+    'action.close': 'Close',
     'ref.deleteTitle': 'Remove this reference (later reference names will be renumbered automatically)',
     'ref.orderLine': 'Reference order (rotary placement order): {order}',
     'ref.rejectedUnknown': 'unknown type',
@@ -1576,6 +1681,19 @@ function renderRefItems() {
 // input[type=file] はそのまま残し(既存の送信ロジックが .files を読む)、
 // ドロップされた File を DataTransfer 経由で input.files に流し込む。
 // プログラム的な代入では change が発火しないので手動で dispatch する。
+// ギャラリータイルの dragstart が dataTransfer.setData('application/x-h3-gallery', ...) に
+// 積む JSON を、ドロップ先の <input type=file> に渡せる File へ変換する。同一オリジンの
+// /outputs 配信なので fetch → blob 変換で完結する。
+async function fetchGalleryDragItem(dataTransfer) {
+  const raw = dataTransfer.getData('application/x-h3-gallery');
+  if (!raw) return null;
+  let item;
+  try { item = JSON.parse(raw); } catch (e) { return null; }
+  const res = await fetch(item.url);
+  const blob = await res.blob();
+  return { file: new File([blob], item.name, { type: blob.type }), type: item.type };
+}
+
 function setupDropzone(zoneId, inputEl, opts) {
   const zone = document.getElementById(zoneId);
   if (!zone || !inputEl) return;
@@ -1585,6 +1703,7 @@ function setupDropzone(zoneId, inputEl, opts) {
   // (言語切替後の再描画でも正しい文言になるように)。
   const placeholderKey = textEl.dataset.i18n;
   const multiple = !!(opts && opts.multiple);
+  const imageOnly = !!(opts && opts.imageOnly);
 
   function setFiles(files) {
     const dt = new DataTransfer();
@@ -1608,6 +1727,15 @@ function setupDropzone(zoneId, inputEl, opts) {
     clearBtn.style.display = '';
   }
 
+  // ゾーンの種別ガードに合わないファイルがドロップされたときの一時ヒント表示。
+  // alert は使わず、プレースホルダ文言を数秒だけ差し替える。
+  let hintTimer = null;
+  function flashHint(msg) {
+    if (hintTimer) clearTimeout(hintTimer);
+    textEl.textContent = msg;
+    hintTimer = setTimeout(() => { hintTimer = null; refresh(); }, 2500);
+  }
+
   zone.addEventListener('click', (e) => {
     if (e.target === clearBtn) return;
     inputEl.click();
@@ -1625,25 +1753,46 @@ function setupDropzone(zoneId, inputEl, opts) {
     e.stopPropagation();
     zone.classList.remove('dragover');
   }));
-  zone.addEventListener('drop', (e) => {
+  zone.addEventListener('drop', async (e) => {
     e.preventDefault();
     e.stopPropagation();
     zone.classList.remove('dragover');
+
+    // 1) OS からの実ファイル D&D(従来どおり)
     const dropped = Array.from(e.dataTransfer.files || []);
-    if (!dropped.length) return;
+    if (dropped.length) {
+      if (imageOnly) {
+        const bad = dropped.some(f => !f.type.startsWith('image/'));
+        if (bad) { flashHint(t('gallery.dropImageOnly')); return; }
+      }
+      if (multiple) {
+        // 参照は順序に意味があるため、ドロップは「置き換え」ではなく「末尾へ追加」。
+        setFiles(Array.from(inputEl.files || []).concat(dropped));
+      } else {
+        setFiles([dropped[0]]);
+      }
+      return;
+    }
+
+    // 2) ギャラリータイルからの D&D(application/x-h3-gallery)
+    const galleryItem = await fetchGalleryDragItem(e.dataTransfer);
+    if (!galleryItem) return;
+    if (imageOnly && galleryItem.type !== 'image') {
+      flashHint(t('gallery.dropImageOnly'));
+      return;
+    }
     if (multiple) {
-      // 参照は順序に意味があるため、ドロップは「置き換え」ではなく「末尾へ追加」。
-      setFiles(Array.from(inputEl.files || []).concat(dropped));
+      setFiles(Array.from(inputEl.files || []).concat([galleryItem.file]));
     } else {
-      setFiles([dropped[0]]);
+      setFiles([galleryItem.file]);
     }
   });
 
   refresh();
 }
 
-setupDropzone('dz-image', imageFileEl, { multiple: false });
-setupDropzone('dz-last-image', lastImageFileEl, { multiple: false });
+setupDropzone('dz-image', imageFileEl, { multiple: false, imageOnly: true });
+setupDropzone('dz-last-image', lastImageFileEl, { multiple: false, imageOnly: true });
 
 // Ref2VA のドロップゾーンは refItems 配列で管理する専用配線(setupDropzoneは使わない)
 refDropzoneEl.addEventListener('click', () => refFilesEl.click());
@@ -1657,10 +1806,18 @@ refFilesEl.addEventListener('change', () => {
 ['dragleave', 'dragend'].forEach(ev => refDropzoneEl.addEventListener(ev, (e) => {
   e.preventDefault(); e.stopPropagation(); refDropzoneEl.classList.remove('dragover');
 }));
-refDropzoneEl.addEventListener('drop', (e) => {
+refDropzoneEl.addEventListener('drop', async (e) => {
   e.preventDefault(); e.stopPropagation();
   refDropzoneEl.classList.remove('dragover');
-  addRefFiles(Array.from(e.dataTransfer.files || []));
+  const dropped = Array.from(e.dataTransfer.files || []);
+  if (dropped.length) {
+    addRefFiles(dropped);
+    return;
+  }
+  // ギャラリータイルからの D&D。image/video どちらも可(addRefFiles が種別自動判定・
+  // 上限チェックまで行うので、ここではガード不要)。
+  const galleryItem = await fetchGalleryDragItem(e.dataTransfer);
+  if (galleryItem) addRefFiles([galleryItem.file]);
 });
 
 // ドロップ位置を外した時にブラウザがファイルを開いてしまうのを防ぐ
@@ -2288,6 +2445,16 @@ function renderGallery() {
     tile.className = 'gallery-tile' + (isSelected ? ' selected' : '');
     tile.dataset.name = item.name;
 
+    // ギャラリー → ドロップゾーン D&D 用。ドロップ側は application/x-h3-gallery を
+    // 読み、fetch(item.url) して File 化する(実ファイルの D&D と同じ経路に合流させる)。
+    tile.draggable = true;
+    tile.addEventListener('dragstart', (e) => {
+      const payload = JSON.stringify({ url: item.url, name: item.name, type: item.type });
+      e.dataTransfer.setData('application/x-h3-gallery', payload);
+      e.dataTransfer.setData('text/uri-list', item.url);
+      e.dataTransfer.effectAllowed = 'copy';
+    });
+
     const thumbWrap = document.createElement('div');
     thumbWrap.className = 'gallery-thumb-wrap';
 
@@ -2331,6 +2498,18 @@ function renderGallery() {
     badge.style.display = isSelected ? '' : 'none';
     thumbWrap.appendChild(badge);
 
+    // 種別バッジ(常時表示・左下)。選択チェックボックス(左上)・順番バッジ(右上)とは
+    // 別の隅に置いて重ならないようにする。
+    const typeBadge = document.createElement('div');
+    typeBadge.className = 'gallery-type-badge';
+    typeBadge.textContent = item.type === 'image' ? '🖼' : '🎬';
+    typeBadge.title = item.type === 'image' ? t('gallery.typeImage') : t('gallery.typeVideo');
+    thumbWrap.appendChild(typeBadge);
+
+    // サムネイルクリックでライトボックス表示(タイル自体の選択トグルは廃止、選択は
+    // チェックボックス経由のみにする)。
+    thumbWrap.addEventListener('click', () => openGalleryLightbox(item));
+
     const info = document.createElement('div');
     info.className = 'gallery-info';
     const resLine = (item.width && item.height) ? `${item.width}×${item.height}` : t('gallery.resUnknown');
@@ -2340,14 +2519,70 @@ function renderGallery() {
       <div>${headLine} / ${resLine} / ${fmtBytes(item.size)}</div>
     `;
 
+    const dlBtn = document.createElement('a');
+    dlBtn.className = 'gallery-download-btn';
+    dlBtn.href = item.url;
+    dlBtn.download = item.name;
+    dlBtn.textContent = '⬇';
+    dlBtn.title = t('action.download');
+    dlBtn.addEventListener('click', (e) => e.stopPropagation());
+    info.appendChild(dlBtn);
+
     tile.appendChild(thumbWrap);
     tile.appendChild(info);
-    tile.addEventListener('click', () => toggleGallerySelection(item.name));
 
     galleryGrid.appendChild(tile);
   });
   updateGalleryToolbar();
 }
+
+// --- ライトボックス(実サイズ表示) ---
+// DOM はページに1つだけ静的に置いてあり(#gallery-lightbox)、開閉のたびに中身を
+// 差し替えて使い回す(タイル毎には作らない)。
+const galleryLightboxEl = document.getElementById('gallery-lightbox');
+const galleryLightboxBodyEl = document.getElementById('gallery-lightbox-body');
+const galleryLightboxNameEl = document.getElementById('gallery-lightbox-name');
+const galleryLightboxDownloadEl = document.getElementById('gallery-lightbox-download');
+const galleryLightboxCloseEl = document.getElementById('gallery-lightbox-close');
+
+function openGalleryLightbox(item) {
+  galleryLightboxBodyEl.innerHTML = '';
+  let media;
+  if (item.type === 'image') {
+    media = document.createElement('img');
+    media.src = item.url;
+    media.alt = item.name;
+  } else {
+    media = document.createElement('video');
+    media.src = item.url;
+    media.controls = true;
+    media.autoplay = true;
+    // 音も確認したいのでミュートしない(サムネイルの muted 動画とは別物)。
+  }
+  galleryLightboxBodyEl.appendChild(media);
+  galleryLightboxNameEl.textContent = item.name;
+  galleryLightboxNameEl.title = item.name;
+  galleryLightboxDownloadEl.href = item.url;
+  galleryLightboxDownloadEl.download = item.name;
+  galleryLightboxEl.classList.add('open');
+}
+
+function closeGalleryLightbox() {
+  if (!galleryLightboxEl.classList.contains('open')) return;
+  const video = galleryLightboxBodyEl.querySelector('video');
+  if (video) video.pause();
+  galleryLightboxEl.classList.remove('open');
+  galleryLightboxBodyEl.innerHTML = '';
+}
+
+galleryLightboxCloseEl.addEventListener('click', closeGalleryLightbox);
+galleryLightboxEl.addEventListener('click', (e) => {
+  if (e.target === galleryLightboxEl) closeGalleryLightbox();  // 背景クリックのみ(バー・本体クリックは無視)
+});
+galleryLightboxDownloadEl.addEventListener('click', (e) => e.stopPropagation());
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeGalleryLightbox();
+});
 
 function toggleGallerySelection(name) {
   const idx = gallerySelectedOrder.indexOf(name);
