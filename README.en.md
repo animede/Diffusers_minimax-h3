@@ -95,6 +95,11 @@ Turbo — the one change that actually speeds up denoising — **tops out at 2.6
 remaining 3x-plus all comes from eliminating fixed costs (even at 30 steps without turbo,
 removing the fixed costs alone takes t2i from 157s to 51.1s, a 3x gain).
 
+**The current best is t2i 7.65s / t2va 5s 28.56s on the 96GB box** (measured 2026-08-12
+with everything stacked: an int8 transformer resident on GPU0, the projected TE resident on
+GPU1, turbo, sage, fp16 decode). The peak is **42.5GB** — the speed comes from running with
+zero fixed costs, not from the capacity (see the dated 2026-08-12 section).
+
 ### Per-technique: how much it bought, and whether the output changes
 
 Equivalence: ◎ = **identical output MD5** at the same seed (mathematically a no-op) /
@@ -2487,6 +2492,68 @@ compositions (profile shots) are nearly identical to the 32B ground truth
 blemish is a light compositional drift late in the 768×1344 run (not a breakdown).
 Outputs: `outputs/ref2i_1786447720.png` / `ref2va_1786449645.mp4` /
 `ref2va_1786452054.mp4` / `ref2va_1786455323.mp4`.
+
+## 2026-08-12: Everything stacked on the 96GB box — t2i 7.65s / t2va 28.56s, and two wasted costs it exposed
+
+With the ballast from the low-VRAM verification removed, the 96GB box (RTX PRO 6000 plus the
+second-slot 4060 Ti 16GB) was measured with **every available speedup turned on**, to find
+the ceiling.
+
+Configuration: `H3_LOWVRAM=1 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1
+H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_TE_DEVICE=cuda:1 H3_TURBO_LORA=1` — an int8
+transformer resident on GPU0 (with the turbo LoRA applied), the projected TE in NF4 (3.11GB)
+resident on GPU1, sage attention (sm_120), fp16 decode. Turbo is toggled per request.
+
+| Setting | t2i steady-state | t2va 5s | Peak |
+|---|---|---|---|
+| **turbo, 4 steps** (FBC is auto-disabled by turbo) | **7.65s** | **28.56s** | 42.5GB |
+| 30 steps + FBC (8 skipped for t2i, 7 for t2va) | 21.41s | 121.5s | 41.8GB |
+| 30 steps, no FBC | 27.42s | 155.0s | 42.5GB |
+| (reference) 96GB default, 30 steps with FBC — the old baseline | — | about 160s | 92GB |
+
+Breakdown with turbo: t2i = denoise 2.40s + decode 1.07s + about 4.2s of remainder; t2va =
+denoise 14.81s + decode 7.20s. **This beats the 48GB box's record** (t2i 9.7s / t2va 44.2s),
+and is **5.6x** faster than the old 96GB default (about 160s).
+
+**Note the 42.5GB peak** — the fastest configuration does not come close to filling 96GB. The
+speed comes from running with zero fixed costs, not from capacity (the same configuration
+fits a 48GB-class card).
+
+### Waste 1: a co-resident projected TE gets freed on every request
+
+The `H3_LOWVRAM=1` choreography loads the TE, encodes, and frees it on every request. That was
+designed around the 32B TE (21GB), but **the projected TE is only 3.11GB and still gets the
+same treatment, paying a 7.6s load every time** — with 55GB sitting free. Parking it on the
+second GPU with `H3_TE_DEVICE=cuda:1`:
+
+| Where the TE lives | t2i steady-state | t2va 5s |
+|---|---|---|
+| Co-resident on GPU0 (loaded/freed each request) | 15.23s | 35.69s |
+| **Resident on GPU1** (`H3_TE_DEVICE=cuda:1`) | **7.65s** | **28.56s** |
+
+Even with everything else identical, **where the TE lives is a 2x difference for t2i**. Note
+that the 96GB box's second card is 16GB, so the 32B TE (21GB in nf4, 17.45GB pruned) would not
+fit — **this residency only works because of the projected TE**.
+
+### Waste 2: a bf16 transformer is freed and reloaded for 12s every request
+
+Since 96GB can hold a bf16 transformer (66.3GB), it should be possible to avoid int8's
+dequantization overhead, so plain mode (no `H3_LOWVRAM`) was measured too. **Denoising is
+indeed faster in bf16** (t2i 2.07s vs int8's 2.40s; t2va 14.05s vs 14.81s — 5-14% faster). Yet
+it loses on the total:
+
+| Transformer | t2i steady-state | t2va 5s | Peak |
+|---|---|---|---|
+| int8, resident (`H3_KEEP_TRANSFORMER=1`) | **7.65s** | **28.56s** | 42.5GB |
+| bf16, plain mode | 19.9s | 40.0s | 68.9-73.1GB |
+
+The log shows plain mode **freeing the transformer for every decode and reloading it in
+11.9-12.3s right after**. That free exists because of the "TE-nf4 21GB + transformer 66.3GB +
+VAE 11GB = 98.5GB > 96GB" premise — but **with the TE no longer on GPU0, it is 66.3 + 6.1
+(fp16 VAE) = 72.4GB**, which fits, so the free is unnecessary in this configuration. Removing
+it should make bf16 the fastest option (roughly t2i 8s / t2va 28s at full-precision weights).
+`H3_KEEP_TRANSFORMER` currently requires `H3_LOWVRAM=1`, so the right fix is an equivalent
+"don't free" decision on the plain-mode side. **Not implemented.**
 
 ## Waiting on external events going forward (backlog, as of 2026-08-06)
 
