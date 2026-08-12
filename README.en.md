@@ -2597,6 +2597,60 @@ mathematically a no-op, and the same image comes out in **19.58s → 7.40s (2.6x
 - bf16 denoises faster than int8 (t2i 2.05-2.07s vs 2.39-2.40s) but **needs a 77GB-class
   card**. Whether that beats int8's 45.6GB at a 7% penalty depends on the card you have.
 
+## 2026-08-12 (part 3): reference-mode speed (ref2i / i2va) — a turbo bug, and the fixed costs that remain
+
+The reference modes were measured in the fastest configuration above (int8, single GPU, no
+decode-window free, 45.6GB peak). Reference generation uses `transformer_ref` — a separate
+model — so both its budget and its bottleneck differ from t2va.
+
+### First, a bug: the reference endpoints never picked up turbo's step default
+
+Requests were running at `steps=30` despite `turbo=1`. The cause was in `app.py`: **the three
+reference endpoints (`/api/ref2va`, `/api/ref2i_batch`, `/api/ref2va_batch`) hardcoded
+`num_inference_steps: int = Form(30)`** while t2va/t2i/t2i_batch/fl2va use
+`DEFAULT_NUM_INFERENCE_STEPS` (which is 4 under turbo). The turbo LoRA itself was being applied
+to `transformer_ref` correctly (the log shows `turbo LoRA lazily applied to transformer_ref
+(312 layers wrapped)`), so the combination running was **a distilled LoRA driven for 30 steps** —
+a mismatch. Fixed by aligning all three to `DEFAULT_NUM_INFERENCE_STEPS`.
+
+### Measurements (96GB box, int8, single GPU, 768²)
+
+| Mode | turbo, 4 steps | 30 steps (no turbo) | Denoise (4 / 30) | Peak |
+|---|---|---|---|---|
+| **ref2i** (reference still, 22 frames) | **79.3s** | 148.4s | 7.8s / 72.1s | 45.4GB |
+| **i2va** (image reference to 5s video, 124 frames) | **103.1s** | 290.3s | 22.0s / 209.0s | 45.9GB |
+
+**The peak is 45.9GB, essentially the same as the t2va family's 45.6GB** — the reference modes
+also fit a single 48GB-class card. Turbo helps less here (2.8x for i2va) than for t2va (5.5x)
+because, as below, **the non-denoise fixed costs dominate**.
+
+### The backlog item "ref2va × turbo" holds up (verified visually)
+
+The turbo LoRA had only ever been measured on `transformer`, never on `transformer_ref`. **At 4
+steps the reference fidelity holds**: bangs, hairstyle, light-green cardigan, white ribbon and
+necklace all match, and across the video the subject stays consistent from first to last frame
+with the camera tracking and the park setting as prompted, with no breakdown
+(`outputs/ref2i_1786509275.png`, `outputs/ref2va_1786509457.mp4`). **Strength 0.094 carries over
+to reference-conditioned trajectories unchanged.**
+
+### The fixed costs that remain (i2va's 103.1s, from log timestamps)
+
+| Phase | Time | Note |
+|---|---|---|
+| **Reference vision encode** | **about 47s** | **The dominant cost.** The 4B projected TE does not shrink it (though it is an improvement on the 32B era's ~65s/scene) |
+| Denoise (4 steps) | 22.0s | |
+| Decode + VAE round trips | about 10s | |
+| Reference VAE encode | about 6s | |
+| **Reloading the t2va transformer at the end** | **about 13s** | **Pure waste for consecutive ref2va requests** |
+
+- **The 47s vision encode is the real target** for reference modes. The batch paths already share
+  it across scenes (`H3_REF_PREFIX_CACHE`), but **repeated single requests do not share anything**
+  — a cross-request cache would pay off whenever the same reference image is reused (not
+  implemented).
+- **The 13s reload** comes from restoring the "t2va steady state" when a ref2va request finishes.
+  If the next request is also ref2va it is unnecessary, and the same "don't restore" judgment as
+  `H3_KEEP_TRANSFORMER` could apply (**not implemented**).
+
 ## Waiting on external events going forward (backlog, as of 2026-08-06)
 
 ### 1. diffusers PR #14355 — **merged (2026-08-05), migration also complete (2026-08-09)**
