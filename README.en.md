@@ -95,10 +95,28 @@ Turbo — the one change that actually speeds up denoising — **tops out at 2.6
 remaining 3x-plus all comes from eliminating fixed costs (even at 30 steps without turbo,
 removing the fixed costs alone takes t2i from 157s to 51.1s, a 3x gain).
 
-**The current best is t2i 7.65s / t2va 5s 28.56s on the 96GB box** (measured 2026-08-12
-with everything stacked: an int8 transformer resident on GPU0, the projected TE resident on
-GPU1, turbo, sage, fp16 decode). The peak is **42.5GB** — the speed comes from running with
-zero fixed costs, not from the capacity (see the dated 2026-08-12 section).
+### Where each mode landed (all measured in one configuration, 2026-08-12)
+
+Configuration: **int8 transformer resident + projected TE (NF4) + no decode-window free +
+turbo at 4 steps + sage + fp16 decode**, on **a single GPU** (measured on the 96GB box:
+`H3_TRANSFORMER_QUANT=int8 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 H3_TE_PROJ=…
+H3_TURBO_LORA=1`).
+
+| Mode | Steady-state | Denoise | Peak | What the remaining time goes to |
+|---|---|---|---|---|
+| **t2i** 768² | **7.40s** | 2.40s | 45.0GB | VAE CPU↔GPU round trips, ~3.3s |
+| **t2va** 5s 768² | **28.13s** | 14.94s | 45.6GB | decode, 7.05s |
+| **ref2i** 768² (reference still) | **79.3s** | 7.8s | 45.4GB | reference vision encode, **~47s** |
+| **i2va** 5s 768² (image reference to video) | **103.1s** | 22.0s | 45.9GB | the same ~47s, plus ~13s to reload the t2va transformer |
+
+- **Every mode fits in 45-46GB**, so a single 48GB card runs the full feature set at
+  near-peak speed. But **mixing the t2va family and the reference family in one process keeps
+  both transformers resident, at 74.3GB** (measured; the peak on returning to t2va is 77.3GB).
+  To run on one 48GB card, **keep the modes in separate processes**.
+- **The reference modes are bound by the reference vision encode (~47s), not by denoising** —
+  which is why turbo buys only 2.8x for i2va against 5.5x for t2va.
+- Two GPUs with a bf16 transformer reach **t2i 6.89s / t2va 26.8s**, the fastest measured, but
+  need a 77GB-class card for about 7%. See the dated 2026-08-12 sections.
 
 ### Per-technique: how much it bought, and whether the output changes
 
