@@ -849,6 +849,16 @@ if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
         "cpu_param_dict は有効化時点で固定されるため、後から追加される LoRA バッファが "
         "offload サイクルから欠落するリスクがある -- 未検証)。H3_LOWVRAM=1 を使ってください。"
     )
+
+# スケジューラの exponential shift の上書き (既定は空 = 触らない)。H3 の既定は
+# video 12.0 / audio 3.0 (scheduler_config.json) で、turbo v0.1・8step v1.0 も同じ格子で
+# 蒸留されているため通常は不要。**turbo 4step v1.0 768p だけは video shift 6 で蒸留**
+# されており (上流 ModelTC/Minimax-H3-Turbo の Model specs 表: Training shifts 6 / 3)、
+# その LoRA を使うときは `H3_VIDEO_SHIFT=6` を併せて指定しないとサンプリング格子が
+# 蒸留時とずれる。適用箇所は `_load_vae` のスケジューラロード直後 (プロセスに1回。
+# scheduler は _pipe/_pipe_ref で同一オブジェクトを共有するため1箇所で足りる)。
+H3_VIDEO_SHIFT = os.environ.get("H3_VIDEO_SHIFT", "").strip()
+H3_AUDIO_SHIFT = os.environ.get("H3_AUDIO_SHIFT", "").strip()
 if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
     raise RuntimeError(
         "H3_TURBO_LORA=1 with the comfy-format (fused-QKV) LoRA "
@@ -2380,6 +2390,14 @@ class MiniMaxH3Runner:
             self._pipe.audio_vae.to(DEVICE)
             self._vae_on_gpu = True
         self._pipe.load_components(names=["scheduler", "audio_scheduler"])
+        # H3_VIDEO_SHIFT / H3_AUDIO_SHIFT (既定は空 = 配布 config の 12.0 / 3.0 のまま)。
+        # 用途と根拠はモジュール定数のコメント参照 (turbo 4step v1.0 768p が video shift 6)。
+        if H3_VIDEO_SHIFT:
+            self._pipe.scheduler.set_shift(float(H3_VIDEO_SHIFT))
+            logger.info("video scheduler shift overridden: %s (H3_VIDEO_SHIFT)", H3_VIDEO_SHIFT)
+        if H3_AUDIO_SHIFT:
+            self._pipe.audio_scheduler.set_shift(float(H3_AUDIO_SHIFT))
+            logger.info("audio scheduler shift overridden: %s (H3_AUDIO_SHIFT)", H3_AUDIO_SHIFT)
         self._vae_loaded = True
         logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
                      "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
