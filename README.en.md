@@ -102,12 +102,18 @@ turbo at 4 steps + sage + fp16 decode**, on **a single GPU** (measured on the 96
 `H3_TRANSFORMER_QUANT=int8 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 H3_TE_PROJ=…
 H3_TURBO_LORA=1`).
 
-| Mode | Steady-state | Denoise | Peak | What the remaining time goes to |
-|---|---|---|---|---|
-| **t2i** 768² | **7.40s** | 2.40s | 45.0GB | VAE CPU↔GPU round trips, ~3.3s |
-| **t2va** 5s 768² | **28.13s** | 14.94s | 45.6GB | decode, 7.05s |
-| **ref2i** 768² (reference still) | **79.3s** | 7.8s | 45.4GB | reference vision encode, **~47s** |
-| **i2va** 5s 768² (image reference to video) | **103.1s** | 22.0s | 45.9GB | the same ~47s, plus ~13s to reload the t2va transformer |
+| Mode | Single (fastest) | **Per item in a run** | Denoise | Peak | What the remaining time goes to |
+|---|---|---|---|---|---|
+| **t2i** 768² | **7.40s** | 7.9s (**0.94x — not worth using**) | 2.40s | 45.0GB | VAE CPU↔GPU round trips, ~3.3s |
+| **t2va** 5s 768² | **28.13s** | (no batch API) | 14.94s | 45.6GB | decode, 7.05s |
+| **ref2i** 768² (reference still) | 79.3s | **47.0s (1.69x)** | 7.8s | 45.4GB | reference vision encode, **~47s** |
+| **i2va** 5s 768² (image reference to video) | 103.1s | **75.0s (1.37x)** | 22.0s | 45.9GB | the same ~47s, plus ~13s to reload the t2va transformer |
+
+"Per item in a run" is the cost per item when several are generated together with the same
+reference and settings (`/api/t2i_batch`, `/api/ref2i_batch`, `/api/ref2va_batch`). **The batch
+path is `H3_LOWVRAM=1`-only**, so that column runs a different configuration from the single
+column — the table pairs "the fastest way to make one" with "the fastest way to make N".
+Measured with 3 scenes for t2i/ref2i and 2 for i2va.
 
 - **Every mode fits in 45-46GB**, so a single 48GB card runs the full feature set at
   near-peak speed. But **mixing the t2va family and the reference family in one process keeps
@@ -118,40 +124,25 @@ H3_TURBO_LORA=1`).
 - Two GPUs with a bf16 transformer reach **t2i 6.89s / t2va 26.8s**, the fastest measured, but
   need a 77GB-class card for about 7%. See the dated 2026-08-12 sections.
 
-### With batching on top
+### What the batch measurements established
 
-The batch phase-reordering is **`H3_LOWVRAM=1`-only** (`if H3_LOWVRAM:` in `app.py`), so the
-plain-mode configuration above **falls back to sequential**. The table below was therefore
-measured with `H3_LOWVRAM=1 H3_KEEP_TRANSFORMER=1` plus the projected TE and turbo (96GB box,
-**everything pinned to 768²**).
-
-| Mode | Single | Batch total | **Per item** | Speedup |
-|---|---|---|---|---|
-| t2i 768² | 7.65s | 3 scenes, 23.6s | **7.9s** | **0.97x (no gain)** |
-| ref2i 768² | 79.3s | 3 scenes, 140.9s | **47.0s** | **1.69x** |
-| i2va 5s 768² | 103.1s | 2 scenes, 150.1s | **75.0s** | **1.37x** |
-
-- **Batching no longer helps t2i** (0.97x, marginally slower). Its purpose was to amortize
-  model-load fixed costs over a batch, and **residency removed the cost there was to amortize**
+- **Batching t2i is no longer worth it** (0.94x, marginally slower). Batching existed to
+  amortize model-load fixed costs, and **residency removed the cost there was to amortize**
   (before residency it was 2.3x: 157s to 67.5s).
-- **The reference modes still benefit** (ref2i 1.69x, i2va 1.37x), because the ~47s reference
-  vision encode is shared across scenes. **The batch's per-step time matches a single request
-  exactly** (ref2i 2.598s vs 2.599s; i2va 7.321s vs 7.323s), so the batch path adds no overhead
-  of its own — the whole difference is how many times the encode is paid.
-- **The "sharing shrinks it" model holds for both** (single minus per-item batch, against the
-  encode the sharing removes, `47x(scenes-1)/scenes`):
-
-  | | Measured saving | Model's prediction | Difference |
-  |---|---|---|---|
-  | ref2i (3 scenes) | 32.3s/image | 31.3s/image | **+1.0s** |
-  | i2va (2 scenes) | 28.1s/video | 23.5s/video | **+4.6s** |
-
-  → **Caching the reference encode across requests should deliver the calculated saving for
-  stills and video alike** (not implemented; see the dated 2026-08-12 section).
-- **Reference batches cannot be combined with `H3_TE_DEVICE`**: a guard rejects them with "the
-  TE GPU needs 24GB or more". That threshold assumes **the 32B TE's vision activations** and is
-  far too large for the 3.11GB projected TE (it rejects a 16GB 4060 Ti). Keeping the projected
-  TE co-resident works. **Worth revisiting.**
+- **Only the reference modes still benefit**, because what gets shared is **not a load but the
+  ~47s reference vision encode**. **The batch's per-step time matches a single request exactly**
+  (ref2i 2.598s vs 2.599s; i2va 7.321s vs 7.323s), so the batch path adds no overhead of its
+  own — the entire difference is how many times that encode is paid.
+- **More scenes, more benefit**: the saving is `47x(scenes-1)/scenes`. For i2va that is 1.37x at
+  2 scenes, 1.44x at 3, 1.57x at 5 — so it favours long stories built around one character.
+- **The "sharing shrinks it" model holds for stills and video alike** (measured vs predicted:
+  ref2i at 3 scenes, 32.3 vs 31.3s/image; i2va at 2 scenes, 28.1 vs 23.5s/video). → **Caching
+  the reference encode across requests should deliver the same saving to repeated single
+  requests** (not implemented; see the dated 2026-08-12 section).
+- **Two gates**: the batch path is `H3_LOWVRAM=1`-only and **silently falls back to sequential**
+  otherwise; and reference batches reject `H3_TE_DEVICE` via a "TE GPU needs 24GB or more" guard
+  — **a threshold sized for the 32B TE's vision activations**, far too large for the 3.11GB
+  projected TE (it rejects a 16GB 4060 Ti). Both **worth revisiting**.
 
 > **A measurement trap (walked into on 2026-08-12)**: comparing a batch against singles without
 > passing `height`/`width` on the batch side means **the batch generates on the server's default
