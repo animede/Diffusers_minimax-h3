@@ -182,6 +182,46 @@ MODEL_ID = "MiniMaxAI/MiniMax-H3"
 DEVICE = torch.device("cuda:0")
 CPU = torch.device("cpu")
 
+# ---------------------------------------------------------------------------
+# H3_VRAM_LIMIT_GB: このプロセスが計算用GPU上で確保できる VRAM の上限 (GB, 10進)。
+# 既定は空 = 無制限 (カード全部を使ってよい)。
+#
+# 用途1 **同居**: 同じGPUで ComfyUI や diffusers-server 等を並走させるとき、H3 が
+#   カードを食い尽くさないように上限を切る。96GB のカードでも「H3 には半分だけ」と
+#   いった運用ができる (例: H3_VRAM_LIMIT_GB=48)。上限を超える確保は PyTorch の
+#   キャッシングアロケータが OOM として弾くので、**同居相手のメモリを奪わない**。
+# 用途2 **低VRAM構成の検証**: `scripts/vram_ballast.py` はダミーテンソルを実際に確保
+#   して空きを減らす方式だが、こちらは1行で済み、確保もしない。ただし
+#   `torch.cuda.mem_get_info()` が返す空き容量やカード総容量の見え方は変わらない
+#   (バラストは変わる) ので、**容量を読んで分岐するコード**
+#   (`_te_external_usable_for()` の 24GB 判定など) の検証にはバラストを使うこと。
+#
+# 実装は `torch.cuda.set_per_process_memory_fraction()`。fraction はカード総容量に
+# 対する比なので、GB 指定を総容量で割って渡す。指定が総容量以上なら無意味なので警告
+# だけ出して素通しする。**予約ではなく上限**なので、使わない限りメモリは消費しない。
+H3_VRAM_LIMIT_GB = os.environ.get("H3_VRAM_LIMIT_GB", "").strip()
+if H3_VRAM_LIMIT_GB:
+    _limit_gb = float(H3_VRAM_LIMIT_GB)
+    if _limit_gb <= 0:
+        raise ValueError(f"H3_VRAM_LIMIT_GB must be positive, got {H3_VRAM_LIMIT_GB!r}")
+    if torch.cuda.is_available():
+        _total_gb = torch.cuda.get_device_properties(DEVICE.index or 0).total_memory / 1e9
+        if _limit_gb >= _total_gb:
+            logger.warning(
+                "H3_VRAM_LIMIT_GB=%.1f is at or above the card's %.1fGB -- no cap applied.",
+                _limit_gb, _total_gb,
+            )
+        else:
+            torch.cuda.set_per_process_memory_fraction(_limit_gb / _total_gb, DEVICE.index or 0)
+            logger.info(
+                "VRAM cap: this process may allocate at most %.1fGB of %.1fGB on %s "
+                "(fraction %.3f, H3_VRAM_LIMIT_GB). Exceeding it raises OOM instead of "
+                "taking memory from co-tenant processes.",
+                _limit_gb, _total_gb, DEVICE, _limit_gb / _total_gb,
+            )
+    else:
+        logger.warning("H3_VRAM_LIMIT_GB set but CUDA is unavailable -- ignored.")
+
 # "none" (default) = current per-request TE<->transformer GPU swap.
 # "bnb-4bit" = TE quantized NF4, TE+transformer both resident permanently, VAEs cycle
 # through GPU per-phase instead. See module docstring above.
@@ -4011,6 +4051,9 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "lowvram_group": H3_LOWVRAM_GROUP,
+            # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
+            # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
+            "vram_limit_gb": float(H3_VRAM_LIMIT_GB) if H3_VRAM_LIMIT_GB else None,
             "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
