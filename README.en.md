@@ -239,13 +239,10 @@ download, cache size can be monitored via `logs/du_monitor.log` (warns above 170
 
 ## VRAM support table and main environment variables (quick reference)
 
-> **Note**: this table is a quick reference for the environment variables, based on
-> ballast measurements from the 96GB-single era. **For measurements on real cards (single
-> 16GB / 8GB×2, using the projected TE), see the
-> "[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" at the top and the
-> dated 2026-08-11 sections.**
-
-Launch examples per use case (all measured; see the sections below for details).
+Launch examples per use case. The top five rows are ballast measurements on the 96GB box
+(PRO 6000, 32B TE); the bottom three rows are **real-card measurements using the projected
+TE** (2026-08-11; see the "[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)"
+at the top and the dated 2026-08-11 sections for details).
 
 | GPU | Startup flag | t2va measured (768², 5s) |
 |---|---|---|
@@ -254,10 +251,21 @@ Launch examples per use case (all measured; see the sections below for details).
 | 48GB tier | `H3_LOWVRAM=1` | peak 38.9GB / about 215s |
 | 32GB tier | `H3_LOWVRAM=group` | peak 28.7GB / about 280s |
 | 18GB tier | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / about 280-320s |
+| **Single 16GB** (real 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / about 25min* |
+| **Single 12GB** (projected, unmeasured) | same as single 16GB | the measured 11.4GB peak should fit in 12GiB; reference modes and 768×1344 will not |
+| **8GB×2** (ballast-measured) | single-16GB flags + `H3_TE_DEVICE=cuda:1` | peak 7.23GB / about 25.6min* |
+
+\* Times in the low-VRAM real-card rows were measured on a PCIe Gen3 x4 slot with an sm_89
+card (SDPA). On Gen4 x16 the weight transfer is about 1/8 (see
+"[An honest note on speed](#an-honest-note-on-speed)"). Cards other than sm_120 also need
+`H3_ATTN_BACKEND=default`.
 
 ```bash
 # Example: launch on a 32GB-tier GPU
 H3_LOWVRAM=group H3_TE_PRUNE=1 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+# Example: launch on a single 16GB card (add H3_ATTN_BACKEND=default on sm_89)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
 Main environment variables (defaults shown; most **can also be toggled from the UI**, so
@@ -267,12 +275,16 @@ only set these if you want to change them permanently):
 |---|---|---|
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder quantization (`none` = bf16, 66.7GB) |
 | `H3_TE_PRUNE` | `0` | Remove unused upper layers of TE (output unchanged, -3.6GB) |
+| `H3_TE_PROJ` | (off) | **Projected TE**: replaces the 32B TE with Qwen3-VL-4B + a linear map (repo id or .safetensors path; quality is an approximation, see the dated 2026-08-10 section) |
+| `H3_TE_PROJ_QUANT` | `bnb-4bit` | Quantization of the projected 4B TE (NF4 = 3.11GB; `none` = bf16 8.88GB / `bnb-8bit`) |
+| `H3_TE_DEVICE` | (off) | Park the TE on a second GPU (e.g. `cuda:1`; the 32B TE needs a 20GB-class card, the projected TE fits an 8GB-class one) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` shrinks the transformer from 66.3GB to 34GB |
-| `H3_LOWVRAM` | `0` | `1` = 48GB-tier phase cycling / `group` = 32GB-tier block offload |
-| `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache (denoise -25%) |
-| `H3_ATTN_BACKEND` | `sage` | `default` if SageAttention is not available |
-| `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use) |
-| `H3_VIDEO_VAE_FP16` | `0` | fp16-ify the video VAE (reduces decode peak) |
+| `H3_LOWVRAM` | `0` | `1` = 48GB-tier phase cycling / `group` = block offload for the 32GB tier and below |
+| `H3_KEEP_TRANSFORMER` | `0` | Keep the transformer resident, removing the reload fixed cost (see its section for the preconditions) |
+| `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache (denoise -25%; measured ineffective on the int8+SDPA trajectory) |
+| `H3_ATTN_BACKEND` | `sage` | The sage build is sm_120-only. **Any other GPU must use `default` (SDPA)** |
+| `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use; incompatible with `group`) |
+| `H3_VIDEO_VAE_FP16` | `0` | fp16-ify the video VAE (reduces decode peak; required at 16GB and below) |
 | `H3_LLM_URL` | `http://127.0.0.1:64650` | Local LLM used for prompt enhancement (optional feature) |
 
 ## VRAM/RAM design (important, based on measurements)

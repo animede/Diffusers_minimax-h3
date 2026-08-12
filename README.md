@@ -223,11 +223,9 @@ venv/bin/python scripts/download_t2va.py
 
 ## VRAM対応表と主な環境変数(早見表)
 
-> **注**: この表は 96GB 機時代のバラスト実測に基づく環境変数の早見表。**実カードでの実測
-> (16GB 単体・8GB×2、投影TE使用)は冒頭の「[VRAM×機能マトリクス](#vram機能マトリクス2026-08-11-実測)」
-> と日付節 2026-08-11 を参照。**
-
-用途に応じた起動例(すべて実測済み。詳細は以降の各節)。
+用途に応じた起動例。上段5行は 96GB 機(PRO 6000)でのバラスト実測(32B TE 使用)、
+下段3行は **投影TE を使う実カード実測**(2026-08-11。詳細は冒頭の
+「[VRAM×機能マトリクス](#vram機能マトリクス2026-08-11-実測)」と日付節 2026-08-11)。
 
 | GPU | 起動時の指定 | t2va 実測(768²・5秒) |
 |---|---|---|
@@ -236,10 +234,20 @@ venv/bin/python scripts/download_t2va.py
 | 48GB級 | `H3_LOWVRAM=1` | peak 38.9GB / 約215秒 |
 | 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒 |
 | 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
+| **16GB 単体**(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / 約25分※ |
+| **12GB 単体**(見込み・未実測) | 16GB 単体と同じ | 実ピーク11.4GBが12GiBに入る計算。参照系・768×1344は不可 |
+| **8GB×2**(バラスト実測) | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB / 約25.6分※ |
+
+※ 低VRAM実カード列の時間は PCIe Gen3 x4 スロット + sm_89(SDPA)での実測。Gen4 x16 なら
+重み転送は約1/8(「[速度の正直な注記](#速度の正直な注記)」参照)。sm_120 以外のカードは
+`H3_ATTN_BACKEND=default` も必要。
 
 ```bash
 # 例: 32GB級GPUで起動する
 H3_LOWVRAM=group H3_TE_PRUNE=1 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+# 例: 16GB カード単体で起動する(sm_89 なら H3_ATTN_BACKEND=default も付ける)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
 主な環境変数(既定値。多くは**UIからも切り替えられる**ので、恒久的に変えたい時だけ指定する):
@@ -248,12 +256,16 @@ H3_LOWVRAM=group H3_TE_PRUNE=1 venv/bin/python -m uvicorn app:app --host 0.0.0.0
 |---|---|---|
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder の量子化(`none` は bf16 で 66.7GB) |
 | `H3_TE_PRUNE` | `0` | TE の未使用上位レイヤー削除(出力は不変、-3.6GB) |
+| `H3_TE_PROJ` | (無効) | **投影TE**: 32B TE を Qwen3-VL-4B+線形写像で代替(repo id か .safetensors パス。品質は近似、日付節 2026-08-10 参照) |
+| `H3_TE_PROJ_QUANT` | `bnb-4bit` | 投影TE 4B の量子化(NF4 で 3.11GB。`none`=bf16 8.88GB / `bnb-8bit`) |
+| `H3_TE_DEVICE` | (無効) | TE を2枚目GPUへ常駐(例 `cuda:1`。32B TE は 20GB 級、投影TE なら 8GB 級で可) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` で transformer を 66.3→34GB |
-| `H3_LOWVRAM` | `0` | `1`=48GB級のフェーズ循環 / `group`=32GB級の block offload |
-| `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%) |
-| `H3_ATTN_BACKEND` | `sage` | `default` で SageAttention 不要 |
-| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL) |
-| `H3_VIDEO_VAE_FP16` | `0` | video VAE を fp16 化(デコードのピークを削減) |
+| `H3_LOWVRAM` | `0` | `1`=48GB級のフェーズ循環 / `group`=32GB級以下の block offload |
+| `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃(成立条件は該当節参照) |
+| `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
+| `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外のGPUは `default`(SDPA)必須** |
+| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL。group とは併用不可) |
+| `H3_VIDEO_VAE_FP16` | `0` | video VAE を fp16 化(デコードのピークを削減。16GB 以下では必須) |
 | `H3_LLM_URL` | `http://127.0.0.1:64650` | プロンプト強化に使うローカルLLM(任意機能) |
 
 ## VRAM/RAM 設計 (重要、実測に基づく)
