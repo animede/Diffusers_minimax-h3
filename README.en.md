@@ -136,9 +136,25 @@ measured with `H3_LOWVRAM=1 H3_KEEP_TRANSFORMER=1` plus the projected TE and tur
   157s to 67.5s — before residency).
 - **ref2i still gets 1.6x**, because the ~47s reference vision encode is shared across scenes
   (about 90s saved over 3 scenes — exactly the two extra scenes' encodes).
-- **The ref2va (video) batch barely helps** (1.02x). If the same sharing applied, two scenes
-  should save ~47s; the measurement shows ~5s. **Cause not yet identified** (needs
-  investigation).
+- **The ref2va (video) batch barely helps** (1.02x) — but **not because the sharing failed**.
+  The log timestamps show **exactly one ~47-48s encode block for ref2i (3 scenes) and for
+  ref2va (2 scenes) alike**, independent of scene count, so the prefix is shared in both. The
+  difference shows up elsewhere: **the batch's denoise runs heavier per scene than a single
+  request** (video: 84s for 2 scenes = 42s/scene against 22s/scene single; stills: 32s for 3
+  scenes = 10.7s/scene against 7.8s/scene). For stills the sharing gain wins; for video it is
+  cancelled out. **That per-scene overhead is not yet explained** (needs investigation).
+
+**Checking the "sharing shrinks it" model** (single minus per-item batch, against the encode
+the sharing removes, `47x(scenes-1)/scenes`):
+
+| | Measured saving | Model's prediction | Difference |
+|---|---|---|---|
+| ref2i (3 scenes) | 29.7s/image | 31.3s/image | **-1.7s (essentially a match)** |
+| i2va (2 scenes) | 2.4s/video | 23.5s/video | **-21.1s (badly off)** |
+
+→ **The model holds for stills and fails for video.** Caching the reference encode should pay
+off as predicted for stills, but for video the gain is likely to be eaten by the unexplained
+cost above (see "Correcting the estimate" below).
 - **Reference batches cannot be combined with `H3_TE_DEVICE`**: a guard rejects them with "the
   TE GPU needs 24GB or more". That threshold assumes **the 32B TE's vision activations** and is
   far too large for the 3.11GB projected TE (it rejects a 16GB 4060 Ti). Keeping the projected
@@ -2694,6 +2710,23 @@ to reference-conditioned trajectories unchanged.**
 - **The 13s reload** comes from restoring the "t2va steady state" when a ref2va request finishes.
   If the next request is also ref2va it is unnecessary, and the same "don't restore" judgment as
   `H3_KEEP_TRANSFORMER` could apply (**not implemented**).
+
+### Correcting the estimate (same day, after the batch measurements)
+
+The initial estimate was that removing these two costs would take **i2va from 103s to about
+45s**. **The batch measurements that followed contradict it**, so the estimate is withdrawn.
+The batch path is literally the experiment "what happens if the reference encode is shared",
+and it showed:
+
+- **Stills behave as predicted**: ref2i's measured saving of 29.7s/image against the sharing
+  model's 31.3s/image (off by 1.7s). **The caching gain arrives essentially as calculated.**
+- **Video does not**: i2va saved only 2.4s/video against a predicted 23.5s, off by 21.1s. The
+  encode itself ran only once (confirmed in the log), yet **the batch's denoise grew from 22s
+  to 42s per scene, consuming the entire sharing gain**.
+
+So "**cross-request cache + no reload → i2va at 45s**" **has no evidential support right now**.
+The equivalent improvement does look reachable for stills (ref2i), but **no speedup can be
+promised for video until the per-scene denoise overhead in batching is understood**.
 
 ## Waiting on external events going forward (backlog, as of 2026-08-06)
 
