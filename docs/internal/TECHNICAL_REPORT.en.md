@@ -8,7 +8,10 @@
 > **[docs/TECHNICAL_OVERVIEW.en.md](../TECHNICAL_OVERVIEW.en.md)** instead.
 > The value here is "why the design ended up this way" and "so the same trap is not hit twice".
 
-**Period covered**: 2026-08-04 to 2026-08-08 (44 commits)
+**Period covered**: the main body covers 2026-08-04 to 2026-08-08 (44 commits). **Everything after
+that is covered by addendum A (08-09) and addendum B (08-11 to 12)** — the main body's numbers and
+open items are a snapshot of that period, and anything since resolved or updated is annotated
+inline (summarized in §11.1).
 **Subject**: this repository `minimax-h3` (a standalone app for verifying MiniMax H3 / Hailuo 3.0 functionality)
 **Implementation size**: approx. 10,700 lines (`core/runner.py` 4,943 / `static/index.html` 1,839 / `README.md` 1,441 / `app.py` 1,003 / others)
 
@@ -83,6 +86,12 @@ The core of this project is the design of "**what is placed on the GPU during wh
 
 **The VRAM floor was pushed from 96GB down to approx. 18GB.** Each tier was verified equivalent either by identical-seed MD5 match or by A/B quality comparison.
 
+> **Since then (2026-08-11) the floor dropped further**: with the projected TE (4B + a trained
+> linear map, 3.11GB at NF4), **a real RTX 4060 Ti 16GB on its own** runs every feature to
+> completion (peak 7.4–15.2GB), and **8GiB×2** gets as far as t2va 5s at 768² (peak 7.23GB). The
+> table above is the five-mode lineup under the 32B TE; **the current floor is the 16GB class**.
+> Details in addendum B and [docs/RESIDENCY.en.md](../RESIDENCY.en.md) §5.3.
+
 ### 3.2 Design Philosophy: Allow Only "Short, One-Way" Moves
 
 Drawing on lessons from the sister project `diffusers-server`, a constraint was set from the very start: **the pattern "swap out a 60GB-class module on every single step" is forbidden**. This was because of a past incident where runaway swapping took down the whole system.
@@ -116,6 +125,13 @@ decode   : [vae pair ~11GB + decode buffers]
 ```
 
 The cost is explicit: **a fixed cost of approx. 90–100 seconds per request** for loading TE plus loading the transformer. This fixed cost later became the motivation for the batch feature (§5.4).
+
+> **That fixed cost was later eliminated**: first `H3_TE_PREQUANT`, then `H3_TE_DEVICE` / the
+> projected TE, then `H3_KEEP_TRANSFORMER` — after which **both the transformer and the TE can stay
+> resident between requests** (addendum A1 and [docs/RESIDENCY.en.md](../RESIDENCY.en.md) §5.5).
+> The "nothing stays resident between requests" shape above is the behavior of
+> `H3_KEEP_TRANSFORMER=0` (the default) and is still the design in use for configurations that
+> **decode in fp32**.
 
 ### 3.4 `H3_LOWVRAM=group` (24–32GB Class): Block-Level Streaming
 
@@ -267,7 +283,7 @@ Note that diffusers has a guard of `num_layers <= 50 → raise` precisely becaus
 - **Ordering of `_sync_shared_components_to_ref()`**: syncing shared components to the ref pipeline must happen **after** TE is loaded. `components` is a live attribute read, not a promise, so syncing beforehand bakes in `text_encoder = None`. Because `H3_LOWVRAM` does not preload TE, this only surfaced in that mode, as `AttributeError: 'NoneType' object has no attribute 'config'`.
 - **`MiniMaxH3AdaLayerNormModulation` reads `.weight.dtype` directly**: replacing the Linear with a wrapper causes an `AttributeError`. Resolved by giving `_TurboLoRALinear` transparent `.weight` / `.bias` properties. This is the same shape of issue the sister project hit with JoyAI's `PatchifyLinear`.
 - **audio_vae must never be run in bf16**: a known upstream bug makes generated audio approx. 20dB quieter. Fixed at fp32, strictly.
-- **VAE tile size has no effect**: shrinking it 256 → 192 → 128 → 96 to reduce decode peak left peak VRAM **unchanged at 16.29GB** (only making timing worse, 5.9s → 10.5s). Concluded that a fixed cost independent of spatial tiling is the bottleneck.
+- **VAE tile size has no effect**: shrinking it 256 → 192 → 128 → 96 to reduce decode peak left peak VRAM **unchanged at 16.29GB** (only making timing worse, 5.9s → 10.5s). Concluded that a fixed cost independent of spatial tiling is the bottleneck. **That 16.29GB predates both the 2026-08-10 uint8 intermediate-tensor fix and the 2026-08-12 move of de-normalization to the CPU (addendum B6)**, so the current decode peak is lower (**the post-fix re-measurement has not been done**). The conclusions (tiling does not help; two thirds of the peak is VAE weights) are unchanged.
 - **Turbo LoRA format detection order matters**: checking for the comfy signature (`qkv_proj`) first is essential, or misdetection occurs. The Ostris version also has `token_refiner.blocks.*` keys, so checking prefix alone would misclassify it as diffusers format (reproduced and fixed using an actual file).
 
 ---
@@ -320,6 +336,17 @@ The key to the implementation is resetting the mutable state shared across scene
 | Still image w/ reference (ref2i, 3 scenes) | 164.9 s/image | **116.7 s/image** | -29% |
 | Video w/ reference (ref2va, 2 scenes) | ~485 s/clip | **401.6 s/clip** | -17% (marginal ~32%) |
 
+> **Making models resident changed what batching is for (2026-08-12)**: this feature existed to
+> amortize **the load fixed cost** across one batch, and `H3_KEEP_TRANSFORMER` removed that fixed
+> cost entirely — so **t2i batching no longer helps** (0.94x at 3 scenes, i.e. marginally slower;
+> before residency it was 157s → 67.5s, a 2.3x win). **The reference family still benefits**,
+> because what is shared there is not the load but the **~47s reference vision encode** (ref2i
+> 1.69x at 3 scenes, i2va 1.37x at 2 scenes). **Per-step times in a batch match single requests
+> exactly** (ref2i 2.598s vs 2.599s, i2va 7.321s vs 7.323s), so the batch path itself adds zero
+> overhead. **Lesson**: an amortization optimization is worth exactly as much as the cost it
+> amortizes. **State explicitly what is being shared**, and you can reason about whether the
+> benefit grows or vanishes when the premises change.
+
 ### 5.5 KV Cache Sharing for the Reference Prefix
 
 During the encoding phase of a ref batch, the Qwen3-VL encoding of the reference labels + vision content (approx. 4,104 tokens, approx. 65 seconds per scene) was being duplicated across every scene.
@@ -342,7 +369,7 @@ The ref2va token sequence has references prepended, with the prompt appended ver
 | + TE bnb-4bit | **185 s** | Frames and audio at the same level, same seed |
 | + FirstBlockCache (0.05) | denoise 157→**118 s** | PSNR 31.8–34.3dB, audio correlation 0.979 |
 | + Sage Attention | denoise 118→**104 s** | Fully deterministic (byte-identical for the same seed) |
-| **current default** | **~160 s** | |
+| **the default at the time (2026-08-08)** | **~160 s** | |
 | + FBC 0.1 (opt-in) | ~125 s | Composition drifts noticeably by eye |
 | + Turbo LoRA 8steps (opt-in) | **~88 s** | Close to baseline |
 | + Turbo 4steps (draft) | ~40 s | Somewhat soft |
@@ -443,7 +470,21 @@ Confirming that it still breaks even at 30 steps was the key point that isolated
 
 **Result** (RTX PRO 5000 48GB + `H3_LOWVRAM=1`, 768², 5 seconds): denoise **197.7s → 26.1s (7.6x)**, total time **351.4s → 135.2s (2.6x)**. Combined with still-image mode, denoise drops to 5.0 seconds.
 
-**Remaining limitations**: incompatible with `H3_LOWVRAM=group` in any form (because `enable_group_offload`'s `cpu_param_dict` is fixed at activation time, the LoRA buffers added afterward risk being left out of the offload cycle; not unlocked while unverified). Audio level runs somewhat higher than non-turbo. Application to ref2va is unverified.
+**Remaining limitations**: incompatible with `H3_LOWVRAM=group` in any form (because `enable_group_offload`'s `cpu_param_dict` is fixed at activation time, the LoRA buffers added afterward risk being left out of the offload cycle; not unlocked while unverified). Audio level runs somewhat higher than non-turbo.
+
+> **Application to ref2va was confirmed on 2026-08-12 (the old "unverified" is resolved)**: even at
+> 4 steps the reference subject's fidelity holds (bangs, hairstyle, cardigan, ribbon and necklace
+> all match), and the video keeps the person consistent from the first frame through the middle to
+> the last. **Strength 0.094 carries over to reference-conditioned trajectories unchanged.**
+> The same test also revealed that **only the three reference endpoints in `app.py`
+> (`/api/ref2va`, `/api/ref2i_batch`, `/api/ref2va_batch`) hard-coded
+> `num_inference_steps: int = Form(30)`** and therefore never picked up turbo's step default
+> (`DEFAULT_NUM_INFERENCE_STEPS` = 4). The turbo LoRA itself was being applied to
+> `transformer_ref` correctly, so what had been silently running for a long time was the
+> contradictory combination of **a distilled LoRA running 30 steps**. Fixed by making all three use
+> `DEFAULT_NUM_INFERENCE_STEPS`. **Lesson**: when you retrofit a "single source of truth" default,
+> **grep for every endpoint carrying the same form parameter and convert them all**. A leftover
+> literal still works, so the only symptom is "slow" — nothing surfaces as an error.
 
 ---
 
@@ -495,7 +536,14 @@ The LLM's n_ctx is **7,680**. Measured system-prompt usage is 4,832 tokens (63%)
 
 ---
 
-## 11. Current State of the Art
+## 11. State of the Art as of 2026-08-08
+
+> **This section is the state of the art for the main body's period (2026-08-04 to 08-08), not
+> today's numbers.** Later records live in addendum A (08-09), addendum B (08-11 to 12) and the
+> README's dated sections. For reference, the current fastest is **t2i 7.40s / t2va 5s 28.13s** on
+> the 96GB box with int8 on a single GPU and freeing stopped (`H3_KEEP_TRANSFORMER=1`), at turbo
+> 4steps, 768², steady state. The table below is from the **48GB box, in the era when the
+> transformer was still being swapped in and out on every request**.
 
 **Environment**: RTX PRO 5000 Blackwell 48GB / 94GB RAM / `H3_LOWVRAM=1`
 
@@ -510,21 +558,46 @@ The LLM's n_ctx is **7,680**. Measured system-prompt usage is 4,832 tokens (63%)
 
 As a storytelling production pipeline, the flow "**establish the character with t2i → produce still images for every scene with ref2i_batch → turn each scene into video with ref2va_batch**" now works end to end.
 
-### 11.1 Remaining Work
+### 11.1 Remaining Work (the 2026-08-08 list, annotated with what happened since)
 
 **Waiting on external events**
 - Merging of diffusers PR #14355 (per §2.1, not tracked casually; when tracked, confirm regression via identical-seed MD5)
-- lightx2v turbo LoRA is v0.1. Reconsider enabling it by default once the community has more track record
+  → **【resolved 2026-08-09】** tracked to the merged `f37ab93`. Every path is equivalent at
+  identical seeds by MD5 (addenda A2 / A5, and the README's dated sections)
+- lightx2v turbo LoRA is v0.1. Reconsider enabling it by default once the community has more track record (**still open**)
 
 **Untouched improvement candidates**
 - Pre-saving quantized checkpoints (would eliminate the low-VRAM mode's 90–100 second fixed cost)
+  → **【resolved】** `H3_TE_PREQUANT` (an on-disk cache of the quantized TE) took 90–100s down to
+  ~55s, and parking the TE on another GPU / using the projected TE together with
+  `H3_KEEP_TRANSFORMER` **removed the fixed cost entirely** (addendum A1 and
+  [docs/RESIDENCY.en.md](../RESIDENCY.en.md) §5.5)
 - 16GB-class support (needs streaming execution of TE; the current floor is 17.45GB)
-- `torch.compile` (compatibility with the FBC / group offload hooks is unverified)
+  → **【resolved 2026-08-11】** solved not by streaming the TE but by the **projected TE** (4B + a
+  trained linear map, 3.11GB at NF4). A real RTX 4060 Ti 16GB runs every feature **on its own**, and
+  8GiB×2 gets as far as t2va (addendum B)
+- `torch.compile` (compatibility with the FBC / group offload hooks is unverified) → **still untouched**
 
 **Known unresolved issues**
 - With `H3_LOWVRAM=group`, running ref2va after t2va gets rejected by the host RAM guard (confirmed only on the 94GB machine; likely, but not verified, not to occur on machines with 48GB+ RAM headroom)
-- ref2va's system prompt occupies 86% of n_ctx (§10.4)
+  → **【resolved 2026-08-12】** the cause was not RAM capacity but **leftover pinned host cache**
+  (fixed by adding `torch._C._host_emptyCache()`, addendum B8). It happens **even on machines with
+  plenty of RAM headroom** — the guess recorded here at the time was **wrong**
+- ref2va's system prompt occupies 86% of n_ctx (§10.4) → **still unresolved**
 - Turbo applied to ref2va, and turbo × group offload, are both unverified
+  → turbo × ref2va is **【resolved 2026-08-12】** (the callout in §9.3).
+  **turbo × group offload is still unverified** and the combination remains rejected in code
+
+**Items added since** (details in addendum B and the README)
+- Caching the **~47s reference vision encode** across requests, which is the reference family's
+  bottleneck (**not implemented**)
+- Removing the **~13s** reload of the t2va transformer at the end of a ref2va request (**not implemented**)
+- The reference family's `H3_TE_DEVICE` guard ("the TE GPU needs 24GB+") is still a **32B-TE-based
+  threshold**, far too strict for the 3.11GB projected TE (**needs revisiting, not yet fixed**)
+- The batch path's phase reordering is `H3_LOWVRAM=1`-only and **silently falls back to sequential**
+  execution otherwise
+- **Threshold tuning** for FBC skipping 0 steps on the int8+SDPA trajectory (**unverified**, up to 2x on the table)
+- **Re-measuring the decode peak** after the 2026-08-12 move of de-normalization to the CPU (not done)
 
 ---
 
@@ -566,6 +639,21 @@ An estimate skewing conservative is safe, but since "4GB of headroom" was the ba
 the go/no-go decision, it was still the right call not to declare it viable until measured.
 
 t2i steady state 9.7s/image, t2va 5 seconds = 44.2s. PNG/MP4 MD5 exact match for the same seed.
+
+> **Since then (2026-08-11 / 08-12): the conditions were relaxed twice.** The original guard was
+> "`H3_LOWVRAM=1` **and** `H3_TE_DEVICE` set **and** `H3_VIDEO_VAE_FP16=1`", but both of the first
+> two came from the premise of **co-locating the 32B TE (17.45GB at nf4) with the compute GPU**.
+> (1) With `H3_TE_PROJ` (the projected TE, 3.11GB at NF4) co-location fits the budget, so
+> `H3_TE_DEVICE` is exempted; (2) plain mode (`H3_LOWVRAM=0`) also frees and reloads the
+> transformer for every decode window (**a measured 11.9–12.3s per request**) and gains exactly the
+> same way, so the condition was relaxed to "`H3_LOWVRAM` is not `group`". **(2) took zero extra
+> implementation** — the branch that skips the free was already shared and the restoring
+> `_ensure_transformer` was idempotent. Equivalence was proven on the plain side too, by a
+> **same-seed PNG MD5 match** (`596a718e4b5cf9a0b907d2ec479225d2`, 19.58s → 7.40s).
+> **Lesson**: a guard's conditions tend to encode **the configuration you happened to have at the
+> time**, not the inequality you actually need. Write *why* each value is required in a comment,
+> and when the premise changes you will **notice that it can be relaxed** (here, the justification
+> for relaxing it was literally the budget arithmetic already written in the guard's own comment).
 
 ## A2. Two `_execution_device` pitfalls hit while tracking the merged version (both a recurrence of §4 in the main body)
 
