@@ -2,63 +2,132 @@
 
 [日本語](README.md) | **English**
 
-A standalone app for verifying the capabilities of MiniMax H3 (Hailuo 3.0). It runs the
-omnimodal 33B model, which generates video + stereo audio simultaneously in a single
-denoise pass, via the diffusers Modular Diffusers path (PR #14355). This is a preliminary
-verification workspace for eventual integration into
-[diffusers-server](https://github.com/animede/diffusers-server) (the diffusers-server
-codebase itself has not been touched at all).
+**MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo
+audio in a single denoise pass, on consumer-tier GPUs.** From text, an image reference, or
+an audio reference it produces **video + stereo audio**, and it can also emit still images
+only (T2I / Ref2I). It is built on the diffusers Modular Pipeline (PR #14355, pinned to
+commit **f37ab93**). **Verified to run on two 8GB cards, and on a single real RTX 4060 Ti
+16GB card** (see the support table below). This is a preliminary verification workspace for
+eventual integration into [diffusers-server](https://github.com/animede/diffusers-server)
+(the diffusers-server codebase itself has not been touched at all).
 
-**Measured on one RTX PRO 5000 48GB + one RTX 4000 SFF Ada 20GB:**
+![Main GUI](docs/images/ui_main_en.png)
 
-| | Baseline | Now | |
-|---|---|---|---|
-| One still image (768²) | 157s | **9.7s** | 16x |
-| 5s video + audio (768²) | 351.4s | **44.2s** | 8.0x |
+*A single-page browser UI. Five modes on tabs (video: **T2VA** = text / **FL2VA** = frame /
+**Ref2VA** = reference; still image: **T2I** / **Ref2I**). The lower section is a gallery of
+outputs, from which checked videos can be concatenated and exported. Prompts can be enhanced
+into the official H3 guide format via a local LLM, and FirstBlockCache / Sage / Turbo /
+quantization / low-VRAM mode are toggled from this panel **without a restart**. Includes a
+Japanese/English switch.*
 
-The central finding of this repository is that the bottleneck was not denoising but the
-**fixed cost of loading and freeing models**. That overhead is removed in three stages (a
-disk cache for the quantized text encoder, keeping the text encoder resident on a second
-GPU, then keeping the transformer resident), and **every one of those speedups is verified
-to produce a byte-identical output (same MD5) at a fixed seed** — so they are demonstrably
-inert, not quality trades. See [docs/TECHNICAL_OVERVIEW.en.md](docs/TECHNICAL_OVERVIEW.en.md)
-for the derivation and the measurements.
+## VRAM × feature matrix (measured 2026-08-11)
 
-**All figures in this README are measured on real hardware**, on an environment of RTX PRO
-6000 Blackwell 96GB / RAM 94GB / Ubuntu 24.04. Low-VRAM configurations have been verified
-down to the 18GB tier using a VRAM ballast (see the VRAM support table below).
+○ = completes (measured) / △ = derived estimate (not yet measured) / × = OOM. All speeds are
+on this box's **PCIe Gen3 x4 slot + sm_89 (4060 Ti) + SDPA**; on a **Gen4 x16 slot the weight
+transfer is roughly 1/8** (see "An honest note on speed" below).
 
-> ## Where things stand and where to resume (as of 2026-08-09)
->
-> Read this first when resuming work.
->
-> | What you want to know | Where to look |
-> |---|---|
-> | **Spec, performance, design** (what is achieved and how) | [docs/TECHNICAL_OVERVIEW.en.md](docs/TECHNICAL_OVERVIEW.en.md) |
-> | **Pitfalls, failures, operational lessons hit** (to avoid the same holes) | [docs/internal/TECHNICAL_REPORT.en.md](docs/internal/TECHNICAL_REPORT.en.md) (the "Addendum: 2026-08-09" at the end is the latest) |
-> | **What to do next** (not yet started / unverified) | This README's "[Waiting on external events going forward](#waiting-on-external-events-going-forward-backlog-as-of-2026-08-06)" §3 |
-> | Which mode loads/releases what, and when | [docs/RESIDENCY.en.md](docs/RESIDENCY.en.md) |
-> | Regression baselines for when diffusers gets bumped | [docs/internal/regression_baselines.json](docs/internal/regression_baselines.json) |
->
-> **Current state**: diffusers is pinned to the merged version **f37ab93** (PR #14355
-> tracking complete, all paths equivalent by identical-seed MD5). Recommended launch is
-> `H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`
-> (t2i steady state 9.7s/image, t2va 5s = 44.2s). **When using ref2va, drop `H3_TE_DEVICE`**
-> (with only 20GB on the TE GPU, capacity is insufficient and it auto-rejects with 400).
->
-> The chronological work log is in this README's dated sections (read on below).
+| Config | t2i 768² | t2va 5s 768² | ref2i | i2va (image ref) | audio ref | 768×1344 5s |
+|---|---|---|---|---|---|---|
+| **Real RTX 4060 Ti 16GB, single** | ○ 498s / peak 7.4GB | ○ 25 min / 11.4GB | ○ | ○ 39 min / 9.41GB | ○ 54 min / 11.96GB | ○ 66 min / 13.37GB (15.2GB real = ceiling) |
+| **8GiB × 2** (compute + TE, ballast-simulated) | ○ 512s / 6.4GB | ○ 25.6 min / 7.23GB | ○ 17.7 min / 6.69GB | × OOM | × OOM | × OOM |
+| **12GB, single** | △ estimate | △ | △ | △ | close to × (14.7GB real) | × |
+| **48GB + 20GB** (two cards, turbo LoRA) | ○ 9.7s | ○ 44.2s | ○ | ○ | ○ | ○ |
 
-> **Environment change (night of 2026-08-07)**: The GPU in this box was swapped from an
-> RTX PRO 6000 Blackwell 96GB to a two-card setup of **RTX PRO 5000 Blackwell 48GB +
-> RTX 4000 SFF Ada 20GB**. Existing measurements are from the 96GB era (still valid as a
-> reference point since they were verified with a VRAM ballast). A single 48GB card cannot
-> physically load the default mode (bf16 transformer, 66.3GB), so **`H3_LOWVRAM=1`
-> (48GB tier) or `H3_LOWVRAM=group` (24-32GB tier) is required to start**.
-> The turbo LoRA was initially "bf16-path only, unusable on this box," but **switching the
-> default LoRA to the lightx2v variant on 2026-08-08 made it usable with `H3_LOWVRAM=1`
-> too** (see the 2026-08-08 update in the "Turbo LoRA" section; cannot be combined with
-> group). New measurements from 2026-08-07 onward (still-image mode section and later) are
-> values on the RTX PRO 5000 48GB + `H3_LOWVRAM=1`.
+- 12GB single is not measured. t2va real peak 11.4GB / i2va 9.41GB (11.2GB real) fit in 12GiB
+  by calculation, but audio ref (14.7GB real) and 768×1344 (15.2GB real) exceed it.
+- The key to the 16GB / 8GB configs is the **projected TE** (Qwen3-VL-4B + a trained linear
+  map, ClipProj, 3.11GB in NF4 — a stand-in for the 32B text_encoder) + `H3_LOWVRAM=group`
+  (streams the int8 transformer block by block, ~1.4GB GPU-resident) + fp16 video-VAE decode.
+  Details are in the dated sections 2026-08-10 to 08-11.
+- **The measurement environment is shared across two machines**: the 16GB / 8GB rows are on
+  the **96GB box (RTX PRO 6000 + an added 4060 Ti 16GB)**, the 48GB+20GB row on the **48GB box
+  (RTX PRO 5000 48GB + RTX 4000 SFF Ada 20GB)**. Older measurements (from the 96GB-single era)
+  are kept as-is in the individual dated sections.
+
+## Quick start by VRAM tier
+
+Complete "[Installation](#installation)" and "[Obtaining the model](#obtaining-the-model)"
+first. After launch, open `http://<host>:8611/` in a browser.
+
+```bash
+# Real 16GB, single card (e.g. an sm_89 4060 Ti)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
+  H3_ATTN_BACKEND=default \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+# Note: anything other than sm_120 requires H3_ATTN_BACKEND=default (the default sage is an sm_120-only build)
+
+# 8GB × 2 (put the TE on the second GPU)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
+  H3_ATTN_BACKEND=default H3_TE_DEVICE=cuda:1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+
+# 48GB tier (recommended: full speedups)
+H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+
+# 96GB tier (everything resident, no env)
+venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+```
+
+For finer per-tier launch examples (80/48/32/18GB) and every environment variable, see
+"[VRAM support table and main environment variables](#vram-support-table-and-main-environment-variables-quick-reference)".
+
+## An honest note on speed
+
+**The low-VRAM configs run, but they are slow.** `H3_LOWVRAM=group` streams the int8 weights
+(~34GB) from CPU to GPU every step, so transfer is the bottleneck. The 16GB / 8GB figures in
+the table above are on this box's **PCIe Gen3 x4 slot**, where most of the `16.5s/step` (t2i)
+to `51s/step` (t2va) is transfer time. On a **proper Gen4 x16 slot the transfer is about 1/8**,
+so these are values of "this box's slot," not "the 16GB card's performance." Also, on the
+int8+SDPA trajectory FirstBlockCache does not kick in (`cache_skipped_steps: 0`), leaving up
+to a 2x speedup on the table via threshold tuning (unverified).
+
+On quality: both the projected TE (PSNR 22.4dB vs 32B) and int8+SDPA shift the composition
+even at the same seed (**a trajectory divergence, not degradation**). In fact, in some
+measured cases int8+SDPA improved prompt fidelity, and the reference (vision) path was
+visually confirmed to match the 32B ground truth in fidelity. **Cross-config quality cannot
+be judged by PSNR/MD5 — judge it by eye.**
+
+## Recent updates (2026-08-11 to 08-12)
+
+- **Both final goals reached**: full functionality on a single real RTX 4060 Ti 16GB (t2va
+  768² peak 11.4GB; the maximum is 768×1344 at a real 15.2GB) / t2va 5s 768² completes at
+  full resolution on 8GB × 2 (peak 7.23GB).
+- Moved the decode-tail denormalization to CPU (bit-identical, lowers the decode peak on all
+  configs).
+- Fixed a dtype instant-death on `H3_VIDEO_VAE_FP16` × reference (added an fp16 autocast on
+  the encode side too).
+- Freed the residual pinned RAM in group mode, so t2va ↔ ref2va mode switching now works.
+
+## Where things stand and where to resume (as of 2026-08-12)
+
+Read this first when resuming work.
+
+| What you want to know | Where to look |
+|---|---|
+| **Spec, performance, design** (what is achieved and how) | [docs/TECHNICAL_OVERVIEW.en.md](docs/TECHNICAL_OVERVIEW.en.md) |
+| **Pitfalls, failures, operational lessons hit** (to avoid the same holes) | [docs/internal/TECHNICAL_REPORT.en.md](docs/internal/TECHNICAL_REPORT.en.md) |
+| **Decisions on incorporating community improvements** | [docs/COMMUNITY_IMPROVEMENTS.en.md](docs/COMMUNITY_IMPROVEMENTS.en.md) |
+| Which mode loads/releases what, and when | [docs/RESIDENCY.en.md](docs/RESIDENCY.en.md) |
+| **What to do next** (not yet started / unverified) | This README's "[Waiting on external events going forward](#waiting-on-external-events-going-forward-backlog-as-of-2026-08-06)" §3 |
+| Regression baselines for when diffusers gets bumped | [docs/internal/regression_baselines.json](docs/internal/regression_baselines.json) |
+
+**Current state**: diffusers is pinned to the merged version **f37ab93** (PR #14355 tracking
+complete, all paths equivalent by identical-seed MD5). **The two final low-VRAM goals (real
+16GB single / 8GB × 2) were reached on 2026-08-11**, broadening the pitch from just "speedup"
+to "**runs on consumer-tier GPUs**." The recommended launch on the 48GB box is
+`H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`
+(t2i steady state 9.7s/image, t2va 5s = 44.2s). **When using ref2va, drop `H3_TE_DEVICE`**
+(with only 20GB on the TE GPU, capacity is insufficient and it auto-rejects with 400). The
+chronological work log is in this README's dated sections (read on below).
+
+> **About the measurement environment**: this home is shared across two machines. The **96GB
+> box** = RTX PRO 6000 Blackwell 96GB + an added RTX 4060 Ti 16GB (the low-VRAM goals were
+> measured here); the **48GB box** = RTX PRO 5000 Blackwell 48GB + RTX 4000 SFF Ada 20GB (the
+> recommended 48GB-tier config and turbo were measured here). Each dated section states which
+> box its figures come from. A single 48GB card cannot physically load the default mode (bf16
+> transformer, 66.3GB), so `H3_LOWVRAM=1` (48GB tier) or `H3_LOWVRAM=group` (24-32GB tier) is
+> required.
 
 ## Structure
 
@@ -83,7 +152,7 @@ minimax-h3/
 
 | | Requirement |
 |---|---|
-| GPU | 18GB or more (96GB / 80GB / 48GB / 32GB / 18GB depending on configuration; see the "VRAM support table" below) |
+| GPU | Minimum: a **single 16GB card** (all features, measured, slow) or **8GB×2** (up to t2i/t2va/ref2i). **48GB tier** recommended for comfortable use. Per-config measurements: "[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" at the top |
 | Host RAM | 64GB or more recommended (`H3_LOWVRAM=group` keeps ~34GB of int8 weights resident in RAM, so 48GB+ free is needed) |
 | Disk | About 145GB (T2VA/FL2VA only) / about 207GB (if Ref2VA is also used) |
 | CUDA | 12.8 series (to match torch 2.9.0+cu128). If building SageAttention, `nvcc` must also be the same series |
@@ -169,6 +238,12 @@ Internally it uses `allow_patterns` to fetch only the necessary subfolders. Duri
 download, cache size can be monitored via `logs/du_monitor.log` (warns above 170GB).
 
 ## VRAM support table and main environment variables (quick reference)
+
+> **Note**: this table is a quick reference for the environment variables, based on
+> ballast measurements from the 96GB-single era. **For measurements on real cards (single
+> 16GB / 8GB×2, using the projected TE), see the
+> "[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" at the top and the
+> dated 2026-08-11 sections.**
 
 Launch examples per use case (all measured; see the sections below for details).
 
@@ -1874,6 +1949,476 @@ the result placeholder and the hint lines; the choice survives a reload; the six
 routes (`/api/t2i`, `/api/ref2va`+still=1, `/api/ref2i_batch`, `/api/ref2va_batch`,
 `/api/ref2va`, `/api/t2va`) are unchanged after switching; and no console errors occur.
 
+## 2026-08-10: Lip sync from an audio reference (`fully_copy`) — measurements, and the bug found along the way
+
+**Motivation**: the technique of replacing the text encoder with a small model + a
+projection matrix
+([ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3)) can shrink
+the TE from 15.7GB to 5.2GB, but by the author's own measurements **speech degrades** (4B is
+unintelligible, 8B drops the language and speaks English). So the hypothesis: if the dialogue
+is fed **from an audio reference, it no longer depends on the TE's speech ability**. This
+section verifies that.
+
+**Result: the hypothesis holds.**
+
+| Verified item | Result |
+|---|---|
+| Does the dialogue content carry over from the audio reference | **Holds** — detected language ja (0.964), recognized "今日は良い天気だね", **100% character match** |
+| Lip sync | **Holds** — correlation between mouth opening and the audio envelope **+0.745** (offset 0ms) |
+| Character consistency | Holds (face, hairstyle, uniform as in the reference) |
+| 1:1 copy of the audio | **Does not hold** — waveform correlation 0.112, duration 5.22s → 5.88s |
+
+The decisive point is that **not a single character of Japanese dialogue was written in the
+prompt** (no `<d>` tag; the only instruction was "match the mouth to the dialogue of
+`<Audio 1>`"). The same Japanese came out anyway = **the dialogue does not pass through the
+text encoder**.
+
+**Despite its name, `fully_copy` is not a signal copy.** The official guide says *"The
+complete source audio serves as the target video's complete final audio track"* / *"reused
+1:1"*, but the actual behavior is "**regenerate the same content**". The voice timbre
+changes, and the duration is decided by the model's own constraints (141 frames = 5.88s). If
+you want the original audio verbatim, you have to swap it in after generation (with +0.745
+sync correlation this looks practical; unverified).
+
+Also, the mouth is open for 4.1s against 1.6s of actual audio — the mouth tends to keep
+moving after the speech ends. Acceptable for anime-style footage, but not a strict
+phoneme-level match.
+
+Conditions: 96GB box, TE nf4 + transformer bf16 (unquantized), 768×1344, 141 frames,
+30 steps, seed 777, total 553.9s, peak 87.67GB.
+
+### [Bug fix] ref2va with an audio reference always crashed under sage attention
+
+This fired during the verification above. **Passing a reference containing audio crashes
+reliably**:
+
+```
+sageattention/core.py: assert dtype in [torch.float16, torch.bfloat16]
+AssertionError: Input tensors must be in dtype of torch.float16 or torch.bfloat16
+  (origin: autoencoder_kl_minimax_h3_audio.py -> dispatch_attention_fn)
+```
+
+**Cause**: `MiniMaxH3AudioAttnProcessor` calls `dispatch_attention_fn` with
+`backend=self._attention_backend` (default `None`), so **the backend is resolved
+globally**. This app only calls `set_attention_backend()` on transformer /
+transformer_ref, but with `H3_ATTN_BACKEND=sage` (the default) even the audio_vae's
+attention flows into sage. The audio_vae, however, is **fixed to fp32 by design** (bf16
+drops the volume by about 20dB), and sage only accepts fp16/bf16. **The per-request
+`attn=` override cannot work around it either** (it only affects the transformer family).
+
+**Fix**: call `audio_vae.set_attention_backend("native")` right after loading the
+audio_vae, pinning just this module to native. The audio VAE's compute is small and sage
+gains nothing there.
+
+**This was a hole in the tests**: the path is only exercised by "references with audio",
+so every existing ref2va regression (**48GB box, int8, image references only**) slipped past
+it. The unquantized ref2va on the 96GB box had also gone unverified since the merged-version
+migration. The fix was confirmed both by ref2va with an audio reference passing with sage
+still the default (186.3s, Japanese ja 0.976, 100% character match) and by image-only ref2i
+remaining intact (133.9s).
+
+## 2026-08-10: Projected TE (Qwen3-VL-4B + a trained linear map) — implementation, measurements, unverified items
+
+Implemented as `H3_TE_PROJ` (default OFF; existing behavior does not change by a single
+byte). It replaces the TE path from Qwen3-VL-32B with **Qwen3-VL-4B + a trained projection
+matrix** ([ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3)). The
+aim is to keep the TE and the transformer **simultaneously resident** on the 48GB box,
+eliminating the swap fixed cost.
+
+```
+cond = ((h - mean_in) / std_in) @ W * std_out + mean_out     # h = the 4B's hidden_states[24]
+cond[:, 0] = sink_out                                        # token 0 is the attention sink
+```
+
+### Measurements (96GB box, t2i 768², 30 steps, seed 4242, identical prompt)
+
+| | 32B TE (current) | **Projected 4B TE** |
+|---|---|---|
+| PSNR | — | **22.64 dB** |
+| Sharpness (Laplacian variance) | 48 | **37** (-23%) |
+| Generation time | 65.7s | **43.7s** |
+| Peak VRAM | 88.73GB | **76.1GB** |
+| **TE's real GPU occupancy** | 21.02GB (nf4) | **8.88GB** |
+
+**The quality is not "the same picture" but "a different picture of comparable quality".**
+Composition, palette and the reading of the time of day match, but fine-grained
+specification drops (a real example, outside what the prompt asked for: the foreground
+water-lily leaves and grass present in the 32B version were replaced by open water in the
+projected version). No breakdown; practical quality. This matches the nature of the
+projection (the distributor reports test cosine 0.712): read it as **the gist of the prompt
+is preserved, the details are lost**.
+
+**This change is different in kind from every optimization so far.** Quantization,
+residency control, turbo etc. could all be proven "mathematically inert" by identical-seed
+MD5 match, but the projected TE is **an approximation by principle**, so MD5 is unusable.
+The verdict rests on PSNR + visual inspection + measured VRAM.
+
+### Tokenizer investigation (the basis of the implementation policy)
+
+| Target | Result |
+|---|---|
+| Ordinary text, Japanese | **IDs match exactly** (the H3-side tokenizer can be used as-is) |
+| `<d>` / `</d>` | H3 has them as **single tokens** 151669/151670; the 4B lacks them and splits them apart |
+| `<\|cutoff\|>` `<\|lyrics_*\|>` `<\|caption_*\|>` | H3-specific (151671-675) but **unused by both the official guide and this app** |
+| `[Shot n]` `<cutoff>` `<scenetrans>` | **Ordinary text** (not special tokens). Multi-shot structure is unaffected |
+
+→ The only thing affected in real use is **the dialogue tag `<d>`**. The implementation
+**explicitly rejects** prompts containing id >= 151669 with a `ValueError` (never silently
+sends something different). Dialogue can be fed via an audio reference (`fully_copy`), as
+demonstrated the same day (see the section above), so an operational workaround exists.
+
+### The second-GPU requirement drops
+
+Plugging the measured 8.88GB back into the derivation in `docs/RESIDENCY.md` §5.4, the card
+requirement for `H3_TE_DEVICE` drops from **20GB to 16GB (probably 12GB)**.
+
+| 2nd GPU | Effective budget | 32B TE (17.45GB) | Projected 4B TE (8.88GB) |
+|---|---|---|---|
+| 12GB | ~10.5GB | No | **Expected to hold** (needs ~9.2GB, ~1.3GB headroom) |
+| 16GB | ~14.5GB | No | **Expected to hold** (~5.3GB headroom) |
+| 20GB | ~19.7GB | t2va only; ref2va OOMs | Holds (~10.5GB headroom) |
+
+**12GB is not asserted without a real-hardware check.** We previously experienced "fits by
+derivation, OOMs in practice" at 20GB (the units pitfall, §5.1), and 1.3GB of headroom is
+thin.
+
+### Addendum (same day): the NF4 quantization option, and quality confirmation on video
+
+Added **`H3_TE_PROJ_QUANT`** (default `none` / `bnb-4bit` / `bnb-8bit`). It quantizes the
+4B itself — a **4B-only flag**, distinct from the 32B's `H3_TE_QUANT` (see the intent of the
+exclusivity guard).
+
+**Using the bf16 projection matrix as-is is the right call** (measured). The conditioning
+drift from quantization is 0.61-0.96% relative RMS under NF4 (cosine 1.0000). Using the
+distributor's int8_convrot matrix actually increases the drift (1.02-2.97%) — that one is
+calibrated specifically for ComfyUI's quantization scheme.
+
+| Config | TE resident | t2i (30 steps) | t2va 5s (30 steps) | Peak (t2va) |
+|---|---|---|---|---|
+| 32B TE | 21.02GB | 65.7s | 162.1s | 91.9GB |
+| Projected 4B bf16 | 8.88GB | 43.7s | — | — |
+| **Projected 4B NF4** | **3.11GB** | **33.5s** | **143.5s** | **74.3GB** |
+
+**Quality confirmed on video too** (768², 5s, 124 frames, identical seed 555): the
+sharpness drop seen on stills (-23%) does not appear on video (187 vs 191), and **flicker
+(second-order difference) is actually 11% lower** (7.51 → 6.67). Direct bf16 vs NF4
+comparison is PSNR 34.45dB — quantization has essentially zero effect. The PSNR 14.98dB
+against the 32B is not "degradation" but "a different take on the same instruction" (the
+32B version has an approaching passer-by, the projected version has the girl alone — a
+divergence of interpretation).
+
+**Relation to the settings API**: the projected TE is currently **env-only**
+(`H3_TE_PROJ`/`H3_TE_PROJ_QUANT`). Attempting to change te_quant/te_prune via
+`/api/settings/apply` slipped past the runner's import-time guard and had a hole where
+**nothing was applied yet the snapshot reported a change**, so with the projected TE
+enabled these fields are now rejected with 400 (read-only `te_proj`/`te_proj_quant` were
+added to the `/api/settings` snapshot).
+
+### Addendum (same day, part 2): NF4 made the default, switchable from the UI
+
+- **Changed the default of `H3_TE_PROJ_QUANT` to `bnb-4bit`** (based on the measured
+  quality; none/bnb-8bit remain selectable explicitly). Along with the default change, the
+  "quantization specified + projection OFF" guard now only fires **when explicitly set
+  (`in os.environ`)** — so ordinary users on the defaults are not knocked over by mistake
+- **The projected TE can now be toggled from the UI's reload-settings panel**
+  (`te_proj` / `te_proj_quant` on `/api/settings/apply`). While ON, the te_quant/te_prune
+  controls are disabled and the API also rejects them with 400 (the check is based on the
+  "post-apply values": turning it OFF while changing te_quant is legal)
+
+**Round-trip reload E2E (measured, 96GB box)**: OFF→ON 47.9s / ON→OFF 29.4s / re-ON 27.3s.
+At each step the PNG MD5 of an identical-seed generation was compared: **the UI-path ON
+matches the env-path NF4 exactly**, **OFF matches the 32B baseline exactly**, and **re-ON
+matches the first ON exactly** (no state residue; the projection matrix reloads correctly).
+Changing te_quant while ON returns 400.
+
+### Unverified (important)
+
+- **TE + transformer simultaneously resident on the 48GB box** — **the main prize**.
+  8.88 + 34 (int8) = 42.9GB is expected to fit but is unmeasured. Only once this holds does
+  the adoption pay off (on the 96GB box both fit anyway, so no difference shows)
+- **The reference path (ref2va)** — the projection matrix was **calibrated on text only**,
+  and whether vision features map correctly was unknown. The implementation is wired to
+  work, but emits a one-time `logger.warning`
+  → **Visually verified on 2026-08-11: references clearly take effect** (face, hair,
+  clothes, accessories all reflected, on par with the 32B ground truth; see the section
+  "2026-08-11: How far do ref2va/i2va go"). The warning is kept as a record of the
+  calibration fact
+- **Combination with an audio reference + `fully_copy`** (does the feed-dialogue-from-audio
+  workflow still hold with the projected TE)
+- **The 4B's TE load of 80.5s** (including the first download). Steady-state load time is
+  unmeasured
+
+## 2026-08-10: Breaking down the decode-phase peak VRAM — the composition, and the 15% we took from it
+
+To decide whether to port ComfyUI's
+[PR #15446](https://github.com/Comfy-Org/ComfyUI/pull/15446) (chunk-streaming the H3 VAE so
+the decode VRAM becomes duration-independent), **we first broke down what our own
+decode-phase peak of 16.29GB is made of**.
+
+### The breakdown (768×1344, 107 frames, fp32, measured)
+
+| Component | Measured | Share |
+|---|---|---|
+| **The weights of the two VAEs (resident)** | **11.02 GB** | 66% |
+| video decode activations | 3.08 GB | 19% |
+| `postprocess_video` | 0.00 GB | 0% |
+| audio decode | 0.00 GB | 0% |
+| **uint8 conversion + CPU transfer** | **2.49 GB** | 15% |
+| Total | **16.59 GB** | (nearly matches the README's measured 16.29GB) |
+
+**What we learned**: two-thirds of the peak is **weights**, and chunking removes not a
+single byte of that. What PR #15446 targets is the 3.08GB of activations — **porting it
+saves at most 19%**.
+
+That the decode peak scales with duration was confirmed separately (latent 32 → 48 frames
+takes 3.08 → 4.80GB, linear at about 30MB/frame). So the PR's observation itself is
+correct, and it helps more at longer durations.
+
+### The 15% taken first — the uint8 conversion's intermediate tensors
+
+Only the breakdown revealed that **our own code was stacking up 2.49GB**:
+
+```python
+frames_uint8 = (video_tensor.permute(0,2,3,1).float().clamp(0,1) * 255).round().to(torch.uint8).cpu().numpy()
+```
+
+`float()` / `clamp` / `*255` / `round()` each return an **intermediate tensor of the full
+length**, and finally the uint8 copy is made on top. This was consolidated into
+`frames_to_uint8()`, which converts 8 frames at a time and writes directly into the CPU
+output array (the same code had existed in 4 places; now one).
+
+| | Peak |
+|---|---|
+| Current (all at once) | +2.65 GB |
+| **Improved (8 frames at a time)** | **+0.03 GB (-99%)** |
+
+The order of operations is identical to before, so the rounding does not change either.
+**The PNG MD5 of an identical-seed production generation matches exactly**
+(`66a59ff92d653f1284cabe76bdb6501c`) — confirmed.
+
+### Porting PR #15446 is on hold
+
+Against 3.08GB of activations (19%), it would require a monkeypatch replacing the
+upstream `_decode` wholesale, incurring a tracking cost. Having taken the cheaper 15%
+first, the next candidate with better expected value is **fp16-ifying the audio_vae (part
+of the 11GB of weights)** (the current fp32-fixed rationale is the measured "bf16 drops the
+volume by about 20dB", but **fp16 is unverified** — bf16 has a 7-bit mantissa, fp16 has 10
+bits, and small-amplitude audio can behave differently).
+
+## 2026-08-11: Added an RTX 4060 Ti 16GB to the 96GB box — stage 1 toward the low-VRAM goals (TE onto the second GPU)
+
+An **RTX 4060 Ti 16GB (sm_89) was added as cuda:1** to the 96GB box (RTX PRO 6000). The
+final goals are **(A) running on a single 16GB card, and (B) running on a two-card 8GB×2
+setup**. As stage 1, "the projected TE (4B NF4) resident on the 4060 Ti" was measured.
+
+Launch: `H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_TE_DEVICE=cuda:1` (no lowvram;
+transformer in bf16, resident on GPU0).
+
+| Measurement | Value | Note |
+|---|---|---|
+| GPU1 resident | **3213 MiB (3.37GB)** | Matches the derived 3.11GB+ε. Does not grow after generation |
+| t2i 768² steady state | 43.94s (denoise 13.48s, decode 0.88s) | ~10s more than the previous day's single-GPU 33.5s (see below) |
+| t2va 5s 768² | 134.58s (denoise 102.57s), peak 71.19GB | |
+| PSNR vs the 32B baseline | **22.36 dB** (sharpness 37 vs baseline 48) | Same level as the old matrix's 22.49dB |
+| PSNR vs the old-matrix NF4 (single-GPU) | **39.29 dB** | Essentially the same picture despite recalibration + a different GPU |
+| t2i PNG MD5 | `3cd088df882e37547219b9816a217b91` | New matrix + sm_89, so it differs from the old anchor (as expected) |
+
+### Two bugs found and fixed (surfaced by a Sonnet agent's verification)
+
+1. **A rope device-mismatch crash in the combination of plain mode (no lowvram) +
+   `H3_TE_DEVICE`**. Detaching the TE makes `_execution_device` fall to the CPU-resident
+   audio_vae — a known pitfall — but this combination had never run before, and the
+   layout-through-timesteps span of the two non-lowvram branches (catch-all /
+   bnb-4bit+fl2va) sat outside `_pin_execution_device_to_compute()`. Fixed by wrapping
+   them in the pin only when `self._te_external` (the usual TE-cohabiting path is
+   byte-for-byte unchanged).
+2. **The projection matrix's default filename 404'd**. The distributor had moved
+   `h3_qwen3vl_4b_tap24.safetensors` to obsolete/ and replaced it with the **recalibrated**
+   `mmh3-4b-ClipProj.safetensors` (training 1,666 → 5,664 prompts, cos_test 0.711 → 0.717,
+   W's cosine 0.9596 vs the old — effectively a different function). The default was
+   updated to the new filename. The old matrix survives in the local HF cache (snapshot
+   3f762f19); passing an absolute path via `H3_TE_PROJ` reproduces it.
+
+### Observation: steady-state t2i is +10s vs single-GPU
+
+Denoise + decode stay at 14.4s; **the per-request fixed cost is about 29s** (vs about 19s
+single-GPU). The main suspects for the difference are the encode running on the sm_89
+4060 Ti (NF4 dequant is slower) + the PCIe transfer of the cond. Meanwhile t2va did not get
+worse at 134.6s — the longer the duration, the thinner the fixed cost spreads. On the 96GB
+box the TE fits on GPU0 anyway, so **there is no practical benefit to using the second GPU
+on this box** (the real targets are the 16GB-single and 8GB×2 configurations).
+
+### Next stages (unmeasured)
+
+- **Stage 2 = goal A**: cap GPU0 to a 16GB equivalent with ballast, `H3_LOWVRAM=group` +
+  projected TE **cohabiting** (no TE_DEVICE). Derived 3.11+1.4+6.6 = 11.1GB should fit, but
+  **the te_proj × group combination has never run**
+- **Stage 3 = goal B**: 8GB×2. The TE's 3.41GB fits on GPU1, but GPU0's blocks +
+  activations of 8.0GB exceed the effective budget of 7.1GB by 0.9GB — trimming the
+  activations via resolution/duration needs consideration
+
+## 2026-08-11: Stage 2 = goal A achieved — t2i / t2va complete on a real RTX 4060 Ti 16GB **alone**
+
+Verified not with ballast simulation but on the real added card alone, via
+`CUDA_VISIBLE_DEVICES=1`. Launch: `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3
+H3_VIDEO_VAE_FP16=1 H3_ATTN_BACKEND=default` (sage is an sm_120-only build, so back to SDPA.
+No TE_DEVICE = projected TE cohabiting. **te_proj × group ran here for the first time** —
+it worked as-is with no fix).
+
+| Measurement | Value | Verdict |
+|---|---|---|
+| Resident right after startup | 251 MiB (transformer on CPU, group offload) | |
+| Peak during t2i | 7.4GB (nvidia-smi 7615MiB) | |
+| Peak during t2va 5s denoise | **11.4GB (nvidia-smi 11681MiB)** | **~4.7GB left** on a 16GiB card |
+| During t2va decode | ~7.0GB (fp16 decode) | |
+| t2i steady state | 498.5s (denoise 479s, **16.5s/step**) | |
+| t2va 5s | 1499s ≈ 25 min (denoise 1445s, 49.8s/step) | |
+
+**The derived 11.1GB of VRAM landed almost exactly on the measured 11.4GB, and goal A
+(single 16GB) holds with plenty of headroom.** Not a single OOM or error.
+
+### The time is heavy mainly because "this box's second slot is PCIe x4"
+
+group offload streams ~34GB of int8 weights CPU→GPU every step, but the slot holding the
+4060 Ti is **Gen3 x4 (effective ~3.5GB/s)**. The transfer alone comes to ~10s/step, which
+is consistent with the measured 16.5s/step. **On a proper Gen4 x16 slot the transfer is
+~1/8**, so this time is a value of "this box's slot", not "the 16GB card's performance".
+The t2va's 49.8s/step is that plus the SDPA compute for 124 frames (sm_89) on top.
+
+One more thing: **the FBC cache is not saving a single step** (`cache_skipped_steps: 0`,
+threshold 0.05). In contrast to the PRO 6000 + sage + bf16 trajectory, where most steps
+were saved. On the int8+SDPA trajectory the residual apparently never drops below the
+threshold. Threshold tuning leaves up to a 2x speedup on the table (unverified; a quality
+trade-off).
+
+### Quality: not "degradation" but a trajectory divergence — and prompt fidelity actually improved
+
+PSNR is 7.40dB vs the 32B baseline / 7.43dB vs the previous stage — numerically
+catastrophic, but **visually it is a different story**:
+
+- The 32B baseline and previous stage (bf16+sage) outputs: at seed 4242 they had converged
+  on an **anime-style sunset lake** (letterboxed). The prompt's "photorealistic" and
+  "snow-capped peaks" were not reflected
+- This run (int8+group+SDPA): **a photorealistic snowy mountain and a misty morning lake**
+  — faithful to the prompt and high quality
+
+So the int8+SDPA combination moved the generation trajectory to a different attractor, and
+prompt adherence actually came out better. Cross-config PSNR/MD5 comparisons never were
+valid (beyond the known int8 trajectory divergence of ~19dB), so **judge cross-config
+quality by eye**.
+
+## 2026-08-11: Stage 3 = goal B achieved — **t2va 5s 768² completes at full resolution on 8GB×2**
+
+Both GPUs were capped to headless-8GiB-card equivalents with
+`scripts/vram_ballast.py --target-free-gb 7.9` (GiB) to simulate. Compute side = 4060 Ti,
+TE side = PRO 6000 (`CUDA_VISIBLE_DEVICES=1,0` maps them to the app's cuda:0/cuda:1).
+Launch is the same env as goal A + `H3_TE_DEVICE=cuda:1` (**te_proj × group × TE_DEVICE
+also ran here for the first time** — worked without modification).
+
+| Measurement (8GiB×2) | Value |
+|---|---|
+| t2i 768² | Success. Peak 6.4GB, total 512s |
+| t2va 5s 768² denoise | **29/29 completed** (51.3s/step — the prior prediction of "0.9GB over" was wrong; it fit) |
+| t2va 5s 768² overall | **Success**. Total 1534s, decode 35.2s, API peak **7.23GB**, measured workload ~8069MiB |
+
+**No reduction of resolution or duration was needed** (the 640²/3s/512² search ladder went
+unused).
+
+### But one thing was fixed: an 838MiB all-at-once fp32 conversion at the decode tail OOM'd → denormalization moved to CPU
+
+The first attempt OOM'd on **the final line of the decode tail** after the denoise had
+completed. The last line of the upstream `decoders.py`'s
+`MiniMaxH3VideoDecodeStep.__call__`,
+`(video.float() * pixel_std + pixel_mean).clamp(0,1)`, converts the full-length fp16
+decode result to fp32 on the GPU all at once — at 768², 124 frames that is
+124×768×768×3×4B = **838MiB** of temporary allocation (matching the OOM message's "Tried
+to allocate 838.00 MiB" exactly). Same family of problem as the all-at-once conversion
+crushed by `frames_to_uint8`.
+
+The remedy follows the no-venv-modification rule: a runner-side subclass
+(`_cpu_norm_video_decode_step()`, duplicating f37ab93's `__call__` with exactly one
+change): **move to CPU while still fp16, then denormalize**. Elementwise fp32
+mul/add/clamp round identically under IEEE754 on CPU and GPU (no reductions, no FMA
+fusion), so the output is bit-identical — **confirmed by measurement: the identical-seed
+PNG MD5 matches exactly (`1a2a136b61234b4917465604ac35cca2`) before and after applying**.
+The only added cost is one PCIe transfer of the full-length fp16 ~420MiB. Applied
+unconditionally to every path (t2va/t2i/ref2va/batch), lowering the decode-phase peak by a
+few full-length fp32 buffers on every configuration (the decode-phase numbers in
+docs/RESIDENCY.md will be re-measured at the next update).
+
+### Summary: both final goals achieved
+
+- **Goal A (single 16GB)**: full functionality on a real RTX 4060 Ti 16GB, peak 11.4GB
+  (~4.7GB headroom)
+- **Goal B (8GB×2)**: compute 8GiB + TE 8GiB completes t2i / t2va 5s 768² (peak 7.23GB)
+
+The remaining caveats are speed only (this box's second slot is Gen3 x4, hence
+16.5-51s/step; on Gen4 x16 the transfer is ~1/8) and the FBC not engaging on the int8+SDPA
+trajectory (threshold tuning unverified).
+
+## 2026-08-11: How far do ref2va/i2va go — two latent bugs found and fixed, and the low-VRAM boundary settled
+
+The reference family (ref2i / i2va = image-reference ref2va / audio reference / 768×1344)
+was verified on the goal A/B configurations. The first pass was a **total wipeout**, but
+the cause was not VRAM — it was **two latent bugs that only fire in combinations never
+exercised together until today**. After the fixes, the boundary is decided plainly by VRAM
+amount.
+
+### Bug 1: `H3_VIDEO_VAE_FP16=1` × any reference always crashes, regardless of VRAM (dtype mismatch)
+
+`H3_VIDEO_VAE_FP16=1` permanently casts the VAE weights to fp16. **Decode** is consistent
+because the upstream step raises its own fp16 autocast, but the **encode** side
+(`encode_vae_condition` in encoders.py — used by ref2va's references and fl2va's keyframe
+conditioning) has no autocast and passes pixels it explicitly promoted to fp32 into
+`vae.encode()` → instant death with
+`Input type (float) and bias type (c10::Half) should be the same`. It crashes even at
+96GB. It stayed latent because every ref2va regression so far had used the fp32-VAE
+configuration.
+**Fix**: in `_load_vae`, immediately after the fp16 cast, wrap `vae.encode` in an fp16
+autocast symmetric with the decode side. Precision is within design
+(`encode_vae_condition` already rounds its result down to fp16 itself before returning).
+
+### Bug 2: in group mode, the t2va→ref2va mode switch was permanently impossible (residual pinned RAM)
+
+group offload (use_stream=True) places the ~34GB of int8 weights in **pinned memory**. The
+del+gc in `_free_transformer` leaves the pages **held by torch's host-side caching
+allocator without returning them to the OS** (`torch.cuda.empty_cache()` is device-side
+only), so MemAvailable stays ~34GB short and the subsequent transformer_ref load is
+rejected by the RAM guard (which asks for 40GB).
+Measured: after freeing, avail was still 38.6GB (RssShmem 45.6GB residual).
+**Fix**: in `_free_transformer` / `_free_transformer_ref`, only in group mode, add
+`torch._C._host_emptyCache()` (a private API, so guarded with getattr). After the fix,
+avail recovers fully to **85.8GB** immediately after freeing, and the t2va→ref2va switch
+succeeded in group mode for the first time.
+
+### The boundary after the fixes (measured)
+
+| Test | 8GiB×2 | 16GB single (TE cohabiting) |
+|---|---|---|
+| ref2i (reference still 768²) | **○** peak 6.69GB, 1059s | (not run — established at 8GB) |
+| i2va (768² 5s) | × denoise OOM | **○** peak 9.41GB, ~39 min |
+| Audio reference (looped 6.9s → 7.29s generated) | × denoise OOM | **○** peak 11.96GB, ~54 min |
+| 768×1344 5s | × denoise OOM | **○** peak 13.37GB (nvidia measured 15.2GB), ~66 min |
+
+- **8GiB×2 goes as far as ref2i**. Video with a reference has a longer sequence than t2va
+  (7.23GB) by the reference tokens, and even the shortest 768²/5s cannot fit the denoise
+  activations (the required amount is a measured 9.41GB).
+- **16GB single runs the entire reference family too**. 768×1344/5s (real peak 15.2GB) is
+  the practical ceiling.
+- A note on audio references: supplying audio shorter than 5 seconds returns 400 from the
+  minimum-duration check (per spec).
+
+### Quality (the first visual verification of the projected TE's vision path): references clearly take effect
+
+Since "the projection matrix was calibrated on text only", vision quality was unknown — but
+visually no degradation could be detected: the reference person's face, bangs, hair length,
+cardigan color, white ribbon and necklace are all consistently reflected, and the i2va
+compositions (profile shots) are nearly identical to the 32B ground truth
+`test1_walk_park.mp4`. With an audio reference the lip movement is clear too. The only
+blemish is a light compositional drift late in the 768×1344 run (not a breakdown).
+Outputs: `outputs/ref2i_1786447720.png` / `ref2va_1786449645.mp4` /
+`ref2va_1786452054.mp4` / `ref2va_1786455323.mp4`.
+
 ## Waiting on external events going forward (backlog, as of 2026-08-06)
 
 ### 1. diffusers PR #14355 — **merged (2026-08-05), migration also complete (2026-08-09)**
@@ -2050,8 +2595,29 @@ ref2va remains unverified.
   holds up on a reference-conditioned trajectory is a separate question (the strength
   0.094 validity is also a t2va-only measurement). If speeding up reference-conditioned
   generation becomes desirable, spike this first
-- **16GB-tier support**: would need streaming execution of TE (flowing it to the GPU block
+- **A 4B-only quantization option for the projected TE (`H3_TE_PROJ`)** → **implemented
+  (same day, 2026-08-10)**: added as `H3_TE_PROJ_QUANT` and, after measurement (NF4 3.11GB,
+  quality on par), **the default was switched to bnb-4bit** (see "Addendum (same day, part 2)"
+  in the dated 2026-08-10 section). What follows is the pre-implementation analysis: the
+  initial projected TE loads Qwen3-VL-4B **in bf16, with a real GPU occupancy of 8.88GB** (measured
+  2026-08-10; matches the 8.88GB checkpoint). The projection matrix's distributor writes
+  "15.7GB → 5.2GB", but **5.2GB does not hold in bf16** (it presumably refers to a
+  quantized variant). Quantizing the 4B to int8/nf4 would put it in the 4-5GB class,
+  lowering the second-GPU requirement further.
+  **Caution**: the current implementation makes `H3_TE_PROJ` and
+  `H3_TE_QUANT`/`H3_TE_PRUNE`/`H3_TE_PREQUANT` **mutually exclusive** via an import-time
+  guard. That is a measure to "keep 32B-TE settings from leaking onto the 4B", not a ban on
+  quantizing the 4B. If implementing, add it as a **separate 4B-only flag** (e.g.
+  `H3_TE_PROJ_QUANT`) without breaking the existing guard's intent. Note also that the
+  projection matrix must be applied in fp32 (W is 2560×5120 fp32)
+- **16GB-tier support** → **achieved (2026-08-11)**: with the projected TE in NF4 (3.11GB)
+  co-resident alongside `H3_LOWVRAM=group`, **full functionality was measured on a real
+  RTX 4060 Ti 16GB alone** (no TE streaming needed after all). 8GiB×2 also holds up through
+  t2va. See the dated 2026-08-11 sections. What follows is the pre-achievement analysis:
+  would need streaming execution of TE (flowing it to the GPU block
   by block). The current floor is the pruned TE-nf4's resident 17.45GB (see the section
+  above). **With the projected TE this floor drops to 8.88GB**, so the 16GB tier may be
+  reachable by a different route (see the recalculation of the second-GPU requirement
   above)
 - **torch.compile**: unverified. Compatibility with FBC/group-offload hooks (graph breaks)
   needs checking

@@ -134,6 +134,23 @@ Of text_encoder (Qwen3-VL-32B, 64 layers), only `hidden_states[50]` is actually 
 
 For int8 quantization, NF4 quantization, and layer removal alike, it has been confirmed that the output mp4/PNG is byte-identical (MD5-identical) with and without the removal/quantization, and these are treated as mathematically inconsequential optimizations.
 
+### Projected Text Encoder (the linchpin of low-VRAM support)
+
+`H3_TE_PROJ` (default OFF) is a route that replaces the 32B text_encoder with **Qwen3-VL-4B + a trained linear map**. The 4B's `hidden_states[tap=24]` (2560 dims) is projected into the 32B TE's embedding space (5120 dims) by a trained projection matrix W (2560→5120, [ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3)). It is a linear map with statistical normalization around it, and token 0 is fixed to the attention sink (`sink_out`).
+
+```
+cond = ((h - mean_in) / std_in) @ W * std_out + mean_out     # h = the 4B's hidden_states[24]
+cond[:, 0] = sink_out                                        # token 0 is the attention sink
+```
+
+- **At NF4 quantization (`H3_TE_PROJ_QUANT=bnb-4bit`, default), it is 3.11GB resident.** That is under 1/5 of the pruned 32B nf4's 17.45GB, and it is the main reason the low-VRAM floor drops sharply (the projection matrix is the bf16 one applied as-is in fp32; using the distributor's int8 matrix actually increases the deviation).
+- **The quality is not "the same image" but "a different image of equivalent quality".** PSNR against the 32B is 22.4dB for stills and 14.98dB for video, but this is not degradation — it is "a different take of the same instruction" (composition, color, and time-of-day interpretation match; fine-grained specifications are lost). Since the projection is fundamentally an approximation, unlike quantization or layer removal it cannot be judged by MD5, and is judged by PSNR + visual + measured VRAM. In video the sharpness drop seen in stills did not appear, and flicker (second difference) was actually 11% lower. The direct bf16-vs-NF4 PSNR is 34.45dB, so the quantization impact is nearly zero.
+- **The vision/reference path was verified visually too** (2026-08-11). Since the projection matrix was calibrated on text only, vision quality was unknown, but a reference person's face, bangs, hair length, clothing color, and accessories were all reflected consistently, on par with the 32B reference. The implementation emits a one-time `logger.warning` as a record of the calibration fact.
+- **Constraint: the H3-specific dialogue tags `<d>`/`</d>` (id≥151669) are outside the 4B's vocabulary.** Prompts containing them are explicitly rejected with a `ValueError` rather than silently sending something different. Dialogue can be supplied via an audio reference (`fully_copy`) instead.
+- **Relation to the settings API**: the projected TE is not env-only; it can also be toggled from the UI's reload-settings panel (`te_proj`/`te_proj_quant` in `/api/settings/apply`). When ON, the 32B-TE-oriented `te_quant`/`te_prune` are rejected with a 400 on the API side (judged on the post-apply values). A round-trip reload E2E confirmed that the UI-path ON is a PNG MD5 exact match with the env-path NF4, and OFF is an exact match with the 32B baseline.
+
+`H3_TE_PROJ` is different in kind from all other optimizations (quantization, residency control, turbo, etc., all of which can be proven inconsequential by MD5 match): it is fundamentally an approximation. It is the core component of the low-VRAM design story (3.11GB NF4 resident + co-residence with `H3_LOWVRAM=group` + fp16 decode) that makes a single 16GB card viable (see §5).
+
 ### Attention
 
 | Method | Environment variable | Effect |
@@ -173,6 +190,21 @@ Output equivalence has been confirmed at every stage via same-seed MD5/PNG exact
 ### fp16-ification of the video VAE
 
 `H3_VIDEO_VAE_FP16=1` converts only the video VAE weights to fp16 (9.70GB → 4.85GB, decode peak 16.29GB → about 11.4GB). The audio VAE stays in fp32 and is never cast (because converting it to bf16 has a known issue of reducing the generated audio's volume by about 20dB). Quality is a mean PSNR of **39.97dB** (min 39.08) across all 124 frames, visually indistinguishable.
+
+### Reaching the Low-VRAM Goals, and the Three Fixes That Took (2026-08-11 to 12)
+
+Combining the projected TE (NF4, 3.11GB) + `H3_LOWVRAM=group` + fp16 decode, **both final goals were achieved**:
+
+- **Goal A (single 16GB)**: a real RTX 4060 Ti 16GB **alone** runs t2i/t2va/ref2i/i2va/audio-reference/768×1344 all to completion (peak 7.4–15.2GB, practical ceiling 768×1344/5s).
+- **Goal B (8GiB×2)**: compute-side 8GiB + TE-side 8GiB up to t2i/t2va 5s 768²/ref2i (peak 6.4–7.23GB). The video reference family doesn't fit due to the reference-token VRAM addition (§5).
+
+Along the way, three issues latent in combinations that are only ever exercised at the low-VRAM goal were fixed. All are applied permanently as part of the design:
+
+1. **De-normalization moved to the CPU in decode**: the tail of upstream `MiniMaxH3VideoDecodeStep` converted the whole-length fp16 decode result to fp32 in one shot on the GPU (an 838MiB temporary at 768², 124 frames). The runner-side subclass `_cpu_norm_video_decode_step()` **moves to CPU while still fp16, then de-normalizes**. Element-wise fp32 ops have no reduction and round identically on CPU and GPU, so the output is bit-identical, proven by a same-seed PNG MD5 exact match. Applied unconditionally to all paths, it takes a few whole-length fp32 tensors off the decode-phase peak in every configuration (the direct condition that let t2va fit on 8GiB×2).
+2. **fp16 autocast on `vae.encode`**: `H3_VIDEO_VAE_FP16=1` casts the VAE weights to fp16, but upstream was asymmetric — **decode has its own autocast, but the encode side (reference and keyframe conditioning) does not**. As a result, fp16 VAE × references dies instantly on a dtype mismatch regardless of VRAM amount. This was resolved by wrapping `vae.encode` in `_load_vae` with an fp16 autocast symmetric with the decode side.
+3. **Returning the pinned host cache when freeing group**: group offload places ~34GB of int8 weights in pinned host memory. del+gc leaves them in torch's host-side caching allocator, never returned to the OS (`empty_cache()` is device-side only), so the t2va↔ref2va mode switch was permanently rejected by the RAM guard. Calling `torch._C._host_emptyCache()` (a private API, getattr-guarded) at free time, only in group mode, made the switch work for the first time.
+
+For the detailed narrative of the pitfalls, see addenda B1–B10 in the internal report.
 
 ### KV Prefix Sharing for Reference Batches
 
@@ -232,10 +264,10 @@ If something needs to stay resident across requests, add its size to each phase 
 
 ### Recommended Configuration Table by Capacity
 
-Revised 2026-08-10 with the projected TE at NF4 (3.11GB resident) and the reduced decode
-phase (7.53GB with fp16 + the uint8 fix). Everything not marked "measured" is a
-derivation. For the projected TE's caveats (no `<d>` tags, approximate detail, unverified
-ref2va vision path) see §4.
+Revised 2026-08-10 / measurements folded in 2026-08-11, with the projected TE at NF4 (3.11GB
+resident) and the reduced decode phase (7.53GB with fp16 + the uint8 fix). Everything not
+marked "measured" is a derivation. For the projected TE's caveats (no `<d>` tags, approximate
+detail; the ref2va vision path was verified visually on 2026-08-11) see §4.
 
 | Capacity (effective) | 32B TE route | Projected TE (NF4) route |
 |---|---|---|
@@ -243,11 +275,15 @@ ref2va vision path) see §4.
 | 48GB (~49.8) | `H3_LOWVRAM=1`, swap per request (measured). With a 20GB 2nd GPU: 9.7s/44.2s (measured) | everything resident at once, expected 44.7GB (margin ~5.1GB, **unmeasured**, needs a guard change) |
 | 32GB (~30.5) | `group` (nf4 21 + blocks 1.4 + activations 6.6 = 29, barely) | `group` with room to spare (~11.1GB) |
 | 24GB (~22.4) | `group`+`H3_TE_PRUNE=1` required (measured) | `group` with room to spare (~11.1GB) |
-| 16GB (~15.2) | not possible (the 17.45GB TE doesn't fit) | **`group` expected to work at 11.1GB** (**unmeasured**). Opens the previously-impossible 16GB tier |
+| 16GB (~15.2) | not possible (the 17.45GB TE doesn't fit) | **Measured (2026-08-11)**: a real RTX 4060 Ti 16GB **alone** runs t2i/t2va/ref2i/i2va/audio-reference/768×1344, all to completion (peak 7.4–15.2GB). Opens the previously-impossible 16GB tier |
 
 Second-GPU requirements are in the next section. The lower the main GPU's VRAM, the more
 the projected TE buys: with the TE parked off-card, the main GPU only needs `group`'s
-blocks + activations, ~8GB.
+blocks + activations, ~8GB. **8GiB×2** (compute-side 8GiB + TE-side 8GiB) was also measured
+on 2026-08-11, working up to t2i/t2va 5s 768²/ref2i (peak 6.4–7.23GB). The video reference
+family (i2va/audio-reference) exceeds the 8GiB budget from the reference-token VRAM addition
+(t2va 7.23GB → i2va 9.41GB), so it runs only on the single 16GB card. For the honest speed
+and quality characteristics, see §6.
 
 ### Requirements for Placing TE on a Second GPU
 
@@ -258,7 +294,7 @@ Specifying a GPU via `H3_TE_DEVICE` keeps TE resident on that GPU continuously; 
 | 32B pruned nf4 / t2va-family | 17.76GB (measured) | 20GB+ (about 1.9GB headroom) |
 | 32B pruned nf4 / ref2va | 20.67GB+ (measured: TE 17.45 + reference encoding ≥3.22) | 24GB+ (a 20GB card OOMs by 204MB) |
 | Projected 4B bf16 | 8.88GB (measured) + ε | 12GB (thin) / 16GB+ |
-| Projected 4B NF4 | 3.11GB (measured) + ε | **expected to fit a 6–8GB-class card** (derived, unmeasured) |
+| Projected 4B NF4 | 3.11GB (measured) + ε | **measured at 8GiB-class (2026-08-11)** (resident on the TE side of an 8GiB×2 setup, running t2i/t2va/ref2i). 6GB-class is derived |
 
 It follows that ref2va requires an effective 20.7GB or more, i.e. a GPU with a catalog capacity of 22.2GB or more (a 24GB card would have an effective ~22.4GB, giving about 1.7GB headroom, but this is not guaranteed since 2 or more references increase the requirement further).
 
@@ -333,6 +369,16 @@ Lineage of fixed-cost reduction on the 48GB machine (t2i turbo 4steps): 157s (ri
 
 Denoise and decode do not overlap in time (the transformer is always freed immediately before decode, except with `H3_KEEP_TRANSFORMER=1`). The peak normally occurs during denoise.
 
+### Honest Speed and Quality Characteristics of Low-VRAM Configurations
+
+Single 16GB and 8GiB×2 **are viable** (all features run to completion), but speed and quality have configuration-specific quirks. The sources of the numbers are stated to avoid misreading.
+
+- **group is bottlenecked on per-step weight transfer.** Because the 2nd slot on the verification box is **Gen3 x4 (effective ~3.5GB/s)**, single-16GB is heavy at t2i 16.5s/step and t2va 49.8s/step. This is a value of "this slot", not "the 16GB card's performance", and **a proper Gen4 x16 slot would transfer ~1/8** (checkable via nvidia-smi's `pcie.link.gen/width`). Don't confuse it with the card's compute performance.
+- **On the int8+SDPA trajectory, FirstBlockCache doesn't work** (`cache_skipped_steps: 0`, threshold 0.05). In contrast to the PRO 6000 + sage + bf16 trajectory where most steps were skipped, on int8+SDPA the residual never drops below the threshold. "Doesn't work" ≠ "broken"; it's trajectory-dependent, with up to a 2x headroom from threshold tuning (unverified).
+- **The composition changes across configurations even at the same seed.** int8+SDPA moves generation to a different attractor; PSNR is numerically catastrophic (7.40dB vs the 32B baseline), but there is a case where prompt fidelity actually improved visually (the prior bf16+sage stage converged to an anime-style dusk scene, whereas this became a photorealistic snowy mountain and a lake in morning mist). **Cross-configuration PSNR/MD5 comparison is simply invalid to begin with** (extending §7's treatment of PSNR to across-configuration). Judge cross-configuration quality visually.
+
+Note that single-16GB verification must run with `H3_ATTN_BACKEND=default` (SDPA) because sage is an sm_120-only build (the added card is sm_89).
+
 ---
 
 ## 7. Ensuring Quality and Equivalence
@@ -364,6 +410,8 @@ All claims about quality or performance — VRAM, time required, PSNR, MD5, ASR 
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder quantization method (`none` is bf16 at 66.7GB) |
 | `H3_TE_PRUNE` | `0` | Removes unused upper layers of TE (output unchanged, -3.6GB with nf4) |
 | `H3_TE_DEVICE` | (empty) | Keeps TE resident on the specified GPU, never freed (e.g. `cuda:1`) |
+| `H3_TE_PROJ` | (empty) | Replaces the 32B TE with the projected 4B TE (Qwen3-VL-4B + trained linear map). HF repo ID or local path. Core of low-VRAM support (§4) |
+| `H3_TE_PROJ_QUANT` | `bnb-4bit` | Quantization of the projected 4B (`none`/`bnb-4bit`/`bnb-8bit`). 3.11GB resident at NF4. Distinct from the 32B's `H3_TE_QUANT` |
 | `H3_TE_PREQUANT` | `1` | On-disk cache of the quantized TE weights (reduces load time) |
 | `H3_TE_PREQUANT_DIR` | `models/prequant` | Cache save location |
 | `H3_TE_PREQUANT_MIN_FREE_GB` | `25` | Skips saving if free disk space falls below this (generation continues) |

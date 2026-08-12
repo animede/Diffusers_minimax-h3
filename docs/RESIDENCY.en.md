@@ -94,6 +94,17 @@ The transformer **stays resident in host RAM** and shuttles to the GPU block by 
 
 **Note**: this is the only mode where it's the TE, not the transformer, that gets freed for decode. Since a group-offloaded transformer's GPU footprint is already small, it's the TE that has to give way instead.
 
+> **group freeing requires _host_emptyCache (added 2026-08-12)**: group offload places ~34GB
+> of int8 weights in **pinned host memory**. `_free_transformer` / `_free_transformer_ref`'s
+> del+gc leaves the pages held in torch's host-side caching allocator, never returned to the
+> OS (`torch.cuda.empty_cache()` is device-side only). **The host-side pinned cache is a
+> separate ledger from device freeing**, and without returning it, the t2va→ref2va mode
+> switch is rejected by the RAM guard (after freeing, avail 38.6GB / RssShmem 45.6GB still
+> held → the subsequent transformer_ref load fails against its 40GB requirement). The fix adds
+> `torch._C._host_emptyCache()` (a private API, so getattr-guarded), only in group mode, and
+> avail recovers fully to **85.8GB** right after freeing. Details in addendum B8 of
+> [docs/internal/TECHNICAL_REPORT.en.md](internal/TECHNICAL_REPORT.en.md).
+
 ---
 
 ## 3. Additional guarantees when `H3_TE_DEVICE` is set
@@ -138,6 +149,18 @@ The transformer **stays resident in host RAM** and shuttles to the GPU block by 
 | ref2va's extra reference-encoding cost | **+3.2GB or more** on top of the TE (vision tower with 2048px short side. measured lower bound) |
 | **CUDA context etc. (non-PyTorch)** | **~1GB** (easy to forget. see the pitfall below) |
 
+> **Decode-phase de-normalization moved to the CPU (2026-08-12)**: the tail of upstream
+> `MiniMaxH3VideoDecodeStep`, `(video.float() * pixel_std + pixel_mean).clamp(0,1)`, converted
+> the whole-length fp16 decode result to fp32 in one shot on the GPU (an **838MiB** temporary
+> at 768², 124 frames). The runner-side subclass `_cpu_norm_video_decode_step()` changes it to
+> **move to CPU while still fp16, then de-normalize**, and this whole-length fp32 temporary
+> disappears from the GPU (element-wise ops are bit-identical CPU vs GPU, proven by a same-seed
+> PNG MD5 match). Applied unconditionally to all paths (t2va/t2i/ref2va/batch). The decode-peak
+> 16.29GB / fp16 11.4GB above are the **pre-fix values**; after the fix a few whole-length fp32
+> tensors come off the top (re-measurement pending). This was the direct condition that let
+> t2va fit on 8GiB×2. Details in addendum B6 of
+> [docs/internal/TECHNICAL_REPORT.en.md](internal/TECHNICAL_REPORT.en.md).
+
 > **The unit pitfall (an actual mistake made while building this table)**: `nvidia-smi` reports
 > **MiB**, PyTorch's OOM messages report **GiB**, and this app's own logs (`gpu_mem_gb()`) report
 > **GB (decimal)**. A 20GB card is 20475 MiB on `nvidia-smi` = **21.47 GB (decimal)**, but the
@@ -167,8 +190,8 @@ Decode  : decode peak (16.29 / 11.4 with fp16)        ≤ effective budget
 
 **Three premises changed** (all measured the same day): (1) the projected TE at NF4 is
 **3.11GB** resident (replacing the pruned 32B nf4's 17.45GB; caveats: no `<d>` dialogue
-tags — use an audio reference instead — approximate detail, and the ref2va vision path is
-unverified), (2) the decode phase is **7.53GB** (video VAE fp16 + the uint8 fix; 14.2GB
+tags — use an audio reference instead — approximate detail; the ref2va vision path was
+verified visually on 2026-08-11), (2) the decode phase is **7.53GB** (video VAE fp16 + the uint8 fix; 14.2GB
 even at fp32), (3) denoise stays 34.03+6.6=**40.6GB**. The tables below are re-derived
 from those. **Everything not marked "measured" is a derivation.**
 
@@ -180,7 +203,16 @@ from those. **Everything not marked "measured" is a derivation.**
 | 48GB (~49.8) | `H3_LOWVRAM=1`, swap every request (measured) | **everything resident at once, expected**: 3.11+34.03+7.53=**44.7GB** (margin ~5.1GB) → fixed cost gone. **Unmeasured**, needs a guard change (below) |
 | 32GB (~30.5) | `group` (nf4 21 + blocks 1.4 + activations 6.6 = 29, barely) | `group` with room to spare (~11.1GB incl. TE) |
 | 24GB (~22.4) | `group`+`H3_TE_PRUNE=1` required (measured, the old floor) | `group` with room to spare (~11.1GB) |
-| **16GB (~15.2)** | **not possible** (the 17.45GB TE doesn't fit) | **`group` expected to work**: TE 3.11 + blocks 1.4 + activations 6.6 = **11.1GB**, decode 7.53GB. Opens up the previously-impossible 16GB tier. **Unmeasured** |
+| **16GB (~15.2)** | **not possible** (the 17.45GB TE doesn't fit) | **Measured (2026-08-11)**: a real RTX 4060 Ti 16GB **alone** runs t2i/t2va/ref2i/i2va/audio-reference/768×1344, all to completion. Peak 7.4–15.2GB (t2va denoise 11.4GB, i2va 9.41GB, audio-reference 11.96GB, 768×1344 measured 15.2GB by nvidia). Opens up the previously-impossible 16GB tier |
+
+> **Single-16GB launch (measured 2026-08-11)**: `H3_LOWVRAM=group H3_TE_PROJ=... H3_VIDEO_VAE_FP16=1
+> H3_ATTN_BACKEND=default` (sage is an sm_120-only build, so fall back to SDPA. no TE_DEVICE =
+> projected TE co-resident). The derived 11.1GB matched the measured t2va denoise 11.4GB
+> closely. The reference family (i2va/audio-reference/768×1344) all runs on the same card too,
+> with 768×1344/5s (measured peak 15.2GB) the practical ceiling. **Speed is 16.5–51s/step
+> because this box's 2nd slot is Gen3 x4** (a value of the slot, not the card; a Gen4 x16 slot
+> would transfer ~1/8). **FBC skips 0 steps on the int8+SDPA trajectory** (threshold tuning
+> unverified).
 
 > **48GB single-GPU caveat**: `H3_KEEP_TRANSFORMER`'s import-time guard currently requires
 > `H3_TE_DEVICE` (it was designed around the 32B TE). Housing the projected TE **on the
@@ -194,11 +226,18 @@ from those. **Everything not marked "measured" is a derivation.**
 | 48GB | 20GB (32B pruned, 17.76 measured) | t2va/t2i at **9.7s / 44.2s (measured)**. ref2va needs a 24GB 2nd card |
 | 48GB | **8GB-class** (projected NF4, 3.11) | the same residency on a much cheaper card (derived) |
 | 32GB | 20GB (32B) / 8GB-class (projected NF4) | still `group`, just with more headroom. **Non-group stays impossible even with a 2nd card** (denoise 40.6 > 30.5 is the main GPU's problem) |
+| **8GiB×2** | **8GiB (projected NF4 3.11+ε)** | **Measured (2026-08-11, ballast-simulated)**: compute-side 8GiB + TE-side 8GiB runs t2i/t2va 5s 768²/ref2i to completion (t2i peak 6.4GB, t2va peak **7.23GB**, ref2i peak 6.69GB). **The video reference family (i2va/audio-reference) does not fit**: reference tokens lengthen the sequence, so even the shortest 768²/5s has no room for denoise activations (i2va requires a measured 9.41GB) |
 | 24/16GB | **6–8GB-class** (projected NF4) | the main GPU runs `group` alone (blocks + activations ~8GB); parking the TE elsewhere lowers the main-GPU floor further |
 
+**The 8GiB×2 boundary (measured 2026-08-11)**: still-image references (ref2i) work, but the
+**video reference family does not fit because of the reference-token VRAM addition**. i2va
+requires 9.41GB against t2va's 7.23GB (+2.18GB from references), and audio-reference and
+768×1344 also exceed the 8GiB budget. These run only on the single 16GB card.
+
 ref2va needs care at every tier: with the 32B TE, reference encoding adds **≥3.22GB
-(measured)** on the TE's GPU. The projected TE's vision path is **unverified** (the
-projection matrix was calibrated on text only).
+(measured)** on the TE's GPU. The projected TE's vision path was **verified visually on
+2026-08-11** (face/hair/clothing/props all reflected, on par with the 32B reference; after
+fixing the two latent bugs).
 
 ### 5.4 Putting the TE on a separate GPU (`H3_TE_DEVICE`)
 
@@ -211,7 +250,7 @@ The current 20GB card's **effective budget is about 19.7GB** (catalog 21.47GB �
 | 32B pruned nf4 / t2va-family | 17.76GB (measured) | **20GB+** (margin ~1.9GB) |
 | 32B pruned nf4 / ref2va | **20.67GB+** (measured: TE 17.45 + reference encoding ≥3.22) | **24GB+** (20GB OOMs, short by 204MB; multiple references not guaranteed even at 24GB) |
 | Projected 4B bf16 | 8.88GB (measured) + ε | 12GB (thin) / **16GB+** |
-| **Projected 4B NF4** | **3.11GB (measured) + ε** | **expected to fit a 6–8GB-class card** (derived, unmeasured; the ref2va vision path is also unverified) |
+| **Projected 4B NF4** | **3.11GB (measured) + ε** | **measured at 8GiB-class (2026-08-11)**: resident on the TE side of an 8GiB×2 setup (t2i/t2va/ref2i complete). 6GB-class is derived. The ref2va vision path was verified visually |
 
 **→ ref2va needs an effective 20.7GB or more, i.e. a catalog capacity of 22.2GB or more.** A 24GB card
 (effective ~22.4GB) is expected to fit with a margin of ~1.7GB. This is the concrete basis for swapping
@@ -276,6 +315,15 @@ measurements in every single case**.
 | GPU0 48GB, denoise with TE resident | 58.05 / 49.81 | NG | ○ this is why we swap every time |
 | GPU0 48GB, decode with transformer resident | 50.29 / 49.81 | NG | (never implemented for fp32 VAE) |
 | Same, + video VAE fp16 (`H3_KEEP_TRANSFORMER=1`) | 45.70 predicted / 49.81 | OK | ○ measured 44.15GB (§5.5, 2026-08-09) |
+| Single 16GB (projected TE NF4 co-resident, group), t2va denoise | 11.1 predicted / ~15.2 | OK | ○ measured 11.4GB (2026-08-11) |
+| 8GiB×2 (projected TE off-card), t2va | 7.23 / ~7.1 | OK (barely) | ○ measured 7.23GB (2026-08-11) |
+| 8GiB×2, i2va (with references) | 9.41 / ~7.1 | NG | ○ OOM (+2.18GB from reference tokens) |
+
+**VRAM addition from reference tokens (measured 2026-08-11, single 16GB)**: against t2va (no
+references) 7.23GB — i2va (image reference) 9.41GB, audio-reference 11.96GB, 768×1344/5s
+13.37GB (nvidia measured 15.2GB). The reference family lengthens the sequence by the reference
+tokens, increasing denoise activations. On 8GiB×2 the ceiling is still-image references
+(ref2i peak 6.69GB); the video reference family exceeds the budget from this addition.
 
 **If you swap the GPU, plug the new capacity into this formula and re-derive.** No need to re-memorize the table.
 

@@ -2,57 +2,121 @@
 
 **日本語** | [English](README.en.md)
 
-MiniMax H3 (Hailuo 3.0) の機能確認用スタンドアロンアプリ。動画+ステレオ音声を1回のデノイズで
-同時生成するオムニモーダル33Bモデルを、diffusers の Modular Diffusers 経路 (PR #14355) で
-動かす。将来 [diffusers-server](https://github.com/animede/diffusers-server) へ統合するための
-先行検証ワークスペース(diffusers-server 本体には一切手を入れていない)。
+**MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニ
+モーダルモデルを、普及帯GPUで動かす検証アプリ。** テキスト / 画像参照 / 音声参照を入力に
+**動画+ステレオ音声**を生成し、静止画のみ(T2I / Ref2I)も出せる。基盤は diffusers の
+Modular Pipeline(PR #14355、コミット **f37ab93** にピン留め)。**8GB×2 の2枚構成でも、
+実 RTX 4060 Ti 16GB カード単体でも動くことを実測済み**(下の対応表)。将来
+[diffusers-server](https://github.com/animede/diffusers-server) へ統合するための先行検証
+ワークスペース(diffusers-server 本体には一切手を入れていない)。
 
-**RTX PRO 5000 48GB + RTX 4000 SFF Ada 20GB の2枚構成での実測:**
+![GUI メイン画面](docs/images/ui_main.png)
 
-| | 素の構成 | 現在 | |
-|---|---|---|---|
-| 静止画 1枚 (768²) | 157s | **9.7s** | 16倍 |
-| 動画+音声 5秒 (768²) | 351.4s | **44.2s** | 8.0倍 |
+*ブラウザから使う単一ページUI。5つのモードをタブで切替(動画: **T2VA**=テキスト /
+**FL2VA**=フレーム / **Ref2VA**=参照、静止画: **T2I** / **Ref2I**)。下段は生成物ギャラリーで、
+チェックした動画を連結して書き出せる。プロンプトはローカルLLMで H3 公式ガイドの形式へ強化でき、
+FirstBlockCache・Sage・Turbo・量子化・低VRAMモードなどは**再起動なしで**このパネルから切替。
+日英切替あり。*
 
-律速はデノイズではなく**モデルの load/free という固定費**だった、というのがこのリポジトリの
-中心的な発見。固定費を3段階(量子化済みTEのディスクキャッシュ → TEを2枚目GPUへ常駐 →
-transformerを常駐)で削り、**すべての高速化について同一seedでの出力MD5一致を確認**して
-「数学的に無影響な最適化」であることを実証している。導出と実測は
-[docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md) を参照。
+## VRAM×機能マトリクス(2026-08-11 実測)
 
-> ## 現在地と再開の入口(2026-08-09 時点)
->
-> 作業を再開するとき、まずここを読む。
->
-> | 知りたいこと | 見る場所 |
-> |---|---|
-> | **仕様・性能・設計**(何をどう実現しているか) | [docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md) |
-> | **踏んだ罠・失敗・運用の教訓**(同じ穴を避けたい) | [docs/internal/TECHNICAL_REPORT.md](docs/internal/TECHNICAL_REPORT.md)(末尾の「追補: 2026-08-09」が最新) |
-> | **次に何をやるか**(未着手・未検証) | 本 README の「[今後の外部イベント待ち](#今後の外部イベント待ち積み残し2026-08-06時点)」§3 |
-> | どのモードで何がいつロード/解放されるか | [docs/RESIDENCY.md](docs/RESIDENCY.md) |
-> | diffusers を上げるときの回帰基準値 | [docs/internal/regression_baselines.json](docs/internal/regression_baselines.json) |
->
-> **現在の状態**: diffusers はマージ版 **f37ab93** にピン留め(PR #14355 の追従完了、全経路が
-> 同一seed MD5 で等価)。推奨起動は
-> `H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`
-> (t2i 定常 9.7s/枚、t2va 5秒 44.2s)。**ref2va を使うときは `H3_TE_DEVICE` を外す**
-> (TE用GPUが 20GB では容量不足で自動 400 拒否)。
->
-> 時系列の作業記録は本 README の日付付きセクション群(下へ読み進む)。
+○ = 実測で完走 / △ = 導出見込み(未実測)/ × = OOM。速度はいずれもこの箱の
+**PCIe Gen3 x4 スロット + sm_89(4060 Ti)+ SDPA** での値で、**Gen4 x16 なら重み転送は
+約1/8**になる(下の「速度の正直な注記」参照)。
 
-このREADMEの数値は**すべて実機の実測値**で、環境は RTX PRO 6000 Blackwell 96GB / RAM 94GB /
-Ubuntu 24.04。低VRAM構成については 18GB 相当までVRAMバラストで検証している(下記の
-VRAM対応表を参照)。
+| 構成 | t2i 768² | t2va 5秒 768² | ref2i | i2va(画像参照) | 音声参照 | 768×1344 5秒 |
+|---|---|---|---|---|---|---|
+| **実 RTX 4060 Ti 16GB 単体** | ○ 498s・ピーク7.4GB | ○ 25分・11.4GB | ○ | ○ 39分・9.41GB | ○ 54分・11.96GB | ○ 66分・13.37GB(実15.2GB=上限) |
+| **8GiB×2**(計算+TE、バラスト模擬) | ○ 512s・6.4GB | ○ 25.6分・7.23GB | ○ 17.7分・6.69GB | × OOM | × OOM | × OOM |
+| **12GB 単体** | △ 見込み | △ | △ | △ | ×に近い(実14.7GB) | × |
+| **48GB+20GB**(2枚、turbo LoRA) | ○ 9.7s | ○ 44.2s | ○ | ○ | ○ | ○ |
 
-> **環境変更 (2026-08-07 夜)**: この箱の GPU は RTX PRO 6000 Blackwell 96GB から
-> **RTX PRO 5000 Blackwell 48GB + RTX 4000 SFF Ada 20GB** の2枚構成に交換された。
-> 既存の実測値は 96GB 時代のもの(VRAMバラスト検証済みなので目安としては有効)。
-> 48GB 単騎では既定モード(bf16 transformer 66.3GB)は物理的にロードできないため、
-> **起動には `H3_LOWVRAM=1`(48GB級)か `H3_LOWVRAM=group`(24-32GB級)が必須**。
-> turbo LoRA は当初「bf16 経路専用でこの箱では使えない」だったが、**2026-08-08 に
-> 既定 LoRA を lightx2v 版へ切り替えたことで `H3_LOWVRAM=1` でも使えるようになった**
-> (「Turbo LoRA」節の 2026-08-08 更新参照。group とは併用不可)。2026-08-07 以降の
-> 新規実測(静止画モード以降のセクション)は RTX PRO 5000 48GB + `H3_LOWVRAM=1` での値。
+- 12GB 単体は未実測。t2va 実ピーク 11.4GB / i2va 9.41GB(実11.2GB)が 12GiB に収まる計算だが、
+  音声参照(実14.7GB)・768×1344(実15.2GB)は超える。
+- 16GB / 8GB 構成の鍵は **投影TE**(Qwen3-VL-4B + 学習済み線形写像 ClipProj、NF4 で 3.11GB。
+  32B の text_encoder の代替)+ `H3_LOWVRAM=group`(transformer int8 をブロック単位で
+  ストリーム、GPU常駐は ~1.4GB)+ video VAE の fp16 デコード。詳細は日付節 2026-08-10〜11。
+- **測定環境は2台のマシンで共有**: 16GB / 8GB 列は **96GB機(RTX PRO 6000 + 増設 4060 Ti 16GB)**、
+  48GB+20GB 列は **48GB機(RTX PRO 5000 48GB + RTX 4000 SFF Ada 20GB)** での実測。旧版の実測
+  (96GB単騎時代)は各日付節にそのまま残してある。
+
+## VRAM級別クイックスタート
+
+セットアップは「[インストール](#インストール)」「[モデルの取得](#モデルの取得)」を先に済ませること。
+起動後、ブラウザで `http://<host>:8611/` を開く。
+
+```bash
+# 実16GB 単体(sm_89 の 4060 Ti など)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
+  H3_ATTN_BACKEND=default \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+# ※ sm_120 以外は H3_ATTN_BACKEND=default が必須(既定の sage は sm_120 専用ビルド)
+
+# 8GB×2(TE を2枚目GPUへ)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
+  H3_ATTN_BACKEND=default H3_TE_DEVICE=cuda:1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+
+# 48GB級(推奨: 高速化フル)
+H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+
+# 96GB級(全モデル常駐、env なし)
+venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+```
+
+より細かい VRAM 級別(80/48/32/18GB)の起動例と全環境変数は
+「[VRAM対応表と主な環境変数](#vram対応表と主な環境変数早見表)」を参照。
+
+## 速度の正直な注記
+
+**低VRAM構成は動くが遅い。** `H3_LOWVRAM=group` は毎ステップ int8 重み(~34GB)を CPU→GPU に
+流すため、転送が律速になる。上の対応表の 16GB / 8GB の実測値は **PCIe Gen3 x4 スロット**での
+もので、`16.5s/step`(t2i)〜`51s/step`(t2va)のほとんどは転送時間。**Gen4 x16 のまともな
+スロットなら転送は約1/8**になるので、これは「16GBカードの性能」ではなく「この箱のスロット」の値。
+また int8+SDPA の軌道では FirstBlockCache が効かず(`cache_skipped_steps: 0`)、閾値調整で
+最大2倍の短縮余地がある(未検証)。
+
+品質については、投影TE(PSNR 22.4dB vs 32B)も int8+SDPA も、同一seedでも構図が変わる
+(**軌道の分岐であって劣化ではない**)。むしろ実測では int8+SDPA の方がプロンプト忠実度が
+上がったケースもあり、参照(ビジョン)経路も目視で 32B 正解と同水準の忠実度を確認済み。
+**構成をまたぐ品質は PSNR/MD5 では判定できないので目視で見ること。**
+
+## 最近の更新(2026-08-11〜12)
+
+- **最終ゴール2つを達成**: 実 RTX 4060 Ti 16GB 単体でフル機能(t2va 768² ピーク 11.4GB、
+  最大は 768×1344 の実 15.2GB)/ 8GB×2 で t2va 5秒 768² がフル解像度のまま完走(ピーク 7.23GB)。
+- デコード末尾の逆正規化を CPU 化(ビット同一、全構成でデコードピーク減)。
+- `H3_VIDEO_VAE_FP16` × 参照ありの dtype 即死を修正(エンコード側にも fp16 autocast)。
+- group モードの pinned RAM 残留を解放し、t2va↔ref2va のモード切替が可能に。
+
+## 現在地と再開の入口(2026-08-12 時点)
+
+作業を再開するとき、まずここを読む。
+
+| 知りたいこと | 見る場所 |
+|---|---|
+| **仕様・性能・設計**(何をどう実現しているか) | [docs/TECHNICAL_OVERVIEW.md](docs/TECHNICAL_OVERVIEW.md) |
+| **踏んだ罠・失敗・運用の教訓**(同じ穴を避けたい) | [docs/internal/TECHNICAL_REPORT.md](docs/internal/TECHNICAL_REPORT.md) |
+| **コミュニティ改良の取り込み判断** | [docs/COMMUNITY_IMPROVEMENTS.md](docs/COMMUNITY_IMPROVEMENTS.md) |
+| どのモードで何がいつロード/解放されるか | [docs/RESIDENCY.md](docs/RESIDENCY.md) |
+| **次に何をやるか**(未着手・未検証) | 本 README の「[今後の外部イベント待ち](#今後の外部イベント待ち積み残し2026-08-06時点)」§3 |
+| diffusers を上げるときの回帰基準値 | [docs/internal/regression_baselines.json](docs/internal/regression_baselines.json) |
+
+**現在の状態**: diffusers はマージ版 **f37ab93** にピン留め(PR #14355 の追従完了、全経路が
+同一seed MD5 で等価)。**低VRAMの最終ゴール2つ(実16GB単体 / 8GB×2)を 2026-08-11 に達成**し、
+訴求点は「高速化」だけでなく「**普及帯GPUで動く**」に広がった。48GB機での推奨起動は
+`H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`
+(t2i 定常 9.7s/枚、t2va 5秒 44.2s)。**ref2va を使うときは `H3_TE_DEVICE` を外す**
+(TE用GPUが 20GB では容量不足で自動 400 拒否)。時系列の作業記録は本 README の日付付き
+セクション群(下へ読み進む)。
+
+> **測定環境について**: この home は2台のマシンで共有されている。**96GB機** = RTX PRO 6000
+> Blackwell 96GB + 増設した RTX 4060 Ti 16GB(低VRAMゴールの実測はこちら)、**48GB機** =
+> RTX PRO 5000 Blackwell 48GB + RTX 4000 SFF Ada 20GB(48GB級の推奨構成・turbo の実測はこちら)。
+> 各日付節の数値がどちらの箱のものかは節内に明記してある。48GB 単騎では既定モード
+> (bf16 transformer 66.3GB)は物理的にロードできないため、`H3_LOWVRAM=1`(48GB級)か
+> `H3_LOWVRAM=group`(24-32GB級)が必須。
 
 ## 構成
 
@@ -77,7 +141,7 @@ minimax-h3/
 
 | | 要件 |
 |---|---|
-| GPU | 18GB 以上(構成により 96GB / 80GB / 48GB / 32GB / 18GB。下の「VRAM対応表」参照) |
+| GPU | 最小: **16GB 単体**(全機能・実測済み・遅い)または **8GB×2**(t2i/t2va/ref2i まで)。快適動作は **48GB 級**を推奨。構成別の実測は冒頭の「[VRAM×機能マトリクス](#vram機能マトリクス2026-08-11-実測)」参照 |
 | ホストRAM | 64GB 以上を推奨(`H3_LOWVRAM=group` は int8 重み ~34GB をRAMに常駐させるため 48GB 以上の空きが必要) |
 | ディスク | 約 145GB(T2VA/FL2VA のみ)/ 約 207GB(Ref2VA も使う場合) |
 | CUDA | 12.8 系(torch 2.9.0+cu128 に合わせる)。SageAttention をビルドするなら `nvcc` も同系統 |
@@ -158,6 +222,10 @@ venv/bin/python scripts/download_t2va.py
 `logs/du_monitor.log` でキャッシュサイズを監視できる(170GB超で警告)。
 
 ## VRAM対応表と主な環境変数(早見表)
+
+> **注**: この表は 96GB 機時代のバラスト実測に基づく環境変数の早見表。**実カードでの実測
+> (16GB 単体・8GB×2、投影TE使用)は冒頭の「[VRAM×機能マトリクス](#vram機能マトリクス2026-08-11-実測)」
+> と日付節 2026-08-11 を参照。**
 
 用途に応じた起動例(すべて実測済み。詳細は以降の各節)。
 
@@ -2211,7 +2279,10 @@ token_refiner は bf16 ベース + bf16 デルタ**という混在状態にな�
   あり、`transformer_ref` への適用は**一度も試していない**。配線上は同じ経路を通るはずだが、
   蒸留LoRAが参照条件付きの軌道でも成立するかは別問題(strength 0.094 の妥当性も t2va での
   実測値)。参照付き生成を高速化したくなったら、まずここをスパイクすること
-- **投影TE (`H3_TE_PROJ`) の4B専用量子化オプション**: 現在の投影TEは Qwen3-VL-4B を
+- **投影TE (`H3_TE_PROJ`) の4B専用量子化オプション** → **実装済み(2026-08-10 同日)**:
+  `H3_TE_PROJ_QUANT` として追加し、実測(NF4 3.11GB・品質同水準)を経て**既定を
+  bnb-4bit 化**済み(日付節 2026-08-10 の「追記(同日その2)」参照)。以下は実装前の
+  検討記録: 当初の投影TEは Qwen3-VL-4B を
   **bf16 でロードしており、GPU実占有は 8.88GB**(2026-08-10 実測。チェックポイント
   8.88GB と一致)。投影行列の配布元は「15.7GB → 5.2GB」と書いているが、**5.2GB は
   bf16 では成立しない**(量子化版を指していると思われる)。4B を int8/nf4 で量子化
@@ -2221,7 +2292,10 @@ token_refiner は bf16 ベース + bf16 デルタ**という混在状態にな�
   ための措置であって、4B を量子化してはいけないという意味ではない。実装するなら
   **4B専用の別フラグ**(例 `H3_TE_PROJ_QUANT`)として足し、既存ガードの意図を壊さないこと。
   投影行列は fp32 のまま適用する必要がある点にも注意(W は 2560×5120 の fp32)
-- **16GB級対応**: TEのストリーミング実行(ブロック単位でGPUへ流す)が必要。現状の床は
+- **16GB級対応** → **達成(2026-08-11)**: 投影TE NF4(3.11GB)+ `H3_LOWVRAM=group` の
+  同居で**実 RTX 4060 Ti 16GB 単体での全機能動作を実測済み**(TEのストリーミング実行は
+  不要だった)。8GiB×2 も t2va まで成立。日付節 2026-08-11 参照。以下は達成前の検討記録:
+  TEのストリーミング実行(ブロック単位でGPUへ流す)が必要。現状の床は
   TE-nf4削除版の常駐17.45GB(上記セクション参照)。**投影TEを使う場合はこの床が
   8.88GB に下がる**ため、別ルートで 16GB 級に到達できる可能性がある(下記の2枚目GPU
   要件の再計算を参照)

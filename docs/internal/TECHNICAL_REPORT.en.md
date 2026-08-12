@@ -655,3 +655,223 @@ same pitfalls, the narrative itself is the value** -- that's the split.
 Japanese/English parity was also done at the same time (separate files with cross-links;
 keeping both languages in a single file was rejected, since in a repository where measured
 values keep getting appended, one language would inevitably go stale).
+
+---
+
+# Addendum: 2026-08-11 to 12 (the campaign to hit the low-VRAM goals)
+
+The main body and the A-addendum cover through fixed-cost reduction on the 48GB box. Here
+we record the pitfalls and lessons hit while, **with the projected TE (Qwen3-VL-4B + a
+trained linear map) as the axis, achieving the two final goals: full functionality on a
+single real 16GB card, and up to t2va on 8GiB×2.** The settled specification lives in
+[docs/TECHNICAL_OVERVIEW.en.md](../TECHNICAL_OVERVIEW.en.md) and
+[docs/RESIDENCY.en.md](../RESIDENCY.en.md), so only pitfalls and lessons are written here.
+
+## B1. plain mode × `H3_TE_DEVICE` device mismatch (a new variant of the `_execution_device` pitfall)
+
+On the very first run of the projected TE (4B NF4) parked on `H3_TE_DEVICE=cuda:1` under
+**no lowvram (plain)**, it crashed with a device mismatch inside rope(). The cause was the
+same `_execution_device` as in the main body §4 and A2, but **the firing site was different
+again**.
+
+- Detaching TE drops `_execution_device` onto the CPU-resident audio_vae (same shape as the
+  first A2 incident). A2 added audio_vae exclusion to `_pin_execution_device_to_compute()`,
+  but only for the window on the lowvram path.
+- plain (non-lowvram) has two other branches (catch-all / bnb-4bit+fl2va), and their
+  layout–timesteps sat **outside the pinning window**. plain × `H3_TE_DEVICE` was a first run
+  here, and this is the only combination that traverses those branches.
+- **Fix**: wrap those branches in `_pin_execution_device_to_compute()` too, but only when
+  `self._te_external` is true (the ordinary path with TE co-resident stays byte-for-byte
+  unchanged).
+
+**Lesson**: the intent gained in A2 — "exclude every nn.Module that comes before
+transformer" — was correct, but we overlooked that **there are multiple windows where that
+intent must be applied, one per path**. When introducing pinning, verify "which paths
+traverse this window" by enumerating all paths. A new env combination traverses, for the
+first time, a branch of existing code that has never been exercised.
+
+## B2. Silent recalibration of the upstream projection matrix (an update that is not same-named but is effectively a different function)
+
+The default file for `H3_TE_PROJ` started 404ing. The distributor had moved the old
+`h3_qwen3vl_4b_tap24.safetensors` into `obsolete/` and replaced it with a **recalibrated
+version** `mmh3-4b-ClipProj.safetensors` (training 1,666→5,664 prompts,
+cos_test 0.711→0.717).
+
+- The rename made the 404 noticeable, but **the contents were also a different thing**. The
+  cosine against the old matrix W was 0.9596, which is at the level of "effectively a
+  different function". Had we looked only at the name and treated it as "a re-upload of the
+  same thing", we could have confused the quality delta with the nature of the projection.
+- **How it was confirmed**: the old matrix was still in the local HF cache
+  (snapshot `3f762f19`), so running old vs new on the same seed let us confirm they were
+  **different by PNG MD5, and different tensors by the hash of W**. The old matrix is
+  reproducible by passing its absolute path to `H3_TE_PROJ`.
+- Both old and new have comparable PSNR against the 32B baseline (22.49→22.36dB); the
+  new-vs-old NF4 PSNR is 39.29dB — "effectively the same image even with recalibration + a
+  different GPU".
+
+**Lesson**: **distrust same-named/renamed updates of distributed artifacts**. Files in an HF
+repo silently change contents. If the old version is still in the local cache, you can
+hash-compare old vs new — so don't wipe `~/.cache/huggingface` snapshots before tracking an
+update (note the hashes before wiping).
+
+## B3. sage attention is an sm_120-only build → sm_89 requires `H3_ATTN_BACKEND=default`
+
+The added RTX 4060 Ti is **sm_89**. This app's sage is 2.2.0 source-built for sm_120 and
+cannot be used on an sm_89 card. The single-16GB verification must launch with
+`H3_ATTN_BACKEND=default` (SDPA).
+
+**Lesson**: the attention backend is tied to the card's compute capability. When the GPU
+changes, first check sage's supported arch, and if unsupported, fall back to SDPA (launching
+with the default `sage` will crash). This also ties into B4 below: falling back to SDPA
+changes the trajectory and stops FBC from working.
+
+## B4. On the int8+SDPA trajectory, FBC skips 0 steps + the composition changes at the same seed → cross-configuration quality is judged visually
+
+In the single-16GB run (int8 group + SDPA), **FBC skipped not a single step**
+(`cache_skipped_steps: 0`, threshold 0.05). In contrast to the PRO 6000 + sage + bf16
+trajectory where most steps were skipped, on the int8+SDPA trajectory the residual never
+drops below the threshold.
+
+At the same time, PSNR is numerically catastrophic (7.40dB vs the 32B baseline / 7.43dB vs
+the prior stage), but **visually it was not degradation**: the prior stage (bf16+sage)
+converged at seed 4242 to an anime-style lake at dusk (not reflecting the prompt's
+"photorealistic"/"snow-capped peaks"), whereas this run (int8+group+SDPA) produced a
+photorealistic snowy mountain and a lake in morning mist — **prompt fidelity actually
+improved**.
+
+**Lesson**: int8+SDPA moves generation to a different attractor. **Cross-configuration
+PSNR/MD5 comparison is simply invalid to begin with** (even further out than the known ~19dB
+int8 trajectory divergence). Judge cross-configuration quality visually. FBC's skip rate is
+also trajectory-dependent, and "doesn't work" ≠ "broken" (there is up to a 2x headroom from
+threshold tuning, but it is unverified and trades against quality).
+
+## B5. Isolating the cause of slowness — this box's 2nd slot is Gen3 x4 (don't confuse it with the card's performance)
+
+On single-16GB, t2i was 16.5s/step and t2va 49.8s/step, very slow. group offload streams
+~34GB of int8 weights CPU→GPU every step, but the slot the 4060 Ti sits in is
+**Gen3 x4 (effective ~3.5GB/s)**. Transfer alone comes to ~10s/step, consistent with the
+measurement.
+
+- **How it was confirmed**: `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current`
+  directly confirmed the slot is Gen3 x4. The bottleneck is the per-step transfer, not the
+  denoise computation itself.
+- On **a proper Gen4 x16 slot, transfer would be ~1/8**, so this time is a value of "this
+  box's slot", not "the 16GB card's performance". t2va's 49.8s/step is that plus SDPA
+  compute (sm_89) for 124 frames.
+
+**Lesson**: group-mode speed is PCIe-bandwidth-bound. When you see slowness, **suspect the
+slot's Gen/width, not the card's compute** (checkable via nvidia-smi). Don't record a value
+specific to this box as the card's general performance.
+
+## B6. 838MiB whole-length fp32 conversion at the end of decode OOMs after denoise completes → move de-normalization to the CPU
+
+The first 8GiB×2 t2va attempt OOMed on **the last line of decode, after denoise ran
+29/29 to completion**. The final line of upstream `decoders.py`
+`MiniMaxH3VideoDecodeStep.__call__`,
+`(video.float() * pixel_std + pixel_mean).clamp(0,1)`, converts the whole-length fp16 decode
+result to fp32 in one shot on the GPU — at 768², 124 frames that is
+124×768×768×3×4B = **838MiB** temporary (exactly matching the OOM message
+"Tried to allocate 838.00 MiB"). The same family as the "whole-length conversion at the end
+of decode" we crushed with `frames_to_uint8` in the main body was still present on the
+normalization side.
+
+- **Handling**: per the no-touching-venv rule, a runner-side subclass
+  (`_cpu_norm_video_decode_step()`, cloning f37ab93's `__call__` with a single change):
+  **move to CPU while still fp16, then de-normalize on the CPU**.
+- **The equivalence argument**: element-wise fp32 mul/add/clamp has no reduction and no FMA
+  fusion, so IEEE754 rounding agrees between CPU and GPU → the output is bit-identical.
+  **Measured and confirmed a same-seed PNG MD5 exact match
+  (`1a2a136b61234b4917465604ac35cca2`) before and after applying** (proven by byte match,
+  not "should be the same"). The only added cost is one PCIe transfer of the whole-length
+  fp16, ~420MiB.
+- Applied unconditionally to all paths (t2va/t2i/ref2va/batch). In every configuration, a
+  few whole-length fp32 tensors disappear from the decode-phase peak.
+
+**Lesson**: the "denoise passes but decode falls over" pattern points to a whole-length dtype
+conversion at the tail. CPU/GPU equivalence of element-wise ops holds when there is no
+reduction, and when it holds the rounding matches, so **it can be proven by MD5** (an
+equivalent relocation, not an approximation).
+
+## B7. `H3_VIDEO_VAE_FP16=1` × references instant death by dtype (decode has autocast, encode does not)
+
+Running the reference family (ref2va / fl2va) under `H3_VIDEO_VAE_FP16=1` dies instantly
+(even at 96GB, regardless of VRAM amount) with
+`Input type (float) and bias type (c10::Half) should be the same`.
+
+- **Why**: `H3_VIDEO_VAE_FP16=1` permanently casts the VAE weights to fp16. **Decode** is
+  fine because the upstream step wraps its own fp16 autocast, but the **encode** side
+  (encoders.py `encode_vae_condition` — used by ref2va's references and fl2va's keyframe
+  conditioning) has no autocast and passes explicitly fp32-ified pixels to `vae.encode()`.
+  The cause is the upstream **asymmetry of decode having autocast and encode not**.
+- **Why it stayed latent**: every ref2va regression so far was on an fp32 VAE configuration,
+  so **it could never have been found by fp32 VAE regressions alone**. It surfaced only when
+  the low-VRAM goal combined `H3_VIDEO_VAE_FP16=1` × with-references for the first time.
+- **Fix**: in `_load_vae`, right after the fp16 cast, wrap `vae.encode` in an fp16 autocast
+  symmetric with the decode side. Precision is within design (`encode_vae_condition`
+  originally rounds its result to fp16 itself via `latents.to(torch.float16).float()` before
+  returning).
+
+**Lesson**: upstream can be **asymmetric in how it applies autocast between decode/encode**.
+Running regressions on only one path (fp32 VAE) makes bugs specific to the other path
+structurally undetectable. The regression matrix is the Cartesian product of "flag ×
+feature", and at least the dangerous combinations (fp16 VAE × references) must be included
+explicitly.
+
+## B8. group's pinned ~34GB stays in the host caching allocator (empty_cache is device-side only)
+
+In group mode, **switching modes t2va→ref2va was permanently impossible**. The cause was not
+VRAM but **residual host-side pinned RAM**.
+
+- group offload (use_stream=True) places ~34GB of int8 weights in **pinned memory**.
+  `_free_transformer`'s del+gc leaves the pages **held in torch's host-side caching allocator,
+  never returned to the OS** (`torch.cuda.empty_cache()` is device-side only), so
+  MemAvailable stays ~34GB short. The subsequent transformer_ref load is rejected by the RAM
+  guard (which requires 40GB).
+- **How it was confirmed**: measuring avail after freeing showed 38.6GB (RssShmem 45.6GB
+  still held). "RAM doesn't come back even though it was freed" was confirmed numerically.
+- **Fix**: add `torch._C._host_emptyCache()` (a private API, so `getattr`-guarded) to
+  `_free_transformer` / `_free_transformer_ref`, only in group mode. After the fix, avail
+  recovers fully to **85.8GB** right after freeing, and t2va→ref2va switching works in group
+  mode for the first time.
+
+**Lesson**: **the host-side pinned cache is a separate ledger from device freeing.**
+`empty_cache()` is device-side only, and pinned host pages are returned to the OS only by
+`_host_emptyCache` (a private API). In a configuration that uses lots of pinning, like group
+mode, return this explicitly at mode switch. Since it's a private API, check its existence
+via `getattr` before calling (it can disappear across torch versions).
+
+## B9. Methodology for VRAM-ballast simulation (why it skews slightly stricter than a real card)
+
+The 8GiB×2 verification simulated headless 8GiB cards by capping the added real 16GB card
+and the 96GB card with `scripts/vram_ballast.py --target-free-gb 7.9` (**in GiB**).
+Compute side = 4060 Ti, TE side = PRO 6000 (assigned to the app's cuda:0/cuda:1 via
+`CUDA_VISIBLE_DEVICES=1,0`).
+
+- The ballast fills the rest while leaving the specified free amount. Since `--target-free-gb`
+  is in GiB, it is **slightly stricter** than the effective budget of an 8GiB card (the
+  ballast's own allocator fragmentation and the CUDA context eat a bit more than a real
+  card's "raw free"). In other words it skews toward "if it passes with ballast, it passes on
+  a real card" — safe as a go/no-go check.
+- We ran both the real card (Goal A) and ballast (Goal B) to **back up whether the ballast
+  correctly approximates a real card** on the real-card side.
+
+**Lesson**: ballast simulation skews stricter than a real card, so it is **safe for go/no-go
+decisions**, but **it does not simulate speed** (PCIe bandwidth and compute capability are
+specific to the real slot/real card). Measure capacity feasibility with ballast, and speed on
+the real card.
+
+## B10. Operating sub-agent verification (Bash 10-min cap → nohup + polling)
+
+Low-VRAM generation takes 25–66 minutes per run (because of this box's Gen3 x4 slot). A
+delegated sub-agent's Bash has a 10-minute cap and can't wait for long-running generation as-is.
+
+- **Handling**: launch generation in the background with `nohup ... &` and poll
+  `logs/server.log` to detect completion. Even if curl disconnects midway, **generation
+  continues server-side** and the result is recoverable from `outputs/` and `server.log`
+  (generation is serialized by a global lock, so a disconnect doesn't lose the job).
+- The "no re-delegation, complete it yourself" at the top of the delegation prompt continues
+  to apply (the A4 lesson).
+
+**Lesson**: verify long-running jobs with "launch + poll + collect logs", not "wait
+synchronously". Don't confuse a curl disconnect with the life/death of the server-side job
+(an HTTP connection is not the job's lifetime).
