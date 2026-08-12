@@ -4258,6 +4258,9 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
+        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
+        # `_mux_mp4` の docstring 参照)。
+        mute: bool = False,
         still: bool = False,
         still_frames: int = 22,
     ) -> dict:
@@ -5235,7 +5238,7 @@ class MiniMaxH3Runner:
             mode = "fl2va" if (image is not None or last_image is not None) else "t2va"
         job_stub = f"{mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
-        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
 
         # 静止画モード: 中央フレームを PNG として書き出す(超短尺 mp4 も上で保存済み。
         # 別フレームを選び直したいときは mp4 から取り出せる)。
@@ -5288,6 +5291,7 @@ class MiniMaxH3Runner:
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo_lora": instant["turbo"],
             "turbo": instant["turbo"],
+            "mute": bool(mute),
             "upscale": int(do_upscale),
             "hires_denoise": H3_HIRES_DENOISE if do_upscale else None,
             "pass1_steps": n1 if do_upscale else None,
@@ -5320,6 +5324,9 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
+        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
+        # `_mux_mp4` の docstring 参照)。
+        mute: bool = False,
     ) -> dict:
         """プロンプト違いの静止画 N 枚を、`H3_LOWVRAM=1` の固定費をバッチ全体で1回に
         償却して生成する(物語の場面画像の連番生成用)。
@@ -5578,7 +5585,7 @@ class MiniMaxH3Runner:
                 # 場面ごとに保存しながら進む (途中失敗でも完了済み場面は残る)
                 job_stub = f"t2i_{int(t_start)}_s{idx + 1}"
                 mp4_path = self.output_dir / f"{job_stub}.mp4"
-                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
                 still_frame_index = len(frames_uint8) // 2
                 png_path = self.output_dir / f"{job_stub}.png"
                 Image.fromarray(frames_uint8[still_frame_index]).save(png_path)
@@ -5636,6 +5643,7 @@ class MiniMaxH3Runner:
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
+            "mute": bool(mute),
             "scenes": results,
         }
         if progress:
@@ -5660,6 +5668,9 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
+        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
+        # `_mux_mp4` の docstring 参照)。
+        mute: bool = False,
         still: bool = False,
         still_frames: int = 22,
     ) -> dict:
@@ -6279,7 +6290,7 @@ class MiniMaxH3Runner:
         ref_mode = "ref2i" if still else "ref2va"
         job_stub = f"{ref_mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
-        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+        _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
 
         # 参照付き静止画モード: 中央フレームを PNG として書き出す (generate() の still と同じ)
         png_path = None
@@ -6324,6 +6335,7 @@ class MiniMaxH3Runner:
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo_lora": instant["turbo"],
             "turbo": instant["turbo"],
+            "mute": bool(mute),
             "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
@@ -6352,6 +6364,9 @@ class MiniMaxH3Runner:
         cache_threshold: float | None = None,
         attn: str | None = None,
         turbo: bool | None = None,
+        # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
+        # `_mux_mp4` の docstring 参照)。
+        mute: bool = False,
     ) -> dict:
         """参照共通・プロンプト違いの ref2va 生成 N 本を、`H3_LOWVRAM=1` の固定費を
         バッチ全体で1回に償却して回す (`generate_still_batch()` の ref2va 版)。
@@ -6648,7 +6663,7 @@ class MiniMaxH3Runner:
 
                 job_stub = f"{'ref2i' if still else 'ref2va'}_{int(t_start)}_s{idx + 1}"
                 mp4_path = self.output_dir / f"{job_stub}.mp4"
-                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path)
+                _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
                 png_path = None
                 still_frame_index = None
                 if still:
@@ -6711,6 +6726,7 @@ class MiniMaxH3Runner:
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
+            "mute": bool(mute),
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
@@ -6725,7 +6741,19 @@ class MiniMaxH3Runner:
         return result
 
 
-def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int, fps: int, mp4_path: Path):
+def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int, fps: int, mp4_path: Path,
+             mute: bool = False):
+    """デコード済みフレームと音声を mp4 に多重化する。
+
+    `mute=True` のときは**音声ストリームを一切作らない**(映像のみの mp4)。
+    H3 は動画と音声を同一の transformer forward で同時に生成する
+    (`denoise.py` が `audio_hidden_states` を毎ステップ渡す)omni-modal モデルなので、
+    **音声の生成そのものは止められない** -- このフラグができるのは「生成された音声を
+    出力コンテナに入れない」ところまでで、**デノイズ時間は1秒も変わらない**。
+    速度目的で使うものではなく、「確実に無音の成果物が欲しい」用途のためのもの。
+    (プロンプト側で `overall_soundscape` に無音を指示する手もあるが、実測では
+    audio_rms が 0 にはならず完全な無音は保証できない -- README 参照。)
+    """
     import av
 
     container = av.open(str(mp4_path), mode="w")
@@ -6734,8 +6762,10 @@ def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int,
     vstream.height = frames_uint8.shape[1]
     vstream.pix_fmt = "yuv420p"
 
-    astream = container.add_stream("aac", rate=sampling_rate)
-    astream.layout = "stereo"
+    astream = None
+    if not mute:
+        astream = container.add_stream("aac", rate=sampling_rate)
+        astream.layout = "stereo"
 
     for frame in frames_uint8:
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
@@ -6744,15 +6774,16 @@ def _mux_mp4(frames_uint8: np.ndarray, audio_np: np.ndarray, sampling_rate: int,
     for packet in vstream.encode():
         container.mux(packet)
 
-    audio_i16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)  # (2, N)
-    # av's packed s16 stereo format wants interleaved L,R,L,R,... in a (1, 2N) array, not
-    # a (2, N) per-channel block layout (verified against a manual roundtrip probe).
-    audio_interleaved = audio_i16.T.reshape(1, -1)
-    audio_frame = av.AudioFrame.from_ndarray(audio_interleaved, format="s16", layout="stereo")
-    audio_frame.sample_rate = sampling_rate
-    for packet in astream.encode(audio_frame):
-        container.mux(packet)
-    for packet in astream.encode():
-        container.mux(packet)
+    if astream is not None:
+        audio_i16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)  # (2, N)
+        # av's packed s16 stereo format wants interleaved L,R,L,R,... in a (1, 2N) array, not
+        # a (2, N) per-channel block layout (verified against a manual roundtrip probe).
+        audio_interleaved = audio_i16.T.reshape(1, -1)
+        audio_frame = av.AudioFrame.from_ndarray(audio_interleaved, format="s16", layout="stereo")
+        audio_frame.sample_rate = sampling_rate
+        for packet in astream.encode(audio_frame):
+            container.mux(packet)
+        for packet in astream.encode():
+            container.mux(packet)
 
     container.close()

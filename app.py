@@ -224,6 +224,7 @@ def _run_generation(
     cache_threshold: Optional[float] = None,
     attn: Optional[str] = None,
     turbo: Optional[bool] = None,
+    mute: bool = False,
     still_frames: Optional[int] = None,
 ) -> dict:
     """still_frames を指定すると静止画モード (t2i): seconds は無視され、超短尺動画から
@@ -280,6 +281,7 @@ def _run_generation(
             cache_threshold=cache_threshold,
             attn=attn,
             turbo=turbo,
+            mute=mute,
             still=still_frames is not None,
             still_frames=still_frames if still_frames is not None else 22,
         )
@@ -312,6 +314,7 @@ def api_t2va(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    mute: bool = Form(False),
 ):
     """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。
 
@@ -333,6 +336,7 @@ def api_t2va(
         cache_threshold=cache_threshold,
         attn=attn,
         turbo=turbo,
+        mute=mute,
     )
     return JSONResponse(result)
 
@@ -350,6 +354,7 @@ def api_t2i(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    mute: bool = Form(False),
 ):
     """静止画生成 (t2i): 超短尺動画を生成して中央フレームを PNG として書き出す。
 
@@ -377,6 +382,7 @@ def api_t2i(
         cache_threshold=cache_threshold,
         attn=attn,
         turbo=turbo,
+        mute=mute,
         still_frames=frames,
     )
     return JSONResponse(result)
@@ -401,6 +407,7 @@ def api_t2i_batch(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    mute: bool = Form(False),
 ):
     """静止画のバッチ生成: プロンプト配列 (multipart で `prompts` を複数回送る) から
     場面ごとの PNG を連続生成する(物語の場面画像用)。
@@ -452,6 +459,7 @@ def api_t2i_batch(
                 cache_threshold=cache_threshold,
                 attn=attn,
                 turbo=turbo,
+                mute=mute,
             )
         else:
             # 常駐モード (bnb-4bit 既定 / group / none): 逐次 generate() でも固定費は
@@ -464,7 +472,7 @@ def api_t2i_batch(
                     prompt=p, height=height, width=width, seconds=0.0,
                     num_inference_steps=num_inference_steps, seed=seed,
                     progress=progress, cache=cache, cache_threshold=cache_threshold,
-                    attn=attn, turbo=turbo, still=True, still_frames=frames,
+                    attn=attn, turbo=turbo, mute=mute, still=True, still_frames=frames,
                 )
                 scenes.append({
                     "prompt": p,
@@ -515,6 +523,7 @@ def api_fl2va(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    mute: bool = Form(False),
 ):
     """height/width を指定すると resolution プリセットより優先され、32の倍数へ丸められる。
 
@@ -540,6 +549,7 @@ def api_fl2va(
         cache_threshold=cache_threshold,
         attn=attn,
         turbo=turbo,
+        mute=mute,
     )
     return JSONResponse(result)
 
@@ -589,6 +599,7 @@ def api_ref2va(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    mute: bool = Form(False),
     still: int = Form(0),
     frames: int = Form(22),
 ):
@@ -680,6 +691,7 @@ def api_ref2va(
                 cache_threshold=cache_threshold,
                 attn=attn,
                 turbo=turbo,
+                mute=mute,
                 still=bool(still),
                 still_frames=frames,
             )
@@ -715,6 +727,7 @@ def _run_ref_batch(
     cache_threshold: Optional[float],
     attn: Optional[str],
     turbo: Optional[bool],
+    mute: bool = False,
 ) -> JSONResponse:
     """/api/ref2i_batch (still=True) と /api/ref2va_batch (still=False) の共通実装。
 
@@ -792,6 +805,7 @@ def _run_ref_batch(
                     cache_threshold=cache_threshold,
                     attn=attn,
                     turbo=turbo,
+                    mute=mute,
                 )
             else:
                 # 常駐モード: 逐次 generate_ref2va() でも固定費はほぼ増えない。
@@ -803,7 +817,7 @@ def _run_ref_batch(
                         prompt=p, references=built_references, height=height, width=width,
                         seconds=seconds, num_inference_steps=num_inference_steps, seed=seed,
                         progress=progress, cache=cache, cache_threshold=cache_threshold,
-                        attn=attn, turbo=turbo, still=still, still_frames=frames,
+                        attn=attn, turbo=turbo, mute=mute, still=still, still_frames=frames,
                     )
                     scenes.append({
                         "prompt": p,
@@ -861,6 +875,7 @@ def api_ref2i_batch(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    mute: bool = Form(False),
 ):
     """参照付き静止画のバッチ生成: 共通の references + プロンプト配列から、
     キャラクター一貫の場面静止画を連続生成する(/api/t2i_batch の ref2va 版)。
@@ -868,7 +883,7 @@ def api_ref2i_batch(
     return _run_ref_batch(
         prompts=prompts, references=references, still=True, frames=frames, seconds=None,
         num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
-        cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo,
+        cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo, mute=mute,
     )
 
 
@@ -885,6 +900,7 @@ def api_ref2va_batch(
     cache_threshold: Optional[float] = Form(None),
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
+    mute: bool = Form(False),
 ):
     """参照付き動画のバッチ生成: 共通の references + プロンプト配列から、
     物語の各場面の動画を連続生成する。尺 (seconds) は全場面共通で必須
@@ -894,7 +910,7 @@ def api_ref2va_batch(
     return _run_ref_batch(
         prompts=prompts, references=references, still=False, frames=22, seconds=seconds,
         num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
-        cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo,
+        cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo, mute=mute,
     )
 
 

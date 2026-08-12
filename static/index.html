@@ -700,6 +700,10 @@
           <input type="checkbox" id="turbo-enabled">
           <label style="margin:0;" for="turbo-enabled" data-i18n="label.turbo">Turbo LoRA(4ステップ推奨・lightx2v蒸留)</label>
         </div>
+        <div class="checkbox-row" id="row-mute">
+          <input type="checkbox" id="mute-enabled">
+          <label style="margin:0;" for="mute-enabled" data-i18n="label.mute">無音で出力(音声トラックを付けない)</label>
+        </div>
         <div class="hint" id="instant-hint"></div>
       </div>
 
@@ -878,6 +882,7 @@ const I18N = {
     'label.upscale': '2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ・約3.6倍時間)',
     'settings.instantTitle': '即反映設定(生成のたびに反映・再ロード不要)',
     'label.turbo': 'Turbo LoRA(4ステップ推奨・lightx2v蒸留)',
+    'label.mute': '無音で出力(音声トラックを付けない)',
     'btn.generate': '生成',
     'btn.generating': '生成中...',
     'hint.generate': '蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。',
@@ -1064,6 +1069,7 @@ const I18N = {
     'label.upscale': '2x latent upscale (generate at 768², finish at 1536². T2VA only, ~3.6x time)',
     'settings.instantTitle': 'Instant-apply settings (applied on every generation, no reload needed)',
     'label.turbo': 'Turbo LoRA (4 steps recommended, lightx2v distillation)',
+    'label.mute': 'Silent output (no audio track)',
     'btn.generate': 'Generate',
     'btn.generating': 'Generating...',
     'hint.generate': 'No CFG needed since this is a distilled model. Default is 50 steps, but 30 is set here as the default for testing.',
@@ -1227,6 +1233,7 @@ const cacheEnabledEl = document.getElementById('cache-enabled');
 const cacheThresholdEl = document.getElementById('cache-threshold');
 const attnSageEl = document.getElementById('attn-sage');
 const turboEnabledEl = document.getElementById('turbo-enabled');
+const muteEnabledEl = document.getElementById('mute-enabled');
 const rowCacheEl = document.getElementById('row-cache');
 const rowAttnEl = document.getElementById('row-attn');
 const rowTurboEl = document.getElementById('row-turbo');
@@ -1948,6 +1955,7 @@ form.addEventListener('submit', async (ev) => {
   // 解釈されうるため、H3_TURBO_LORA=1 で起動したサーバではチェックを外しても
   // turbo が無効にならない恐れがある。
   fd.append('turbo', turboEnabledEl.checked ? '1' : '0');
+  fd.append('mute', muteEnabledEl.checked ? '1' : '0');
 
   // "auto" はサーバ既定に任せる(t2va/fl2va は resolution を送らなければ 768x768、
   // ref2va は height/width を送らなければ H3 自身の 16:9)。"custom" は幅/高さを
