@@ -118,6 +118,32 @@ H3_TURBO_LORA=1`).
 - Two GPUs with a bf16 transformer reach **t2i 6.89s / t2va 26.8s**, the fastest measured, but
   need a 77GB-class card for about 7%. See the dated 2026-08-12 sections.
 
+### With batching on top
+
+The batch phase-reordering is **`H3_LOWVRAM=1`-only** (`if H3_LOWVRAM:` in `app.py`), so the
+plain-mode configuration above **falls back to sequential**. The table below was therefore
+measured with `H3_LOWVRAM=1 H3_KEEP_TRANSFORMER=1` plus the projected TE and turbo (96GB box,
+46.7GB peak).
+
+| Mode | Single | Batch total | **Per item** | Speedup |
+|---|---|---|---|---|
+| t2i 768² | 7.65s | 3 scenes, 16.47s | **5.49s** | 1.39x |
+| ref2i 768² | 79.3s | 3 scenes, 148.9s | **49.6s** | 1.60x |
+| i2va 5s 768² | 103.1s | 2 scenes, 201.4s | **100.7s** | 1.02x |
+
+- **Residency shrank the point of batching.** Its purpose was to amortize model-load fixed
+  costs over a batch; with those costs gone, t2i is down to **1.39x** (it was **2.3x** —
+  157s to 67.5s — before residency).
+- **ref2i still gets 1.6x**, because the ~47s reference vision encode is shared across scenes
+  (about 90s saved over 3 scenes — exactly the two extra scenes' encodes).
+- **The ref2va (video) batch barely helps** (1.02x). If the same sharing applied, two scenes
+  should save ~47s; the measurement shows ~5s. **Cause not yet identified** (needs
+  investigation).
+- **Reference batches cannot be combined with `H3_TE_DEVICE`**: a guard rejects them with "the
+  TE GPU needs 24GB or more". That threshold assumes **the 32B TE's vision activations** and is
+  far too large for the 3.11GB projected TE (it rejects a 16GB 4060 Ti). Keeping the projected
+  TE co-resident works. **Worth revisiting.**
+
 ### Per-technique: how much it bought, and whether the output changes
 
 Equivalence: ◎ = **identical output MD5** at the same seed (mathematically a no-op) /
