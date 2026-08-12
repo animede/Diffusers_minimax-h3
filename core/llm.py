@@ -20,6 +20,7 @@ few-shot 例を入れてある(diffusers-server の LLM強化で確立した知�
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -88,6 +89,9 @@ _COMMON_RULES = (
     "ユーザーが声について何も言っていない場合は、環境音・自然音・物音・音楽のみで音を構成し、"
     "人の声は一切書かないこと。"
     "出力はプロンプト本文のみ。前置き・説明・引用符・「プロンプト:」等のラベルは一切禁止。"
+    "**書き直しは出力前に済ませ、訂正・注釈・言い訳を本文に残さないこと**。"
+    "「(100mmに修正)」「※」「←」のようなメタ記述を混ぜてはならない — "
+    "誤った値を書いたら、最初から正しい値だけを書いた文を出力すること。"
 )
 
 BRIEF_SYSTEM_PROMPT = (
@@ -285,6 +289,49 @@ def build_h3_official_system_prompt(task: str, seconds: float, lang: str) -> str
     )
 
 
+# 焦点距離として許可された値 (プロンプトガイドの規定)。H3 のガイドはこの4種のみを想定して
+# おり、それ以外を書くと未学習の記述になる。
+ALLOWED_FOCAL_MM = (35, 50, 65, 100)
+
+
+def _sanitize_enhanced(text: str) -> str:
+    """強化結果から、LLM が混入させがちな2種の欠陥を機械的に取り除く。
+
+    1. **自己訂正の注釈**: 「85mm(100mmに修正)」のように、誤った値を書いたあと括弧で
+       訂正を添える出力が実機で観測された (2026-08-12)。そのまま H3 に渡ると、
+       プロンプトにメタ文が混ざる。括弧内が焦点距離を示していればその値を採用し、
+       注釈自体は削除する。
+    2. **許可外の焦点距離**: 35/50/65/100mm 以外は最も近い許可値に丸める。指示違反が
+       残るより、規定内の近い値に寄せたほうが実害が小さい。
+
+    どちらも発火したら logger.info を出す (黙って書き換えない)。システムプロンプト側でも
+    禁止しているので、ここは最後の防波堤。
+    """
+    original = text
+
+    # 1) 「NNmm(MMmmに修正)」形式 -> 「MMmm」
+    def _take_correction(m):
+        return f"{m.group(2)}mm"
+
+    text = re.sub(r"(\d{2,3})\s*mm\s*[(（][^)）]*?(\d{2,3})\s*mm[^)）]*?[)）]", _take_correction, text)
+    # 2) 焦点距離を伴わない注釈括弧 (「(100mmに修正)」が単独で残る等) を落とす
+    text = re.sub(r"[(（][^)）]{0,20}(?:に修正|へ修正|修正済|訂正)[^)）]{0,10}[)）]", "", text)
+
+    # 3) 許可外の焦点距離を最も近い許可値へ
+    def _snap(m):
+        val = int(m.group(1))
+        if val in ALLOWED_FOCAL_MM:
+            return m.group(0)
+        nearest = min(ALLOWED_FOCAL_MM, key=lambda a: abs(a - val))
+        return f"{nearest}mm"
+
+    text = re.sub(r"(\d{2,3})\s*mm", _snap, text)
+
+    if text != original:
+        logger.info("enhanced prompt sanitized (focal length / self-correction annotation removed)")
+    return text
+
+
 def enhance_prompt(
     text: str,
     mode: str,
@@ -294,14 +341,16 @@ def enhance_prompt(
     lang: str = "en",
 ) -> str:
     if mode == "brief":
-        return chat_completion(BRIEF_SYSTEM_PROMPT, text)
+        return _sanitize_enhanced(chat_completion(BRIEF_SYSTEM_PROMPT, text))
     if mode == "storyboard":
         sec = int(round(seconds))
-        return chat_completion(STORYBOARD_SYSTEM_PROMPT_TEMPLATE.format(seconds=sec), text)
+        return _sanitize_enhanced(
+            chat_completion(STORYBOARD_SYSTEM_PROMPT_TEMPLATE.format(seconds=sec), text)
+        )
     if mode == "translate":
-        return chat_completion(TRANSLATE_SYSTEM_PROMPT, text, temperature=0.2)
+        return _sanitize_enhanced(chat_completion(TRANSLATE_SYSTEM_PROMPT, text, temperature=0.2))
     if mode == "h3-official":
-        return _enhance_h3_official(text, seconds, task=task, lang=lang)
+        return _sanitize_enhanced(_enhance_h3_official(text, seconds, task=task, lang=lang))
     raise ValueError(f"mode は {VALID_MODES} のいずれかです: {mode!r}")
 
 
