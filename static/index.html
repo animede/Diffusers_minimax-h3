@@ -885,7 +885,7 @@ const I18N = {
     'label.mute': '無音で出力(音声トラックを付けない)',
     'btn.generate': '生成',
     'btn.generating': '生成中...',
-    'hint.generate': '蒸留モデルのためCFG不要。50ステップ既定だが検証用に30を既定値としている。',
+    'hint.generate': 'ステップ数は Turbo LoRA 有効時に自動で推奨値へ切り替わる(手で変えた値はそのまま使われる)。Turbo なしなら 30 前後が目安。',
     'status.checkingServer': 'サーバ状態を確認中...',
     'reload.summary': '再ロードが必要な設定(transformer量子化・TE量子化・低VRAMモード等)',
     'label.transformerQuant': 'transformer 量子化',
@@ -1073,7 +1073,7 @@ const I18N = {
     'label.mute': 'Silent output (no audio track)',
     'btn.generate': 'Generate',
     'btn.generating': 'Generating...',
-    'hint.generate': 'No CFG needed since this is a distilled model. Default is 50 steps, but 30 is set here as the default for testing.',
+    'hint.generate': 'The step count switches to the recommended value automatically when Turbo LoRA is on (a value you set by hand is kept). Without Turbo, around 30 is the usual choice.',
     'status.checkingServer': 'Checking server status...',
     'reload.summary': 'Settings that require a reload (transformer quantization, TE quantization, low-VRAM mode, etc.)',
     'label.transformerQuant': 'transformer quantization',
@@ -1324,15 +1324,10 @@ cacheEnabledEl.addEventListener('change', () => {
 cacheThresholdEl.disabled = !cacheEnabledEl.checked;
 
 turboEnabledEl.addEventListener('change', () => {
-  // Turbo LoRA is community-verified at 8 steps -- default steps to that when turned
-  // on, and back to 30 when turned off, but only if the user has not hand-edited the
-  // field away from one of those two defaults (per the task brief: "ユーザーが手で
-  // 変えた値は尊重してよい").
-  if (turboEnabledEl.checked) {
-    if (stepsEl.value === '' || stepsEl.value === '30') stepsEl.value = '8';
-  } else {
-    if (stepsEl.value === '8') stepsEl.value = '30';
-  }
+  // turbo ON でサーバの推奨ステップへ、OFF で 30 へ戻す。ただしユーザーが手で
+  // 変えた値は尊重する(どちらの既定でもない値なら触らない)。推奨値は
+  // TURBO_STEPS_DEFAULT (サーバ由来) を使う -- 詳細はその宣言部のコメント。
+  syncStepsToTurbo();
   updateInstantHint();
 });
 // upscaleEl の change では updateTurboAvailability() を呼ばない: turbo+upscale は
@@ -1782,6 +1777,11 @@ async function refreshServerStatus() {
     const res = await fetch('/api/status');
     const data = await res.json();
     const r = data.runner;
+    if (r && r.turbo_steps_default != null) {
+      TURBO_STEPS_DEFAULT = r.turbo_steps_default;
+      TURBO_STEPS_KNOWN = true;
+      maybeInitialStepSync();
+    }
     if (data.constraints) {
       H3_CONSTRAINTS = Object.assign({}, H3_CONSTRAINTS, data.constraints);
       // min/max/step は意図的に設定しない(HTML5検証が端数入力の送信を止めるため)。
@@ -1807,9 +1807,48 @@ setInterval(refreshServerStatus, 4000);
 // サーバステータス更新(4秒毎)が入力中の選択を巻き戻すと編集しづらいため)。
 let RELOAD_TOUCHED = false;
 
+// turbo ON のときの推奨ステップ数。**サーバが実際に使う値**(/api/status の
+// runner.turbo_steps_default)を持ってくる -- LoRA を差し替えると 4/8 と変わるため、
+// UI 側にハードコードすると嘘になる (2026-08-12: 既定 LoRA が 8step v0.1 系から
+// 4step v1.0 768p に変わり、UI の 8 が実際の 4 と食い違っていた)。
+let TURBO_STEPS_DEFAULT = null;
+const NON_TURBO_STEPS_DEFAULT = '30';
+// 起動時の1回だけ、turbo の状態に合わせてステップ欄を揃える。checked への代入では
+// change が発火しないので、これが無いと「turbo は最初から ON なのにステップは 30 のまま」
+// になる (実機で報告された不具合)。
+//
+// **順序に注意**: 初期同期には2つの非同期結果が両方必要 --
+//   (a) /api/status の turbo_steps_default (推奨ステップ数)
+//   (b) /api/settings の instant.turbo (チェックボックスの実際の状態)
+// この2つは別々の fetch で、どちらが先に解決するかは保証されない
+// (refreshServerStatus() の方が先に *発行* されるが、先に *解決* するとは限らない)。
+// 片方だけで同期すると、まだ反映されていないチェックボックス状態を見て空振りする。
+// そこで両方が揃った時点で1回だけ実行する。
+let TURBO_STEPS_KNOWN = false;
+let INITIAL_SETTINGS_APPLIED = false;
+let STEPS_SYNCED_ONCE = false;
+
+function maybeInitialStepSync() {
+  if (STEPS_SYNCED_ONCE || !TURBO_STEPS_KNOWN || !INITIAL_SETTINGS_APPLIED) return;
+  STEPS_SYNCED_ONCE = true;   // 以降はユーザーの編集を尊重して触らない
+  syncStepsToTurbo();
+}
+
+function syncStepsToTurbo() {
+  if (TURBO_STEPS_DEFAULT === null) return;
+  const turboDefault = String(TURBO_STEPS_DEFAULT);
+  if (turboEnabledEl.checked) {
+    if (stepsEl.value === '' || stepsEl.value === NON_TURBO_STEPS_DEFAULT) stepsEl.value = turboDefault;
+  } else {
+    if (stepsEl.value === turboDefault) stepsEl.value = NON_TURBO_STEPS_DEFAULT;
+  }
+}
+
 function applySettingsToControls(data) {
   CURRENT_SETTINGS = data;
   const i = data.instant, r = data.reload;
+  // このあとチェックボックス類がサーバ値で埋まる。turbo の状態が確定するのはここなので、
+  // 関数の最後で maybeInitialStepSync() を呼ぶ (宣言部のコメント参照)。
   if (RELOAD_TOUCHED === false) {
     // ユーザーがまだ手を触れていない項目だけサーバ値で上書きする(ポーリング中に
     // 入力中の値を消さないため)。初回ロード時は全項目未使用なのでここで全部埋まる。
@@ -1830,6 +1869,8 @@ function applySettingsToControls(data) {
   updateTurboAvailability();
   updateTeProjAvailability();
   updateReloadApplyState();
+  INITIAL_SETTINGS_APPLIED = true;
+  maybeInitialStepSync();
 }
 
 async function loadSettings() {
