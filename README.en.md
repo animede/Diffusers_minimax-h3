@@ -22,9 +22,11 @@ Japanese/English switch.*
 
 ## VRAM × feature matrix (measured 2026-08-11)
 
-○ = completes (measured) / △ = derived estimate (not yet measured) / × = OOM. All speeds are
-on this box's **PCIe Gen3 x4 slot + sm_89 (4060 Ti) + SDPA**; on a **Gen4 x16 slot the weight
-transfer is roughly 1/8** (see "An honest note on speed" below).
+○ = completes (measured) / △ = derived estimate (not yet measured) / × = OOM. **Times are
+steady-state** (second and later requests, excluding the initial model load); **peaks are
+torch's allocated peak**. The 16GB and 8GiB rows run 30 steps, the 48GB+20GB row turbo at 4
+steps. All speeds are on this box's **PCIe Gen3 x4 slot + sm_89 (4060 Ti) + SDPA**; on a
+**Gen4 x16 slot the weight transfer is roughly 1/8** (see "An honest note on speed" below).
 
 | Config | t2i 768² | t2va 5s 768² | ref2i | i2va (image ref) | audio ref | 768×1344 5s |
 |---|---|---|---|---|---|---|
@@ -80,7 +82,8 @@ down; nothing here was re-measured for this table.
 
 ### Cumulative: from the stock configuration to today
 
-48GB box (PRO 5000 48GB + RTX 4000 20GB), the `H3_LOWVRAM=1` family, 768².
+48GB box (PRO 5000 48GB + RTX 4000 20GB), the `H3_LOWVRAM=1` family, 768², **steady-state**
+(second and later requests, excluding the initial model load; t2va is 5s = 124 frames).
 
 | Stage | t2i (1 image) | t2va (5s) |
 |---|---|---|
@@ -109,11 +112,22 @@ H3_TURBO_LORA=1`).
 | **ref2i** 768² (reference still) | 79.3s | **47.0s (1.69x)** | 7.8s | 45.4GB | reference vision encode, **~47s** |
 | **i2va** 5s 768² (image reference to video) | 103.1s | **75.0s (1.37x)** | 22.0s | 45.9GB | the same ~47s, plus ~13s to reload the t2va transformer |
 
-"Per item in a run" is the cost per item when several are generated together with the same
-reference and settings (`/api/t2i_batch`, `/api/ref2i_batch`, `/api/ref2va_batch`). **The batch
-path is `H3_LOWVRAM=1`-only**, so that column runs a different configuration from the single
-column — the table pairs "the fastest way to make one" with "the fastest way to make N".
-Measured with 3 scenes for t2i/ref2i and 2 for i2va.
+**How to read these numbers** (measurement conditions):
+
+- **All steady-state; the initial load at server startup is excluded** (second and later
+  requests). Startup spends **about 50s** making the transformer and VAE resident, but that is
+  paid once per process.
+- **The reference modes differ on their first request only**: `transformer_ref` is loaded on the
+  first reference request rather than at startup, costing **+55s once** (measured for ref2i:
+  134.7s first, 79.3s steady). It stays resident afterwards.
+- Resolution pinned to **768×768**. Video is 5s = **124 frames** (24fps); stills are **22 frames**.
+- **4 steps with the turbo LoRA** (`H3_TURBO_LORA=1`). FirstBlockCache is auto-disabled by turbo;
+  attention is sage. Seed and prompt are fixed per mode.
+- "Per item in a run" is the cost per item when several are generated together with the same
+  reference and settings (`/api/t2i_batch`, `/api/ref2i_batch`, `/api/ref2va_batch`), measured
+  with 3 scenes for t2i/ref2i and 2 for i2va. **The batch path is `H3_LOWVRAM=1`-only**, so that
+  column runs a different configuration from the single column — the table pairs "the fastest way
+  to make one" with "the fastest way to make N".
 
 - **Every mode fits in 45-46GB**, so a single 48GB card runs the full feature set at
   near-peak speed. But **mixing the t2va family and the reference family in one process keeps
