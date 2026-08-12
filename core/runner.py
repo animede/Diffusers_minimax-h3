@@ -811,8 +811,16 @@ H3_TURBO_LORA = os.environ.get("H3_TURBO_LORA", "0").strip() == "1"
 # (README「Turbo LoRA 完成版のリリース待ち → lightx2v 版」節のスパイク実測参照)。
 # 旧 Ostris 版に戻すには REPO/FILE を larryvrh/MiniMax-H3-Turbo-Lora /
 # minimax_h3_turbo_4step.safetensors にする (bf16 経路専用のまま)。
+# 既定ファイルは 2026-08-12 に v0.1 -> 4step v1.0 768p へ切替 (README「2026-08-12」節の
+# スパイクで確認済み: 768p 版のほうが同じ4stepsで品質が上、scale/shift は下の
+# resolve_turbo_lora_scale()/H3_TURBO_VIDEO_SHIFT が metadata/ファイル名から自動導出する
+# ので追加の env 指定は不要)。旧 v0.1 に戻すには
+# H3_TURBO_LORA_FILE=minimax_h3_fl2v_turbo_4step_v0.1.safetensors を明示すればよい
+# (scale はその場で metadata フォールバック=0.094、shift は自動切替なしに戻る)。
 H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "lightx2v/Minimax-h3-Turbo")
-H3_TURBO_LORA_FILE = os.environ.get("H3_TURBO_LORA_FILE", "minimax_h3_fl2v_turbo_4step_v0.1.safetensors")
+H3_TURBO_LORA_FILE = os.environ.get(
+    "H3_TURBO_LORA_FILE", "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
+)
 
 # 既知の comfy (融合QKV) 形式リポジトリ。int8 との組み合わせ拒否 (import 時と
 # リクエスト時の両方) はこの形式のときだけ必要 -- diffusers ネイティブ形式は
@@ -855,10 +863,29 @@ if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
 # 蒸留されているため通常は不要。**turbo 4step v1.0 768p だけは video shift 6 で蒸留**
 # されており (上流 ModelTC/Minimax-H3-Turbo の Model specs 表: Training shifts 6 / 3)、
 # その LoRA を使うときは `H3_VIDEO_SHIFT=6` を併せて指定しないとサンプリング格子が
-# 蒸留時とずれる。適用箇所は `_load_vae` のスケジューラロード直後 (プロセスに1回。
+# 蒸留時とずれる。適用箇所は `_ensure_vaes` のスケジューラロード直後 (プロセスに1回。
 # scheduler は _pipe/_pipe_ref で同一オブジェクトを共有するため1箇所で足りる)。
 H3_VIDEO_SHIFT = os.environ.get("H3_VIDEO_SHIFT", "").strip()
 H3_AUDIO_SHIFT = os.environ.get("H3_AUDIO_SHIFT", "").strip()
+
+# turbo LoRA が有効なリクエストにだけ適用する video shift の上書き (既定は空 =
+# ファイル名から自動判定)。H3_VIDEO_SHIFT (上) はプロセス全体・全リクエスト共通の
+# 上書きなのに対し、こちらは「turbo=1 のリクエストのときだけ shift を切り替え、
+# turbo=0 のリクエストでは配布既定 (またはH3_VIDEO_SHIFTがあればそれ) に戻す」
+# リクエスト単位の切替 -- turbo は `cache`/`attn` と同じ instant-apply (リクエスト
+# ごとに on/off できる) なので、shift もそれに追従する必要がある (固定してしまうと
+# turbo=0 のリクエストが誤った格子で走る)。
+# 解決規則: 明示指定があればその値を最優先。空なら
+# H3_TURBO_LORA_FILE のファイル名に `_768p` を含むかどうかで自動判定する
+# (768p 系だけ video shift 6 で蒸留されている -- 上の H3_VIDEO_SHIFT のコメント参照)。
+# 該当しなければ「切替なし」(turbo=1 でも配布既定/H3_VIDEO_SHIFT のまま)。
+H3_TURBO_VIDEO_SHIFT_RAW = os.environ.get("H3_TURBO_VIDEO_SHIFT", "").strip()
+if H3_TURBO_VIDEO_SHIFT_RAW:
+    H3_TURBO_VIDEO_SHIFT: float | None = float(H3_TURBO_VIDEO_SHIFT_RAW)
+elif "_768p" in H3_TURBO_LORA_FILE:
+    H3_TURBO_VIDEO_SHIFT = 6.0
+else:
+    H3_TURBO_VIDEO_SHIFT = None
 if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
     raise RuntimeError(
         "H3_TURBO_LORA=1 with the comfy-format (fused-QKV) LoRA "
@@ -1868,13 +1895,53 @@ def turbo_lora_expected_format() -> str:
     return "comfy" if H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS else "diffusers"
 
 
-def resolve_turbo_lora_scale(lora_format: str) -> float:
-    """適用係数を解決する: H3_TURBO_LORA_SCALE が明示されていればそれ、空なら
-    形式ごとの実測既定 (comfy=1.0 / diffusers=0.094 -- 導出と強度スイープの実測は
-    H3_TURBO_LORA_SCALE のモジュールコメントと README を参照)。"""
+def resolve_turbo_lora_scale(lora_format: str, lora_path: str | None = None) -> float:
+    """適用係数を解決する。優先順位:
+
+    1. `H3_TURBO_LORA_SCALE` が明示されていればそれを最優先。
+    2. 未指定なら、`lora_path` のチェックポイント自身の safetensors metadata に
+       `alpha` があれば `scale = float(alpha) / rank` を使う (rank はソート済み
+       最初の `lora_A` キーの shape[0] -- lightx2v/Minimax-h3-Turbo の3ファイルは
+       いずれも128)。2026-08-12 に追加された v1.0 系 (8step/768p) はどちらも
+       metadata に `alpha` を持つ (8step: alpha='8' -> scale=0.0625, 768p:
+       alpha='128' -> scale=1.0 -- 実測でスパイク済み、README「2026-08-12」節参照)
+       ので、ここで自動導出できる。
+    3. metadata に `alpha` が無ければ (例: 旧 v0.1 ファイル) 形式ごとの実測既定へ
+       フォールバック: comfy=1.0 / diffusers=0.094 (導出と強度スイープの実測は
+       H3_TURBO_LORA_SCALE のモジュールコメントと README を参照)。
+
+    解決した scale とその出典を1行 logger.info する。
+    """
     if H3_TURBO_LORA_SCALE_RAW:
-        return float(H3_TURBO_LORA_SCALE_RAW)
-    return 1.0 if lora_format == "comfy" else 0.094
+        scale = float(H3_TURBO_LORA_SCALE_RAW)
+        logger.info("turbo LoRA scale resolved: %.4f (source=env H3_TURBO_LORA_SCALE)", scale)
+        return scale
+
+    if lora_path is not None:
+        try:
+            from safetensors import safe_open
+
+            with safe_open(lora_path, framework="pt") as f:
+                metadata = f.metadata() or {}
+                alpha_raw = metadata.get("alpha")
+                if alpha_raw is not None:
+                    lora_a_keys = sorted(k for k in f.keys() if ".lora_A." in k)
+                    rank = f.get_slice(lora_a_keys[0]).get_shape()[0]
+                    scale = float(alpha_raw) / rank
+                    logger.info(
+                        "turbo LoRA scale resolved: %.4f (source=metadata alpha=%s, rank=%d, file=%s)",
+                        scale, alpha_raw, rank, lora_path,
+                    )
+                    return scale
+        except Exception:
+            logger.warning(
+                "turbo LoRA metadata alpha probe failed for %s, falling back to format default",
+                lora_path, exc_info=True,
+            )
+
+    scale = 1.0 if lora_format == "comfy" else 0.094
+    logger.info("turbo LoRA scale resolved: %.4f (source=format-default, format=%s)", scale, lora_format)
+    return scale
 
 
 def apply_diffusers_turbo_lora(transformer, lora_path: str, scale: float) -> int:
@@ -2398,6 +2465,11 @@ class MiniMaxH3Runner:
         if H3_AUDIO_SHIFT:
             self._pipe.audio_scheduler.set_shift(float(H3_AUDIO_SHIFT))
             logger.info("audio scheduler shift overridden: %s (H3_AUDIO_SHIFT)", H3_AUDIO_SHIFT)
+        # turbo=1 のリクエストだけ video shift を切り替える `_apply_turbo_video_shift()`
+        # の「元に戻す」先。H3_VIDEO_SHIFT の上書きが上で既に適用された*後*に読むことが
+        # 重要 -- プロセス全体の base はこの値 (H3_VIDEO_SHIFT 指定時はそれ、未指定なら
+        # 配布 config の 12.0) であって、常に 12.0 ではない。
+        self._base_video_shift = self._pipe.scheduler.shift
         self._vae_loaded = True
         logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
                      "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
@@ -2578,7 +2650,8 @@ class MiniMaxH3Runner:
                 )
             return apply_turbo_lora(transformer, self._turbo_lora_path)
         return apply_diffusers_turbo_lora(
-            transformer, self._turbo_lora_path, resolve_turbo_lora_scale(lora_format)
+            transformer, self._turbo_lora_path,
+            resolve_turbo_lora_scale(lora_format, self._turbo_lora_path),
         )
 
     def _download_turbo_lora_if_needed(self):
@@ -3106,6 +3179,50 @@ class MiniMaxH3Runner:
             logger.debug("%s: turbo LoRA %s (%d wrapper modules)", label, "enabled" if turbo else "disabled", n)
         # else: turbo requested False and it was never wrapped in the first place --
         # nothing to do, the transformer's Linears are still the plain unwrapped ones.
+
+    def _apply_turbo_video_shift(self, turbo_effective: bool) -> None:
+        """Switch the (process-wide, shared) video scheduler's shift for this request,
+        based on the request's *resolved* turbo state (`instant["turbo"]`) -- turbo is a
+        per-request instant-apply setting (like `cache`/`attn`), so the shift a
+        turbo-distilled checkpoint needs has to follow it per-request too, not get
+        fixed at process start the way `H3_VIDEO_SHIFT` alone would.
+
+        No-op entirely when `H3_TURBO_VIDEO_SHIFT` (module-level, resolved from either
+        the env var or the configured turbo LoRA file's name -- see its own module
+        comment) is `None`: this happens for every non-`_768p` turbo LoRA file (v0.1,
+        8step v1.0), which were both distilled at the same shift the base model already
+        defaults to, so there is nothing to switch between turbo=1 and turbo=0 for.
+        Also effectively unreachable when `H3_TURBO_LORA=0` (LoRA disabled for this
+        process): callers only invoke this after `settings.resolve_instant_settings()`,
+        and `turbo_effective` can only be True if `H3_TURBO_LORA=1` unless a request
+        explicitly opts in via `turbo=True` -- but the request-level override is itself
+        rejected before reaching a transformer that never got the turbo LoRA structurally
+        wrapped (`_apply_turbo_setting` above only wraps lazily on `turbo=True`, and
+        every call site of this helper runs on the same request whose turbo flag it
+        checks). Must run before the request's `MiniMaxH3SetTimestepsStep` call(s) --
+        the scheduler bakes `shift` into the sigma schedule at `set_timesteps()` time.
+
+        `self._pipe.scheduler` and `self._pipe_ref.scheduler` are the same object
+        (single ModularPipeline shell, see `_ensure_pipe_ref_shell`'s docstring), so one
+        `set_shift()` call here covers both `generate()`/`generate_still_batch()` (t2va)
+        and `generate_ref2va()`/`generate_ref_batch()` (ref2va) call sites. Audio is
+        deliberately left untouched -- no turbo LoRA variant distilled at a different
+        audio shift has been observed (see `H3_VIDEO_SHIFT`'s module comment: video
+        12.0/audio 3.0 is the shared baseline, and the 768p checkpoint's own upstream
+        spec table only lists a different *video* training shift).
+        """
+        if H3_TURBO_VIDEO_SHIFT is None:
+            return
+        desired = H3_TURBO_VIDEO_SHIFT if turbo_effective else self._base_video_shift
+        scheduler = self._pipe.scheduler
+        if scheduler.shift == desired:
+            return
+        scheduler.set_shift(desired)
+        logger.info(
+            "turbo video scheduler shift %s: %.3f (turbo=%s, H3_TURBO_VIDEO_SHIFT=%.3f, base=%.3f)",
+            "applied" if turbo_effective else "restored", desired, turbo_effective,
+            H3_TURBO_VIDEO_SHIFT, self._base_video_shift,
+        )
 
     def apply_instant_settings(
         self,
@@ -4347,6 +4464,10 @@ class MiniMaxH3Runner:
         # generation's encode+denoise+decode, not the (much larger, one-time) model
         # loading peak from a cold start.
         torch.cuda.reset_peak_memory_stats()
+        # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
+        # inside the mode-specific branches below) -- see `_apply_turbo_video_shift`'s
+        # own docstring for why per-request rather than process-wide.
+        self._apply_turbo_video_shift(instant["turbo"])
 
         pipe = self._pipe
 
@@ -5296,6 +5417,10 @@ class MiniMaxH3Runner:
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
         torch.cuda.reset_peak_memory_stats()
+        # バッチは場面ループの外・リクエスト先頭で1回 (全場面共通の turbo 状態 -- この
+        # メソッドはプロンプト以外のパラメータが全場面共通という前提そのもの)。以降の
+        # 場面ループ内で回る `MiniMaxH3SetTimestepsStep` より前に必ず適用しておく。
+        self._apply_turbo_video_shift(instant["turbo"])
         pipe = self._pipe
 
         # --- encode 位相: TE 常駐のまま全場面を準備 ---
@@ -5726,6 +5851,10 @@ class MiniMaxH3Runner:
         # Reset peak stats after loading so the reported peak reflects this generation's
         # encode+denoise+decode, not the (much larger, one-time) model loading peak.
         torch.cuda.reset_peak_memory_stats()
+        # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
+        # inside the mode-specific branches below) -- see `generate()`'s matching call
+        # site and `_apply_turbo_video_shift`'s own docstring.
+        self._apply_turbo_video_shift(instant["turbo"])
 
         pipe = self._pipe_ref
 
@@ -6333,6 +6462,10 @@ class MiniMaxH3Runner:
             # 先に sync すると _pipe_ref.text_encoder が None のまま取り残される)。
             self._sync_shared_components_to_ref()
         torch.cuda.reset_peak_memory_stats()
+        # バッチは場面ループの外・リクエスト先頭で1回 (generate_still_batch() と同じ
+        # 理由 -- 全場面共通の turbo 状態を、以降の場面ループ内で回る
+        # `MiniMaxH3SetTimestepsStep` より前に適用しておく)。
+        self._apply_turbo_video_shift(instant["turbo"])
         pipe = self._pipe_ref
 
         # --- encode 位相 (TE 常駐): 全場面の setup + テキスト/参照ビジョンエンコード ---

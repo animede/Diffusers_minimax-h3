@@ -2438,6 +2438,60 @@ H3_TURBO_LORA=1 H3_TURBO_LORA_FILE=minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.sa
   H3_TURBO_LORA_SCALE=1.0 H3_VIDEO_SHIFT=6 ...
 ```
 
+→ 既定化後は `H3_TURBO_LORA=1` だけでこの構成になる。
+
+### 追記(同日): 既定化完了
+
+上の2点(scale のファイル metadata 自動導出・shift のリクエスト単位切替)を実装し、
+`core/runner.py` の既定 LoRA ファイルを 768p v1.0 へ切り替えた。
+
+- **`resolve_turbo_lora_scale(lora_format, lora_path)`**: `H3_TURBO_LORA_SCALE` 未指定時、
+  `lora_path` の safetensors metadata に `alpha` があれば `scale = alpha / rank`
+  (rank はソート済み最初の `lora_A` キーの shape[0]、3ファイルとも128) を使う。
+  `alpha` が無ければ従来どおり形式別既定(diffusers=0.094)にフォールバック。解決した
+  scale と出典を `logger.info` で1行出す。
+- **`H3_TURBO_VIDEO_SHIFT`**(新 env、既定は空): 空のときは `H3_TURBO_LORA_FILE` に
+  `_768p` を含むかどうかで自動判定(768p系のみ 6.0、それ以外は「切替なし」= `None`)。
+  `MiniMaxH3Runner._apply_turbo_video_shift(turbo_effective)` が
+  `generate()`/`generate_still_batch()`/`generate_ref2va()`/`generate_ref_batch()`
+  それぞれのリクエスト先頭(`MiniMaxH3SetTimestepsStep` より前、バッチは場面ループの外)
+  で呼ばれ、`instant["turbo"]`(リクエストの実効 turbo 状態)に応じて
+  `scheduler.set_shift(turbo_shift if turbo_effective else base_video_shift)` を行う
+  (`base_video_shift` は `_ensure_vaes` が `H3_VIDEO_SHIFT` 適用後に記録した値、
+  常に 12.0 とは限らない)。現在値と同じなら no-op。`H3_TURBO_VIDEO_SHIFT is None`
+  (768p 以外のファイル)のプロセスでは呼び出し自体が即 return する。
+- **既定ファイル変更**: `H3_TURBO_LORA_FILE` の既定を
+  `minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors` に変更。旧 v0.1 に戻すには
+  env で明示すればよい(scale はその場で 0.094 フォールバック、shift 自動切替なしに戻る)。
+
+設計からの逸脱は無し(タスク仕様どおりの実装)。
+
+#### 実機検証(96GB機、`CUDA_VISIBLE_DEVICES=0 H3_TRANSFORMER_QUANT=int8
+H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3
+H3_TURBO_LORA=1`、FILE/SCALE/SHIFT は一切未指定 = 新既定のみ)
+
+| 検証 | 結果 |
+|---|---|
+| 1. ユニット: `resolve_turbo_lora_scale` 3ファイル | v0.1→0.094 / 8step→0.0625 / 768p→1.0000、いずれも期待値と一致 |
+| 2. 起動ログ | 768p ファイル選択・`turbo LoRA scale resolved: 1.0000 (source=metadata alpha=128, rank=128, ...)` を確認 |
+| 3. turbo=1 (既定4steps) t2i seed 4242 | 8.95〜9.16s、ログに `turbo video scheduler shift applied: 6.000 (turbo=True, ..., base=12.000)`。PNG はクリーン、市松アーティファクトなし |
+| 4. turbo=0 30steps 等価性 | **既存ベースライン `outputs/t2i_1786507458.png`(MD5 `596a718e...`)は実は「v0.1・turbo=1・4steps」の結果**(README「その2」の `H3_KEEP_TRANSFORMER` 等価性検証の記録と一致)であって turbo=0/30steps ではなかったため、単純比較は無効と判明。turbo=0/30steps 自体は本タスクの往復検証(次項)で自己無矛盾を確認した |
+| 5. 往復リーク検査(turbo1→turbo0(30)→turbo1→turbo0(30)) | turbo=1 側3回すべて MD5 `d8bdffed4dce7694c2daf141f70f41a2` 一致、turbo=0(30steps)側3回すべて MD5 `f3622b6d0229feac608f2e4f666aa410` 一致。shift の適用/復元ログもリクエストごとに1回ずつ、期待どおり増減。リークなし |
+| 6. ref2va still=1 (ref2i) turbo=1 スモーク | 完走(147.0s、初回のみ transformer_ref ロード込み)。ログに shift 適用行あり。品質は参照人物の特徴(前髪・薄緑カーディガン・ネックレス)を保持、破綻なし |
+| 7. 旧ファイル後方互換(`H3_TURBO_LORA_FILE=...v0.1...`) | 起動ログで `scale=0.0940 (source=format-default)`、shift ログは一切出ない(=切替なし)。t2i turbo=1 完走、PNG MD5 `596a718e4b5cf9a0b907d2ec479225d2` が旧デフォルト構成の既知値と完全一致(岩肌の市松アーティファクトも再現、劣化ではなく忠実な再現) |
+
+**検証4で判明した重要事項**: タスク前提の「`outputs/t2i_1786507458.png` = turbo=0/30steps ベースライン」は誤りだった
+(実体は v0.1・turbo=1・4steps の結果)。shift 復元に実際のバグは無かった —
+往復検証(5)の自己無矛盾で正しさを確認済み。今後 turbo=0/30steps の基準値が要るときは、
+このタスクの検証5で得た `f3622b6d0229feac608f2e4f666aa410`(seed=4242, 768x768, 22frames,
+int8単騎+解放停止+投影TE構成)を新しい基準として使える。
+
+**変更前後の等価性も後追いで成立(同日、親側で確認)**: 本来意図していた「旧コードの
+turbo=0/30steps」の実物は `outputs/t2i_1786510342.png`(既定化*前*のコード・同構成で
+同日実測した 30steps)で、その MD5 は **`f3622b6d0229feac608f2e4f666aa410` — 新コードの
+turbo=0 出力と完全一致**。つまり「既定 LoRA を 768p に替え、リクエスト毎 shift 切替を
+入れても、turbo を使わない生成は1ビットも変わらない」ことがコード変更をまたいで実証された。
+
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
 ### 1. diffusers PR #14355 — **マージ済み(2026-08-05)、追従も完了(2026-08-09)**
