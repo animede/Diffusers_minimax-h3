@@ -123,76 +123,42 @@ H3_TURBO_LORA=1`).
 The batch phase-reordering is **`H3_LOWVRAM=1`-only** (`if H3_LOWVRAM:` in `app.py`), so the
 plain-mode configuration above **falls back to sequential**. The table below was therefore
 measured with `H3_LOWVRAM=1 H3_KEEP_TRANSFORMER=1` plus the projected TE and turbo (96GB box,
-46.7GB peak).
+**everything pinned to 768²**).
 
 | Mode | Single | Batch total | **Per item** | Speedup |
 |---|---|---|---|---|
-| t2i 768² | 7.65s | 3 scenes, 16.47s | **5.49s** | 1.39x |
-| ref2i 768² | 79.3s | 3 scenes, 148.9s | **49.6s** | 1.60x |
-| i2va 5s 768² | 103.1s | 2 scenes, 201.4s | **100.7s** | 1.02x |
+| t2i 768² | 7.65s | 3 scenes, 23.6s | **7.9s** | **0.97x (no gain)** |
+| ref2i 768² | 79.3s | 3 scenes, 140.9s | **47.0s** | **1.69x** |
+| i2va 5s 768² | 103.1s | 2 scenes, 150.1s | **75.0s** | **1.37x** |
 
-- **Residency shrank the point of batching.** Its purpose was to amortize model-load fixed
-  costs over a batch; with those costs gone, t2i is down to **1.39x** (it was **2.3x** —
-  157s to 67.5s — before residency).
-- **ref2i still gets 1.6x**, because the ~47s reference vision encode is shared across scenes
-  (about 90s saved over 3 scenes — exactly the two extra scenes' encodes).
-- **The ref2va (video) batch barely helps** (1.02x) — but **not because the sharing failed**.
-  The log timestamps show **exactly one ~47-48s encode block for ref2i (3 scenes) and for
-  ref2va (2 scenes) alike**, independent of scene count, so the prefix is shared in both. The
-  difference shows up elsewhere: **the batch's denoise runs heavier per scene than a single
-  request** (video: 84s for 2 scenes = 42s/scene against 22s/scene single; stills: 32s for 3
-  scenes = 10.7s/scene against 7.8s/scene). For stills the sharing gain wins; for video it is
-  cancelled out. **That per-scene overhead is not yet explained** (needs investigation).
+- **Batching no longer helps t2i** (0.97x, marginally slower). Its purpose was to amortize
+  model-load fixed costs over a batch, and **residency removed the cost there was to amortize**
+  (before residency it was 2.3x: 157s to 67.5s).
+- **The reference modes still benefit** (ref2i 1.69x, i2va 1.37x), because the ~47s reference
+  vision encode is shared across scenes. **The batch's per-step time matches a single request
+  exactly** (ref2i 2.598s vs 2.599s; i2va 7.321s vs 7.323s), so the batch path adds no overhead
+  of its own — the whole difference is how many times the encode is paid.
+- **The "sharing shrinks it" model holds for both** (single minus per-item batch, against the
+  encode the sharing removes, `47x(scenes-1)/scenes`):
 
-**Checking the "sharing shrinks it" model** (single minus per-item batch, against the encode
-the sharing removes, `47x(scenes-1)/scenes`):
+  | | Measured saving | Model's prediction | Difference |
+  |---|---|---|---|
+  | ref2i (3 scenes) | 32.3s/image | 31.3s/image | **+1.0s** |
+  | i2va (2 scenes) | 28.1s/video | 23.5s/video | **+4.6s** |
 
-| | Measured saving | Model's prediction | Difference |
-|---|---|---|---|
-| ref2i (3 scenes) | 29.7s/image | 31.3s/image | **-1.7s (essentially a match)** |
-| i2va (2 scenes) | 2.4s/video | 23.5s/video | **-21.1s (badly off)** |
-
-→ **The model holds for stills and fails for video.** Caching the reference encode should pay
-off as predicted for stills, but for video the gain is likely to be eaten by the unexplained
-cost above (see "Correcting the estimate" below).
+  → **Caching the reference encode across requests should deliver the calculated saving for
+  stills and video alike** (not implemented; see the dated 2026-08-12 section).
 - **Reference batches cannot be combined with `H3_TE_DEVICE`**: a guard rejects them with "the
   TE GPU needs 24GB or more". That threshold assumes **the 32B TE's vision activations** and is
   far too large for the 3.11GB projected TE (it rejects a 16GB 4060 Ti). Keeping the projected
   TE co-resident works. **Worth revisiting.**
 
-### Per-technique: how much it bought, and whether the output changes
-
-Equivalence: ◎ = **identical output MD5** at the same seed (mathematically a no-op) /
-○ = epsilon-level drift (not bit-identical, visually equivalent) / △ = an approximation or
-a different model (quality can change).
-
-| Technique | Flag | Measured effect | Equiv. | Measured on |
-|---|---|---|---|---|
-| On-disk cache of the quantized TE | `H3_TE_PREQUANT` (default on) | TE load 53.0→**29.5s**, whole request 128.6→**83.2s** (-35%) | ◎ | 48GB box |
-| Dropping the TE's unused upper layers | `H3_TE_PRUNE=1` | TE load 42.3→**35.0s** (-17%) | ◎ (byte-identical mp4) | 48GB box |
-| Parking the TE on a second GPU | `H3_TE_DEVICE=cuda:1` | t2i steady-state 78.4→**about 35s** (-55%) | ○ (sm difference, 0.084% relative RMS) | 48GB+20GB |
-| Keeping the transformer resident | `H3_KEEP_TRANSFORMER=1` | the per-request reload cost disappears → t2i **9.7s** / t2va **44.2s** | ◎ | 48GB+20GB |
-| FirstBlockCache | `H3_CACHE=fbc` (default) | denoise 157→**118s** (-25%, 7 of 30 steps skipped) | △ (skips steps) | 96GB box |
-| lightx2v turbo LoRA | `H3_TURBO_LORA=1` | t2va 351.4→**143s** (2.6x; denoise alone is 7.6x) | △ (4-step distillation) | 48GB box |
-| Batched still images | `/api/t2i_batch` | sequential 157→**67.5s/image** (3 scenes; asymptote ~31s) | ◎ | 48GB box |
-| Sharing the reference KV prefix across scenes | `H3_REF_PREFIX_CACHE` (default on) | reference encode 212.5→**83.1s**, ref2i batch 164.9→**116.7s/image** (-29%) | ○ (PSNR 21.9-27.4dB) | 48GB box |
-| Ultra-short clips for reference stills | `still=1` (124→22 frames) | denoise 102.2→**13.5s** (1/7.6) | — (different length, not comparable) | 48GB box |
-| Projected TE (replacing the 32B TE) | `H3_TE_PROJ` | t2i 65.7→**33.5s**, t2va 162.1→**143.5s** | △ (PSNR 22.4dB, visually on par) | 96GB box |
-
-### What cut VRAM
-
-| Change | Effect |
-|---|---|
-| int8 quantization of the transformer (`H3_TRANSFORMER_QUANT=int8`) | 66.3 → **34.0GB** |
-| NF4 for the projected TE (`H3_TE_PROJ`, default bnb-4bit) | TE residency 21.02 → **3.11GB** |
-| Dropping the TE's unused upper layers (`H3_TE_PRUNE=1`) | 21.01 → **17.44GB** |
-| fp16 decode for the video VAE (`H3_VIDEO_VAE_FP16=1`) | decode phase 16.29 → **about 11.4GB** |
-| Streaming the uint8 conversion (2026-08-10) | decode-phase intermediates +2.65 → **+0.03GB** |
-| Moving decode denormalization to the CPU (2026-08-12) | the **838MiB** bulk fp32 upcast at 768²×124 frames leaves the GPU |
-
-Stacking all of this is what produces the
-"[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" at the top — running on
-a single real 16GB card, and on 8GB×2.
+> **A measurement trap (walked into on 2026-08-12)**: comparing a batch against singles without
+> passing `height`/`width` on the batch side means **the batch generates on the server's default
+> 16:9 canvas (1344×768)** — 1.75x the pixels — which manufactures a nonexistent "the batch's
+> steps are 1.75x slower" effect. It was caught because the pixel ratio 1344×768÷768² = 1.75
+> matched the measured step-time ratio of 1.753 exactly. **Always pin the resolution when
+> comparing modes or code paths.**
 
 ## An honest note on speed
 
@@ -2711,22 +2677,27 @@ to reference-conditioned trajectories unchanged.**
   If the next request is also ref2va it is unnecessary, and the same "don't restore" judgment as
   `H3_KEEP_TRANSFORMER` could apply (**not implemented**).
 
-### Correcting the estimate (same day, after the batch measurements)
+### Confirming the estimate (same day, via the batch measurements)
 
-The initial estimate was that removing these two costs would take **i2va from 103s to about
-45s**. **The batch measurements that followed contradict it**, so the estimate is withdrawn.
-The batch path is literally the experiment "what happens if the reference encode is shared",
-and it showed:
+The estimate that removing these two costs takes **i2va from 103s to about 45s** is **supported
+by the batch measurements**. The batch path is literally the experiment "what happens if the
+reference encode is shared", and with everything pinned to 768²:
 
-- **Stills behave as predicted**: ref2i's measured saving of 29.7s/image against the sharing
-  model's 31.3s/image (off by 1.7s). **The caching gain arrives essentially as calculated.**
-- **Video does not**: i2va saved only 2.4s/video against a predicted 23.5s, off by 21.1s. The
-  encode itself ran only once (confirmed in the log), yet **the batch's denoise grew from 22s
-  to 42s per scene, consuming the entire sharing gain**.
+| | Single | Per item, batched | Measured saving | Model's prediction | Difference |
+|---|---|---|---|---|---|
+| ref2i (3 scenes) | 79.3s | 47.0s | 32.3s/image | 31.3s/image | **+1.0s** |
+| i2va (2 scenes) | 103.1s | 75.0s | 28.1s/video | 23.5s/video | **+4.6s** |
 
-So "**cross-request cache + no reload → i2va at 45s**" **has no evidential support right now**.
-The equivalent improvement does look reachable for stills (ref2i), but **no speedup can be
-promised for video until the per-scene denoise overhead in batching is understood**.
+**Stills and video both land on prediction** (slightly better, in fact). The batch's per-step
+time matches a single request (i2va 7.321s vs 7.323s), so the difference is purely how many
+times the 47s encode is paid. A cross-request cache (47s) plus dropping the reload (13s) gives
+**103.1 − 47 − 13 ≈ 43s**, consistent with the evidence as it stands (**still not implemented**).
+
+> **This was briefly withdrawn in error**: the first batch measurement omitted `height`/`width`
+> on the batch side only, so it generated at 1344×768 — 1.75x the pixels of 768² — which read as
+> "video gets no sharing benefit" and prompted a retraction. Matching the resolution made the
+> numbers agree. **Pin the resolution when comparing code paths** — see the boxed note in the
+> batching section above.
 
 ## Waiting on external events going forward (backlog, as of 2026-08-06)
 

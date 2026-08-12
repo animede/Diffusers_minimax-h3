@@ -875,3 +875,37 @@ delegated sub-agent's Bash has a 10-minute cap and can't wait for long-running g
 **Lesson**: verify long-running jobs with "launch + poll + collect logs", not "wait
 synchronously". Don't confuse a curl disconnect with the life/death of the server-side job
 (an HTTP connection is not the job's lifetime).
+
+## B11. Comparing code paths without pinning resolution "discovered" an effect that did not exist (2026-08-12)
+
+**What happened**: comparing the reference batch endpoints (`/api/ref2i_batch`,
+`/api/ref2va_batch`) against single requests (`/api/ref2va`) showed **the batch denoising 1.75x
+slower per step**. The ratio held at 1, 2 and 3 scenes, held with `H3_REF_PREFIX_CACHE=0`, and
+both paths were confirmed to be on the sage backend — so the conclusion was nearly "the batch
+path carries a scene-count-independent overhead".
+
+**Why**: the single-request curl passed `height=768 width=768`; **the batch curl did not**. When
+omitted, the server resolves H3's own 16:9 canvas, so only the batch generated at **1344×768** —
+**1.75x the pixels** of 768².
+
+**How it was pinned down**: reading the output mp4 dimensions with `av` showed 1344×768 versus
+768×768. The clincher was that **the pixel ratio 1344×768 ÷ 768² = 1.750 matched the measured
+step-time ratio 12.84 ÷ 7.323 = 1.753** almost exactly. Re-measured at matched resolution, the
+batch's per-step time matched a single request **exactly** (ref2i 2.598s vs 2.599s; i2va 7.321s
+vs 7.323s) — the batch path's overhead is actually zero.
+
+**Fallout**: that bad measurement was read as "video gets no benefit from sharing the reference
+encode", and the `i2va 103s → 45s` estimate was withdrawn from the README on the strength of it.
+Re-measured at matched resolution, the sharing model holds for stills and video alike (+1.0s and
++4.6s against prediction), and the estimate was reinstated.
+
+**Lessons**:
+1. **When comparing speed across code paths or modes, pin resolution, duration and step count
+   explicitly.** "Let the defaults apply" is not a comparison when the defaults differ per path.
+2. When a ratio lands on **a clean number like 1.75**, suspect geometry (pixel count, token
+   count) first. Checking input size is faster than auditing implementation differences.
+3. Output dimensions are readable from the artifact even when the result JSON's `height`/`width`
+   are `null`. **Verify measurement conditions from the artifacts, not the request.**
+4. Conclusions drawn from a bad measurement get retracted even after they are written down. Here
+   the "withdraw → re-measure → reinstate" history was kept in the README rather than quietly
+   edited away.
