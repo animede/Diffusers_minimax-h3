@@ -48,7 +48,9 @@ T2I and Ref2I are modes that substitute for image generation by "generating an u
 | `POST /api/ref2i_batch` | Batch of still images with references | references, frames, resolution, steps | prompt (per scene) |
 | `POST /api/ref2va_batch` | Batch of videos with references | references, seconds (same for all scenes, required) | prompt (per scene) |
 
-All of these are designed to amortize, once over the entire batch, the fixed cost of loading/freeing the model under `H3_LOWVRAM=1` (details in §4). In modes other than `H3_LOWVRAM=1` (large model resident), there is no gain from phase reordering, so the same API falls back to sequential generation.
+All of these are designed to amortize, once over the entire batch, the fixed cost of loading/freeing the model under `H3_LOWVRAM=1` (details in §4). The phase-reordering implementation is **`H3_LOWVRAM=1` only**; in other modes (large model resident) there is no gain, so the same API silently falls back to sequential generation.
+
+> **How this changed as of 2026-08-12**: now that the transformer can stay resident across requests, the load fixed cost that batching was meant to amortize is gone, so **`t2i_batch` no longer helps** (0.94x over 3 scenes — marginally slower; before residency it was 157s → 67.5s, a 2.3x win). The only batches that still pay off are the **reference ones** (`ref2i_batch` / `ref2va_batch`), where what gets shared is not model loading but the reference vision encode (about 47s/scene). See §4 and §6.
 
 ### LLM Prompt Enhancement
 
@@ -109,7 +111,7 @@ setup → encode → layout/latents/timesteps → denoise → after-denoise → 
 
 ### A structure in which both the transformer and transformer_ref slots live in a single pipe shell
 
-Ref2VA uses a dedicated checkpoint, `transformer_ref/` (same class and config as `transformer`, weights only differ). The text_encoder, VAEs, and processor are shared between both variants, and a single pipeline shell holds both the `transformer` and `transformer_ref` slots. In configurations with ample VRAM (int8 both resident, see §5), both are kept resident simultaneously, eliminating the T2VA⇔Ref2VA switching cost. In VRAM-constrained configurations, the approach switches to "keep only the active one resident, and free→reload on variant switch" (the currently resident variant can be checked via `active_variant` in `/api/status`).
+Ref2VA uses a dedicated checkpoint, `transformer_ref/` (same class and config as `transformer`, weights only differ). The text_encoder, VAEs, and processor are shared between both variants, and a single pipeline shell holds both the `transformer` and `transformer_ref` slots. In configurations with ample VRAM (int8 both resident, see §5), both are kept resident simultaneously, eliminating the T2VA⇔Ref2VA switching cost (but even at int8 that reaches **74.3GB**, so it is not an option on a single 48GB-class card; see §6). In VRAM-constrained configurations, the approach switches to "keep only the active one resident, and free→reload on variant switch" (the currently resident variant can be checked via `active_variant` in `/api/status`).
 
 ### Server Configuration
 
@@ -170,6 +172,7 @@ The two operate on independent layers and can be combined (sage + threshold 0.1 
 - **Why it can be combined with an int8-quantized transformer**: the lightx2v format's keys are diffusers-native (to_q/to_k/to_v separated), so applying it does not require `fuse_projections()` (which requires `torch.cat`). The older-generation comfy format (Ostris version, fused `qkv_proj`) requires `torch.cat`, and since `aten.cat` kernels are not implemented for int8-quantized `Int8Tensor`, it remains unusable in int8/low-VRAM mode. The apply function auto-detects the key format.
 - **Combination restriction**: it cannot be combined with `H3_LOWVRAM=group`, regardless of format (because `enable_group_offload`'s `cpu_param_dict` is fixed at the time it is enabled).
 - When turbo is enabled, FBC is automatically disabled.
+- **It also holds on the reference path (`transformer_ref`)** — verified visually on 2026-08-12; previously unverified. Even at 4 steps the reference subject's face, hairstyle, clothing color, and accessories stay faithful, and the person remains consistent from the first frame to the last. The same 0.094 scale as `transformer` works. Along with this, a mismatch was fixed: the three reference endpoints (`/api/ref2va`, `/api/ref2i_batch`, `/api/ref2va_batch`) were the only ones hardcoding `num_inference_steps` to 30, so they never picked up turbo's 4-step default — i.e. they ran 30 steps with the distillation LoRA attached.
 
 ### Offloading
 
@@ -183,13 +186,21 @@ Even when loaded onto the CPU with `device_map={"transformer": "cpu"}`, int8 qua
 
 1. **On-disk cache of the quantized text_encoder** (`H3_TE_PREQUANT`, default ON): saves the bnb-4bit quantized weights once, so subsequent runs only need to load them. TE load average 53.0s → **29.5s**.
 2. **Keeping TE resident on a second GPU** (`H3_TE_DEVICE=cuda:1`): keeps TE resident on a second GPU, reducing TE load time to zero for subsequent requests. Steady-state time for t2i turbo 4steps averages 78.4s → **about 35s (-55%)**.
-3. **Keeping transformer resident** (`H3_KEEP_TRANSFORMER=1`): does not free the transformer even during the decode phase. There are 3 conditions for this to hold (see §5.5). t2i turbo 4steps drops to a steady-state **9.7s/image**.
+3. **Keeping transformer resident** (`H3_KEEP_TRANSFORMER=1`): does not free the transformer even during the decode phase (conditions in §5). On the **48GB machine** (`H3_LOWVRAM=1` + TE on a second GPU), t2i turbo 4steps drops to a steady-state **9.7s/image**.
 
 Output equivalence has been confirmed at every stage via same-seed MD5/PNG exact match (only for moving TE to a second GPU, architecture differences between sm_120 and sm_89 cause bit mismatches from rounding error, but the relative RMS difference of 0.084% stays within the level of trajectory drift).
+
+### Extending "stop freeing for the decode window" to plain mode (2026-08-12)
+
+`H3_KEEP_TRANSFORMER` was initially `H3_LOWVRAM=1` only, but it turned out that **plain mode (`H3_LOWVRAM=0`, large model resident) was also freeing the transformer just for the decode window and reloading it immediately afterwards** (measured 11.9–12.3s per request). That free came from a budget that assumes **the 32B TE sits on the compute GPU** ("TE-nf4 21GB + transformer bf16 66.3GB + VAE fp32 11GB = 98.5GB > 96GB"), and the assumption does not hold once the TE is not on that GPU (bf16 66.3 + fp16 decode 11.4 = 77.7GB). Since the other two conditions are exactly what plain mode needs as well, **relaxing only the first condition to "`H3_LOWVRAM` must not be `group`"** was enough (the branch that skips the free was already shared, and the restore side `_ensure_transformer` is idempotent, so no extra implementation was needed).
+
+The effect on the 96GB machine, int8 on a single card: **19.58s → 7.40s (2.6x)**. PNGs generated with `H3_KEEP_TRANSFORMER` 0 vs 1 under otherwise identical conditions are an **exact MD5 match** (`596a718e4b5cf9a0b907d2ec479225d2`), so stopping the free is mathematically inconsequential. Per-configuration measurements are in §6.
 
 ### fp16-ification of the video VAE
 
 `H3_VIDEO_VAE_FP16=1` converts only the video VAE weights to fp16 (9.70GB → 4.85GB, decode peak 16.29GB → about 11.4GB). The audio VAE stays in fp32 and is never cast (because converting it to bf16 has a known issue of reducing the generated audio's volume by about 20dB). Quality is a mean PSNR of **39.97dB** (min 39.08) across all 124 frames, visually indistinguishable.
+
+> **About the decode peak figures**: both 16.29GB and ~11.4GB were measured **before** the "de-normalization moved to the CPU in decode" fix described below (2026-08-11). That fix removed the whole-length fp32 tensors from the GPU side, so the real peak should now be lower — but **it has not been re-measured**. Every budget calculation in this document that uses 16.29 / 11.4GB (§5's inequalities, the `H3_KEEP_TRANSFORMER` conditions) is therefore conservative by that margin.
 
 ### Reaching the Low-VRAM Goals, and the Three Fixes That Took (2026-08-11 to 12)
 
@@ -204,7 +215,7 @@ Along the way, three issues latent in combinations that are only ever exercised 
 2. **fp16 autocast on `vae.encode`**: `H3_VIDEO_VAE_FP16=1` casts the VAE weights to fp16, but upstream was asymmetric — **decode has its own autocast, but the encode side (reference and keyframe conditioning) does not**. As a result, fp16 VAE × references dies instantly on a dtype mismatch regardless of VRAM amount. This was resolved by wrapping `vae.encode` in `_load_vae` with an fp16 autocast symmetric with the decode side.
 3. **Returning the pinned host cache when freeing group**: group offload places ~34GB of int8 weights in pinned host memory. del+gc leaves them in torch's host-side caching allocator, never returned to the OS (`empty_cache()` is device-side only), so the t2va↔ref2va mode switch was permanently rejected by the RAM guard. Calling `torch._C._host_emptyCache()` (a private API, getattr-guarded) at free time, only in group mode, made the switch work for the first time.
 
-For the detailed narrative of the pitfalls, see addenda B1–B10 in the internal report.
+For the detailed narrative of the pitfalls, see addenda B1–B11 in the internal report.
 
 ### KV Prefix Sharing for Reference Batches
 
@@ -225,6 +236,14 @@ decode  : [VAE pair]       decode all scenes → save (saved as each scene finis
 
 The key implementation detail is resetting the mutable state shared across scenes. Because the scheduler's sigma/timestep values are identical across all scenes (same geometry, same step count), it suffices to reset `_step_index = None` (since `MiniMaxH3Scheduler.step()` re-derives the index from the timestep value), and FirstBlockCache calls `_reset_stateful_cache()` + `cache_context` per scene. Matching mp4/PNG MD5s against sequential generation demonstrates that the phase reordering is mathematically inconsequential.
 
+**The batch path itself adds zero overhead** — batched step time matches single-request step time exactly (ref2i 2.598s vs 2.599s single, i2va 7.321s vs 7.323s). So the batch win is determined solely by how many times a shareable fixed cost is *not* paid, and the simple model `saving = shareable fixed cost × (scenes-1)/scenes` matches the measurements well (ref2i 3 scenes: measured 32.3 vs predicted 31.3s/image; i2va 2 scenes: measured 28.1 vs predicted 23.5s/clip).
+
+Constraints and standing as of 2026-08-12:
+
+- **`t2i_batch` no longer helps** (0.94x), because the load fixed cost it was meant to share disappeared once the transformer stays resident (before residency it was 157s → 67.5s, 2.3x). Only reference batches still pay off, and what they share is the reference vision encode (about 47s/scene).
+- Phase reordering is **`H3_LOWVRAM=1` only** (a branch in `app.py`); any other configuration silently falls back to sequential generation behind the same API.
+- **Reference batches cannot be combined with `H3_TE_DEVICE`**: they are rejected with a 400 by the guard that requires 24GB+ on the TE GPU (§5; `ValueError` → `HTTPException(400)`). That threshold assumes the 32B TE's vision activations and is far too large for the projected TE's 3.11GB residency (**needs revisiting, not yet fixed**).
+
 ---
 
 ## 5. Handling by VRAM Capacity
@@ -244,7 +263,7 @@ The mode can be derived as a function of VRAM capacity. When the GPU changes, re
 | transformer_ref bf16 / int8 | 61.7GB / about 34GB |
 | vae + audio_vae (fp32) | 11.0GB |
 | Denoise activations | about 5–6.6GB (measured 6.6GB at 768², 5 seconds) |
-| Decode peak | 16.29GB (about 11.4GB with video VAE fp16) |
+| Decode peak | 16.29GB (about 11.4GB with video VAE fp16). Both predate the CPU de-normalization fix and have not been re-measured (§4) |
 | Additional cost of ref2va reference encoding | +3.2GB or more against TE (vision tower at 2048px short side, measured lower bound) |
 | CUDA context etc. (non-PyTorch) | about 1GB |
 
@@ -264,16 +283,16 @@ If something needs to stay resident across requests, add its size to each phase 
 
 ### Recommended Configuration Table by Capacity
 
-Revised 2026-08-10 / measurements folded in 2026-08-11, with the projected TE at NF4 (3.11GB
-resident) and the reduced decode phase (7.53GB with fp16 + the uint8 fix). Everything not
+Revised 2026-08-10 / measurements folded in 2026-08-11 and 08-12, with the projected TE at NF4
+(3.11GB resident) and the reduced decode phase (7.53GB with fp16 + the uint8 fix). Everything not
 marked "measured" is a derivation. For the projected TE's caveats (no `<d>` tags, approximate
 detail; the ref2va vision path was verified visually on 2026-08-11) see §4.
 
 | Capacity (effective) | 32B TE route | Projected TE (NF4) route |
 |---|---|---|
-| 96GB | bf16 TE+transformer resident (measured) | unnecessary |
-| 48GB (~49.8) | `H3_LOWVRAM=1`, swap per request (measured). With a 20GB 2nd GPU: 9.7s/44.2s (measured) | everything resident at once, expected 44.7GB (margin ~5.1GB, **unmeasured**, needs a guard change) |
-| 32GB (~30.5) | `group` (nf4 21 + blocks 1.4 + activations 6.6 = 29, barely) | `group` with room to spare (~11.1GB) |
+| 96GB | bf16 TE+transformer resident (measured) | Useful as the way to get the 32B TE off the compute GPU. bf16 transformer + projected TE + no decode-window free is the current fastest (t2i 6.89–7.08s, peak 74.2–77.3GB, measured, §6) |
+| 48GB (~49.8) | `H3_LOWVRAM=1`, swap per request (measured). With a 20GB 2nd GPU: 9.7s/44.2s (measured on the 48GB machine) | **Everything resident at once now holds** (guard relaxed). int8 transformer + projected TE + no decode-window free gives a **45.6GB peak** (measured on the 96GB machine; ~4.2GB margin against the ~49.8GB effective budget). **Not yet confirmed on a real 48GB card** |
+| 32GB (~30.5) | `group` (nf4 21GB + blocks 1.4GB + activations 6.6GB = 29GB, barely) | `group` with room to spare (~11.1GB) |
 | 24GB (~22.4) | `group`+`H3_TE_PRUNE=1` required (measured) | `group` with room to spare (~11.1GB) |
 | 16GB (~15.2) | not possible (the 17.45GB TE doesn't fit) | **Measured (2026-08-11)**: a real RTX 4060 Ti 16GB **alone** runs t2i/t2va/ref2i/i2va/audio-reference/768×1344, all to completion (peak 7.4–15.2GB). Opens the previously-impossible 16GB tier |
 
@@ -296,23 +315,37 @@ Specifying a GPU via `H3_TE_DEVICE` keeps TE resident on that GPU continuously; 
 | Projected 4B bf16 | 8.88GB (measured) + ε | 12GB (thin) / 16GB+ |
 | Projected 4B NF4 | 3.11GB (measured) + ε | **measured at 8GiB-class (2026-08-11)** (resident on the TE side of an 8GiB×2 setup, running t2i/t2va/ref2i). 6GB-class is derived |
 
-It follows that ref2va requires an effective 20.7GB or more, i.e. a GPU with a catalog capacity of 22.2GB or more (a 24GB card would have an effective ~22.4GB, giving about 1.7GB headroom, but this is not guaranteed since 2 or more references increase the requirement further).
+It follows that ref2va requires an effective 20.7GB or more, i.e. a GPU with a catalog capacity of 22.2GB or more (a 24GB card would have an effective ~22.4GB, giving about 1.7GB headroom, but this is not guaranteed since 2 or more references increase the requirement further). The runner implements this as a guard: if the TE GPU's total capacity is **under 24GB, ref2va is explicitly rejected** (`_te_external_usable_for()`).
 
-Layering `H3_KEEP_TRANSFORMER=1` on top makes it possible to keep the transformer resident even during the decode phase. All 3 of the following conditions are required:
+> **That 24GB threshold still assumes the 32B TE.** It is calibrated on the 32B TE's vision activations and is far too large for the projected TE's 3.11GB residency, so it rejects setups that use a 16GB card as the TE GPU (this is also why reference batches cannot be combined with `H3_TE_DEVICE`). **Needs revisiting, not yet fixed.**
 
-1. `H3_LOWVRAM=1` (`group` is not eligible)
-2. `H3_TE_DEVICE` is set (without TE on a separate GPU, the resident transformer-int8 34.3GB + TE-nf4 17.45GB = 51.75GB would break the encode phase first)
+Layering `H3_KEEP_TRANSFORMER=1` on top makes it possible to keep the transformer resident even during the decode phase. All 3 of the following conditions are required, and a missing one raises a `RuntimeError` at import time (condition 1 was relaxed on 2026-08-12, condition 2 on 2026-08-11; the primary source is the `H3_KEEP_TRANSFORMER` guard and its design comment in `core/runner.py`):
+
+1. `H3_LOWVRAM` must **not be `group`** (both `1` and `0` (plain) are eligible). Only `group` is excluded, since it is a different design that keeps the transformer resident on the CPU and streams it block by block. With `1` this removes the per-request reload fixed cost; with `0` (plain) it removes the per-decode-window free/reload (11.9–12.3s).
+2. Either `H3_TE_DEVICE` **or** `H3_TE_PROJ` is set — i.e. **do not put the 32B TE on the compute GPU**. If you do, the *encode* phase (not decode) breaks first: TE-nf4 17.45GB + resident transformer-int8 34.3GB = 51.75GB, over the ~49.8GB effective budget. The projected TE is only 3.11GB at NF4, so 3.11 + 34.03 + 6.6GB of denoise activations = 43.7GB fits on the same GPU, satisfying this condition on its own.
 3. `H3_VIDEO_VAE_FP16=1` (with fp32 decode, transformer 34.3GB + decode peak 16.29GB = 50.6GB doesn't fit in 48GB; with fp16 it's 45.7GB, which fits)
 
-### Recommended Launch Command (Current 48GB + 20GB Configuration)
+### Recommended Launch Commands
+
+**Two-GPU 48GB + 20GB (32B TE route)**:
 
 ```bash
 H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
-To nearly eliminate the fixed cost further, add `H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`.
+To nearly eliminate the fixed cost further, add `H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1` (on the 48GB machine: t2i steady-state 9.7s/image, t2va 5s 44.2s). This assumes a two-GPU configuration where GPU0 (48GB) is fixed for transformer duties, and GPU1 (20GB) is used to keep TE resident. To show only GPU0 (a configuration where TE is not placed on a separate GPU), start with `CUDA_VISIBLE_DEVICES=0` and `H3_LOWVRAM=1` alone. **Drop `H3_TE_DEVICE` when you want ref2va** (a 20GB TE GPU is rejected by the guard above).
 
-This assumes a two-GPU configuration where GPU0 (48GB) is fixed for transformer duties, and GPU1 (20GB) is used to keep TE resident. To show only GPU0 (a configuration where TE is not placed on a separate GPU), start with `CUDA_VISIBLE_DEVICES=0` and `H3_LOWVRAM=1` alone.
+**Single GPU, projected TE route (the fastest tier as of 2026-08-12; measured on the 96GB machine, 45.6GB peak)**:
+
+```bash
+H3_TRANSFORMER_QUANT=int8 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 \
+  H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_TURBO_LORA=1 \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+```
+
+This keeps the int8 transformer and the projected TE (NF4) resident together on one GPU and also stops the decode-window free. The 45.6GB peak fits inside the ~49.8GB effective budget of a 48GB-class card, but **this has not been confirmed on a real 48GB card** (only that a peak measured on the 96GB machine fits the 48GB budget). Note that the measurement prefixed `CUDA_VISIBLE_DEVICES=0` to expose just one card of the two-GPU 96GB machine; a genuinely single-GPU host does not need it.
+
+**Single 16GB / 8GiB×2 (projected TE + group offload)**: see "Quick start by VRAM class" in the README for launch examples. The core is `H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1`, and anything other than sm_120 additionally requires `H3_ATTN_BACKEND=default` (the default sage is an sm_120-only build).
 
 For more detailed, per-phase patterns of what stays resident, see [docs/RESIDENCY.en.md](RESIDENCY.en.md).
 
@@ -332,7 +365,11 @@ For more detailed, per-phase patterns of what stays resident, see [docs/RESIDENC
 | 32GB class (`H3_LOWVRAM=group`) | 28.7GB | about 280s |
 | 18GB class (`H3_LOWVRAM=group H3_TE_PRUNE=1`) | 17.7GB | about 280–320s |
 
-**Measurements for each mode on RTX PRO 5000 48GB + `H3_LOWVRAM=1` (current configuration, since 2026-08-07)**:
+These are the pre-2026-08-12 baselines. On the 96GB machine with int8 on a single card and no decode-window free, the same 30 steps now give t2va 155.0s (no FBC) / 121.5s (with FBC) — see "Per-Mode Results" below.
+
+> **Which machine a number comes from**: below, the **96GB machine** = RTX PRO 6000 Blackwell 96GB + an added RTX 4060 Ti 16GB, and the **48GB machine** = RTX PRO 5000 Blackwell 48GB + RTX 4000 SFF Ada 20GB. The same number is not comparable across boxes, so each table states which one it is.
+
+**Measurements for each mode on the 48GB machine with `H3_LOWVRAM=1` (since 2026-08-07)**:
 
 | Mode | Time | Notes |
 |---|---|---|
@@ -343,6 +380,40 @@ For more detailed, per-phase patterns of what stays resident, see [docs/RESIDENC
 | t2i_batch (still image batch, 3 scenes) | 67.5s/image | marginal cost about 31s/image |
 | ref2i_batch (still image with reference, 3 scenes) | 116.7s/image | including KV prefix sharing |
 | ref2va_batch (video with reference, 2 scenes, 5 seconds) | 401.6s/clip | marginal cost about 330s/clip (asymptotically about 32% shorter as scene count grows) |
+
+### Fastest Configurations After Stopping the Decode-Window Free (96GB machine, 2026-08-12)
+
+**turbo 4steps, 768², steady state** (second and later requests after server start; t2va is 5 seconds = 124 frames). The TE is the projected TE (NF4, 3.11GB) in every row.
+
+| Configuration | t2i | t2va 5s | Peak | GPUs |
+|---|---|---|---|---|
+| bf16 + TE@GPU1 + no decode-window free | **6.89s** | **26.8s** | 74.2GB + 3.2GB | 2 |
+| bf16 single card (TE on GPU0 too) + no free | 7.08s | 27.04s | 77.3GB | 1 |
+| **int8 single card + no free (best practical)** | **7.40s** | **28.13s** | **45.6GB** | 1 |
+| int8 + `H3_LOWVRAM=1` + KEEP + TE@GPU1 | 7.65s | 28.56s | 42.5GB | 2 |
+| int8 single card, with free (`H3_KEEP_TRANSFORMER=0`) | 19.58s | — | 39.8GB | 1 |
+| bf16 + TE@GPU1, with free | 19.9s | 40.0s | 68.9GB | 2 |
+
+- bf16 denoises faster than int8 (t2i 2.05–2.07s vs 2.39–2.40s, t2va 14.05s vs 14.81s), but it **needs a 77GB-class card**. The gap to int8 on a single card is only about 7%, so which one to pick depends on the card you own.
+- **Where the TE lives no longer matters**: single card 7.08s vs two cards 6.89s is a 2.7% difference. The old "t2i is 2x different depending on where the TE lives" (15.23s vs 7.65s) was **an artifact of the era when the free was still happening**; once it is stopped, one card is enough.
+- The fastest configuration peaks at 45.6GB, which shows the speed comes not from capacity but from **running with zero fixed cost**.
+
+### Per-Mode Results (96GB machine, int8 single card, no decode-window free, 2026-08-12)
+
+**turbo 4steps, 768², steady state.** Video is 5 seconds = 124 frames; stills are 22 frames.
+
+| Mode | Single request | Per item in a batch | Denoise | Peak |
+|---|---|---|---|---|
+| t2i 768² | 7.40s | 7.9s (0.94x = no benefit) | 2.40s | 45.0GB |
+| t2va 5s 768² | 28.13s | (no batch API) | 14.94s | 45.6GB |
+| ref2i 768² (still with reference) | 79.3s | 47.0s (1.69x) | 7.8s | 45.4GB |
+| i2va 5s 768² (image reference → video) | 103.1s | 75.0s (1.37x) | 22.0s | 45.9GB |
+
+Without turbo, at 30 steps: t2i 27.42s / t2va 155.0s (no FBC), 21.41s / 121.5s (with FBC), ref2i 148.4s, i2va 290.3s.
+
+- **First-request cost**: making the transformer + VAEs resident at startup takes about 50 seconds (once per process). The reference family is the exception: `transformer_ref` is cold-loaded on the first reference request, so that request costs **+55 seconds** (measured on ref2i: 134.7s first, 79.3s steady).
+- **All modes fit in 45–46GB**, but **mixing the t2va family and the reference family in one process keeps both transformers resident, at 74.3GB** (and a peak of 77.3GB once it returns to t2va). On a single 48GB card, run separate processes per mode.
+- **The bottleneck for the reference family is the reference vision encode, not denoising.** Breakdown of i2va's 103.1s (from log timestamps): reference vision encode ~47s / denoise 22.0s / decode + VAE round trip ~10s / reference VAE encode ~6s / reloading the t2va transformer at the end ~13s. This is why turbo buys less here (2.8x on i2va) than on t2va (5.5x). **A cross-request reference-encode cache (47s) and a "don't switch back to t2va" decision (13s) are both unimplemented.**
 
 ### Lineage of Speedups
 
@@ -357,7 +428,9 @@ For more detailed, per-phase patterns of what stays resident, see [docs/RESIDENC
 | + Turbo LoRA 8 steps (opt-in) | **about 88s** |
 | + Turbo 4 steps (draft use) | about 40s |
 
-Lineage of fixed-cost reduction on the 48GB machine (t2i turbo 4steps): 157s (right after the GPU swap) → 83.2s (`H3_TE_PREQUANT`) → about 35s (`H3_TE_DEVICE`) → **9.7s** (`H3_KEEP_TRANSFORMER`). For t2va at 5 seconds, 768²: 351.4s without turbo at 30 steps → 143s with turbo → 60.5s → **44.2s** (8.0x).
+Lineage of fixed-cost reduction on the 48GB machine (t2i turbo 4steps): 157s (right after the GPU swap) → 83.2s (`H3_TE_PREQUANT`) → about 35s (`H3_TE_DEVICE`) → **9.7s** (`H3_KEEP_TRANSFORMER`, 16x). For t2va at 5 seconds, 768²: 351.4s without turbo at 30 steps → 143s with turbo → 60.5s → **44.2s** (8.0x).
+
+Those **9.7s / 44.2s are the 48GB machine's record** and are still correct for that configuration — but they are **no longer the fastest**: on 2026-08-12 the 96GB machine reached **7.40s / 28.13s** with int8 on a single card (no decode-window free), and **6.89s / 26.8s** with two cards and bf16 (tables above). The boxes differ so the numbers are not directly comparable, but the reason for the update is not the card — it is stopping the decode-window free.
 
 ### Measured Peak VRAM
 
@@ -372,6 +445,15 @@ Denoise and decode do not overlap in time (the transformer is always freed immed
 ### Honest Speed and Quality Characteristics of Low-VRAM Configurations
 
 Single 16GB and 8GiB×2 **are viable** (all features run to completion), but speed and quality have configuration-specific quirks. The sources of the numbers are stated to avoid misreading.
+
+**Measurements (taken on the RTX 4060 Ti 16GB added to the 96GB machine; `H3_LOWVRAM=group` + projected TE (NF4) + fp16 decode + SDPA, 30 steps, 2026-08-11)**:
+
+| Configuration | t2i 768² | t2va 5s 768² | ref2i | i2va (image reference) | audio reference | 768×1344 5s |
+|---|---|---|---|---|---|---|
+| Real 16GB single card (TE co-resident) | 498s, peak 7.4GB | 25 min, 11.4GB | (not run — it already works on 8GiB×2) | 39 min, 9.41GB | 54 min, 11.96GB | 66 min, 13.37GB (15.2GB by nvidia-smi = practical ceiling) |
+| 8GiB×2 (compute side + TE side, ballast-simulated) | 512s, 6.4GB | 25.6 min, 7.23GB | 17.7 min, 6.69GB | × denoise OOM | × denoise OOM | × denoise OOM |
+
+**8GiB×2 goes up to ref2i.** Video with references has a longer sequence by the reference tokens, so even the shortest case (768², 5s) does not fit its denoise activations in 8GiB (measured requirement: 9.41GB). **A single 16GB card runs the reference family too.**
 
 - **group is bottlenecked on per-step weight transfer.** Because the 2nd slot on the verification box is **Gen3 x4 (effective ~3.5GB/s)**, single-16GB is heavy at t2i 16.5s/step and t2va 49.8s/step. This is a value of "this slot", not "the 16GB card's performance", and **a proper Gen4 x16 slot would transfer ~1/8** (checkable via nvidia-smi's `pcie.link.gen/width`). Don't confuse it with the card's compute performance.
 - **On the int8+SDPA trajectory, FirstBlockCache doesn't work** (`cache_skipped_steps: 0`, threshold 0.05). In contrast to the PRO 6000 + sage + bf16 trajectory where most steps were skipped, on int8+SDPA the residual never drops below the threshold. "Doesn't work" ≠ "broken"; it's trajectory-dependent, with up to a 2x headroom from threshold tuning (unverified).
@@ -417,7 +499,7 @@ All claims about quality or performance — VRAM, time required, PSNR, MD5, ASR 
 | `H3_TE_PREQUANT_MIN_FREE_GB` | `25` | Skips saving if free disk space falls below this (generation continues) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` quantizes the transformer from 66.3GB→34GB |
 | `H3_LOWVRAM` | `0` | `1` = phase-cycling for 48GB class / `group` = block-level offload for 24-32GB class |
-| `H3_KEEP_TRANSFORMER` | `0` | Under `H3_LOWVRAM=1`, keeps the transformer resident even during the decode phase (3 conditions required, see §5) |
+| `H3_KEEP_TRANSFORMER` | `0` | Keeps the transformer resident even during the decode phase. Requires all 3 of: `H3_LOWVRAM` not `group` (either `1` or `0`), either `H3_TE_DEVICE` or `H3_TE_PROJ`, and `H3_VIDEO_VAE_FP16=1` (see §5) |
 | `H3_VIDEO_VAE_FP16` | `0` | Converts the video VAE to fp16 (audio VAE is excluded) |
 | `H3_CACHE` | `fbc` | Enables FirstBlockCache (`none` disables it) |
 | `H3_CACHE_THRESHOLD` | `0.05` | FBC's cache-skip decision threshold |
