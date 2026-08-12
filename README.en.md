@@ -2555,6 +2555,48 @@ it should make bf16 the fastest option (roughly t2i 8s / t2va 28s at full-precis
 `H3_KEEP_TRANSFORMER` currently requires `H3_LOWVRAM=1`, so the right fix is an equivalent
 "don't free" decision on the plain-mode side. **Not implemented.**
 
+## 2026-08-12 (part 2): stopping the decode-window free — t2i 7.4s on a single GPU at 45.6GB, and the 48GB-tier goal falls out
+
+"Waste 2" above was fixed on the spot. **The change is one import-time guard condition**:
+`H3_KEEP_TRANSFORMER` used to require `H3_LOWVRAM=1`; that was relaxed to "anything but
+`group`", so plain mode (`H3_LOWVRAM=0`) can skip the decode-window free too. The branch that
+skips the free (`if H3_KEEP_TRANSFORMER: pass`) was already shared, and the restore path's
+`_ensure_transformer` is idempotent, so **no additional implementation was needed**. The other
+two conditions (the TE is not on GPU0, i.e. `H3_TE_DEVICE` or `H3_TE_PROJ`; and
+`H3_VIDEO_VAE_FP16=1`) are exactly what makes plain mode fit as well (66.3 + 11.4 fp16 decode
+= 77.7GB).
+
+### All configurations compared (96GB box, turbo 4 steps, 768²)
+
+| Configuration | t2i steady-state | t2va 5s | Peak | GPUs |
+|---|---|---|---|---|
+| bf16 + TE on GPU1 + **no free** (B) | **6.89s** | **26.8s** | 74.2GB + 3.2GB | 2 |
+| bf16 **single GPU** (TE on GPU0) + no free (A) | 7.08s | 27.04s | 77.3GB | 1 |
+| **int8 single GPU + no free (C)** | 7.40s | 28.13s | **45.6GB** | 1 |
+| int8 + `H3_LOWVRAM=1` + KEEP + TE on GPU1 (previous best) | 7.65s | 28.56s | 42.5GB | 2 |
+| int8 single GPU, **with the free** (C at KEEP=0) | 19.58s | — | 39.8GB | 1 |
+| bf16 + TE on GPU1, with the free (previous section) | 19.9s | 40.0s | 68.9GB | 2 |
+
+**Equivalence**: configuration C and the same configuration at `H3_KEEP_TRANSFORMER=0` produce
+a PNG with an **identical MD5** (`596a718e4b5cf9a0b907d2ec479225d2`). Skipping the free is
+mathematically a no-op, and the same image comes out in **19.58s → 7.40s (2.6x)**.
+
+### What this establishes
+
+- **Where the TE lives no longer matters.** Single GPU (TE on GPU0) at 7.08s versus two GPUs
+  (TE on GPU1) at 6.89s is a 2.7% difference. **The second GPU only mattered while the free was
+  still there** — the "2x difference from TE placement" in the previous section was an artifact
+  of that free.
+- **The free itself was the cost** (2.6x under otherwise identical settings).
+- **The practical optimum is configuration C**: int8, single GPU, **45.6GB peak**. Against a
+  48GB-tier effective budget of about 49.8GB that leaves roughly 4.2GB of headroom, so **a
+  single 48GB card can run within 7% of the fastest configuration**. The backlog item
+  "[TE + transformer co-resident on the 48GB box](#unverified-important)" is satisfied in this
+  form (not yet confirmed on the physical 48GB box — this is the 96GB box's measured peak
+  shown to fit the 48GB budget).
+- bf16 denoises faster than int8 (t2i 2.05-2.07s vs 2.39-2.40s) but **needs a 77GB-class
+  card**. Whether that beats int8's 45.6GB at a 7% penalty depends on the card you have.
+
 ## Waiting on external events going forward (backlog, as of 2026-08-06)
 
 ### 1. diffusers PR #14355 — **merged (2026-08-05), migration also complete (2026-08-09)**

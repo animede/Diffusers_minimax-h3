@@ -573,9 +573,24 @@ if H3_LOWVRAM_ANY:
 # transformer(int8) 34.3GB + デコードピーク **fp16** 11.4GB = 45.7GB で入る見込み
 # (未検証、余裕 ~4GB)。fp32 デコードピーク 16.29GB では 34.3+16.29=50.6GB で
 # 入らないため、H3_VIDEO_VAE_FP16=1 が必須 (RESIDENCY.md §5.6)。
+#
+# **plain モード (H3_LOWVRAM=0) にも適用 (2026-08-12 に条件1を緩和)**: plain モードは
+# transformer をリクエスト間は常駐させているが、**デコード窓だけは解放して直後に
+# 再ロードする** (実測 11.9-12.3s/リクエスト)。この解放は「TE-nf4 21GB +
+# transformer bf16 66.3GB + VAE fp32 11GB = 98.5GB > 96GB」という 32B TE 前提の収支から
+# 来たもので、**TE が GPU0 に居ない構成 (条件2) では前提が成立しない**:
+# 66.3 + fp16 デコード 11.4 = 77.7GB (投影TE を同居させても +3.11 で 80.8GB)。
+# つまり条件2・3 がそのまま plain モードの成立条件でもあるので、条件1を
+# 「group でないこと」に緩めるだけでよい (解放をスキップする分岐は共通、復元側の
+# `_ensure_transformer` は冪等なので no-op になる)。bf16 のデノイズは int8 より
+# 5-14% 速い (t2i 2.07s vs 2.40s) ため、96GB 級ではこちらが最速になりうる。
+# **注意**: 66.3+11.4=77.7GB なので実質 80GB 級以上が必要 (48GB 級では bf16
+# transformer 自体が載らないので自動的に対象外)。溢れた場合もデコードの try/except が
+# steady state を復元してから re-raise する。
+#
 # 成立条件 (3つとも必須、欠けたら import 時に RuntimeError):
-#   1) H3_LOWVRAM == True (raw "1" のみ。"group" は対象外 -- このフラグの目的は
-#      lowvram=1 の毎リクエスト再ロード固定費の削減であって、group モードは
+#   1) H3_LOWVRAM が "group" でないこと ("1" = 毎リクエストの再ロード固定費を削減、
+#      "0"/plain = デコード窓の解放/再ロードを削減。"group" だけは対象外 --
 #      そもそも transformer を常駐させたまま CPU/GPU 間を group offload する
 #      別設計なので無関係)
 #   2) H3_TE_DEVICE が設定済み (TE が別GPU)。そうでないと **デコード位相ではなく
@@ -588,12 +603,11 @@ if H3_LOWVRAM_ANY:
 H3_KEEP_TRANSFORMER = os.environ.get("H3_KEEP_TRANSFORMER", "0").strip() == "1"
 if H3_KEEP_TRANSFORMER:
     _keep_transformer_missing = []
-    if not H3_LOWVRAM:
+    if H3_LOWVRAM_GROUP:
         _keep_transformer_missing.append(
-            f"H3_LOWVRAM must be '1' (got {H3_LOWVRAM_RAW!r}) -- this flag only removes "
-            "H3_LOWVRAM=1's per-request transformer reload cost; 'group' mode already "
-            "keeps its transformer resident via a different (CPU+block-offload) design "
-            "and is unrelated"
+            f"H3_LOWVRAM must be '1' or '0' (got {H3_LOWVRAM_RAW!r}) -- 'group' mode "
+            "already keeps its transformer resident via a different (CPU+block-offload) "
+            "design and is unrelated"
         )
     if not H3_TE_DEVICE and not H3_TE_PROJ:
         # この条件は **32B TE を前提にした収支** から来ている: TE-nf4 17.45GB +
@@ -619,9 +633,9 @@ if H3_KEEP_TRANSFORMER:
         )
     if _keep_transformer_missing:
         raise RuntimeError(
-            "H3_KEEP_TRANSFORMER=1 requires H3_LOWVRAM=1 AND H3_TE_DEVICE set AND "
-            "H3_VIDEO_VAE_FP16=1 (see this flag's module comment for the VRAM budget "
-            "derivation). Missing: " + "; ".join(_keep_transformer_missing)
+            "H3_KEEP_TRANSFORMER=1 requires H3_LOWVRAM != 'group' AND (H3_TE_DEVICE set "
+            "OR H3_TE_PROJ set) AND H3_VIDEO_VAE_FP16=1 (see this flag's module comment "
+            "for the VRAM budget derivation). Missing: " + "; ".join(_keep_transformer_missing)
         )
 
 # "group" mode's own RAM guard (see H3_LOWVRAM_GROUP's design comment further down):
