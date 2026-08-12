@@ -988,6 +988,7 @@ const I18N = {
     'turbo.incompatible.lowvram': '低VRAMモード(lowvram={lowvram})と comfy形式 turbo LoRA の組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています',
     'turbo.incompatible.bothResident': 'transformer/transformer_ref 両方常駐(int8)と comfy形式 turbo LoRA の組み合わせは実測で不可のため無効化しています',
     'hint.turboDisablesCache': 'turbo有効時はFirstBlockCacheが自動的に無効化されます',
+    'hint.dialogueNeedsTe32B': '⚠ 台詞タグ <d> は投影TEでは使えません。「再ロードが必要な設定」パネルで投影TEをOFF（=32B TE）にして適用してください（再起動不要、常駐は3.11GB→21GBに増加）。このまま生成するとエラーになります。',
     'size.actualSize': '実際の生成サイズ: 幅{w}×高さ{h}',
     'size.rounded': '(入力値を{multiple}の倍数へ丸め)',
     'size.overNative': ' ※ネイティブ範囲(最大{max})超え・VRAMと品質は未検証',
@@ -1175,6 +1176,7 @@ const I18N = {
     'turbo.incompatible.lowvram': 'Disabled because low-VRAM mode (lowvram={lowvram}) combined with the comfy-format turbo LoRA is known not to work (Int8Tensor does not support aten.cat)',
     'turbo.incompatible.bothResident': 'Disabled because having both transformer/transformer_ref resident (int8) combined with the comfy-format turbo LoRA is known not to work',
     'hint.turboDisablesCache': 'FirstBlockCache is automatically disabled while turbo is enabled',
+    'hint.dialogueNeedsTe32B': '⚠ The <d> dialogue tag does not work with the projected TE. Turn the projected TE off (= 32B TE) in the reload settings panel and apply (no restart needed; residency grows from 3.11GB to 21GB). Generating as-is will fail.',
     'size.actualSize': 'Actual generation size: {w}×{h} (width×height)',
     'size.rounded': ' (input rounded to a multiple of {multiple})',
     'size.overNative': ' * Exceeds the native range (max {max}) — VRAM usage and quality are unverified',
@@ -1298,8 +1300,23 @@ function updateTurboAvailability() {
 function updateInstantHint() {
   const parts = [];
   if (turboEnabledEl.checked) parts.push(t('hint.turboDisablesCache'));
+  // 投影TE が ON のまま <d> 入りプロンプトを送ると、エンコード段で 400 になる
+  // (4B の語彙に H3 固有の台詞タグが無い)。生成を投げる前に気づけるよう、
+  // プロンプト欄に <d> があるうちは常に出しておく。TE の自動切替はしない方針なので、
+  // ここは「投影TEをOFFにしてください」と案内するだけ。
+  if (promptHasDialogueTag() && reloadTeProjEl && reloadTeProjEl.checked) {
+    parts.push(t('hint.dialogueNeedsTe32B'));
+  }
   instantHintEl.textContent = parts.join(' / ');
 }
+
+function promptHasDialogueTag() {
+  const el = document.getElementById('prompt');
+  return !!(el && /<d>/i.test(el.value || ''));
+}
+
+document.getElementById('prompt').addEventListener('input', updateInstantHint);
+if (reloadTeProjEl) reloadTeProjEl.addEventListener('change', updateInstantHint);
 
 cacheEnabledEl.addEventListener('change', () => {
   cacheThresholdEl.disabled = !cacheEnabledEl.checked;
