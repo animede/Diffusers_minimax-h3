@@ -72,6 +72,63 @@ venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 For finer per-tier launch examples (80/48/32/18GB) and every environment variable, see
 "[VRAM support table and main environment variables](#vram-support-table-and-main-environment-variables-quick-reference)".
 
+## What the speedups bought (measured summary)
+
+**This repository's central finding: the bottleneck was not denoising but the fixed cost of
+loading and freeing models.** The numbers below are collected from the sections further
+down; nothing here was re-measured for this table.
+
+### Cumulative: from the stock configuration to today
+
+48GB box (PRO 5000 48GB + RTX 4000 20GB), the `H3_LOWVRAM=1` family, 768².
+
+| Stage | t2i (1 image) | t2va (5s) |
+|---|---|---|
+| Stock configuration (30 steps, no turbo) | 157s | 351.4s |
+| + lightx2v turbo LoRA (4 steps) | 157s | 143s |
+| + `H3_TE_PREQUANT` (on-disk cache of the quantized TE) | 83.2s | — |
+| + `H3_TE_DEVICE` (TE parked on a second GPU) | about 35s | 60.5s |
+| + `H3_KEEP_TRANSFORMER` (transformer stays resident) | **9.7s** | **44.2s** |
+| | **16x** | **8.0x** |
+
+Turbo — the one change that actually speeds up denoising — **tops out at 2.6x**. The
+remaining 3x-plus all comes from eliminating fixed costs (even at 30 steps without turbo,
+removing the fixed costs alone takes t2i from 157s to 51.1s, a 3x gain).
+
+### Per-technique: how much it bought, and whether the output changes
+
+Equivalence: ◎ = **identical output MD5** at the same seed (mathematically a no-op) /
+○ = epsilon-level drift (not bit-identical, visually equivalent) / △ = an approximation or
+a different model (quality can change).
+
+| Technique | Flag | Measured effect | Equiv. | Measured on |
+|---|---|---|---|---|
+| On-disk cache of the quantized TE | `H3_TE_PREQUANT` (default on) | TE load 53.0→**29.5s**, whole request 128.6→**83.2s** (-35%) | ◎ | 48GB box |
+| Dropping the TE's unused upper layers | `H3_TE_PRUNE=1` | TE load 42.3→**35.0s** (-17%) | ◎ (byte-identical mp4) | 48GB box |
+| Parking the TE on a second GPU | `H3_TE_DEVICE=cuda:1` | t2i steady-state 78.4→**about 35s** (-55%) | ○ (sm difference, 0.084% relative RMS) | 48GB+20GB |
+| Keeping the transformer resident | `H3_KEEP_TRANSFORMER=1` | the per-request reload cost disappears → t2i **9.7s** / t2va **44.2s** | ◎ | 48GB+20GB |
+| FirstBlockCache | `H3_CACHE=fbc` (default) | denoise 157→**118s** (-25%, 7 of 30 steps skipped) | △ (skips steps) | 96GB box |
+| lightx2v turbo LoRA | `H3_TURBO_LORA=1` | t2va 351.4→**143s** (2.6x; denoise alone is 7.6x) | △ (4-step distillation) | 48GB box |
+| Batched still images | `/api/t2i_batch` | sequential 157→**67.5s/image** (3 scenes; asymptote ~31s) | ◎ | 48GB box |
+| Sharing the reference KV prefix across scenes | `H3_REF_PREFIX_CACHE` (default on) | reference encode 212.5→**83.1s**, ref2i batch 164.9→**116.7s/image** (-29%) | ○ (PSNR 21.9-27.4dB) | 48GB box |
+| Ultra-short clips for reference stills | `still=1` (124→22 frames) | denoise 102.2→**13.5s** (1/7.6) | — (different length, not comparable) | 48GB box |
+| Projected TE (replacing the 32B TE) | `H3_TE_PROJ` | t2i 65.7→**33.5s**, t2va 162.1→**143.5s** | △ (PSNR 22.4dB, visually on par) | 96GB box |
+
+### What cut VRAM
+
+| Change | Effect |
+|---|---|
+| int8 quantization of the transformer (`H3_TRANSFORMER_QUANT=int8`) | 66.3 → **34.0GB** |
+| NF4 for the projected TE (`H3_TE_PROJ`, default bnb-4bit) | TE residency 21.02 → **3.11GB** |
+| Dropping the TE's unused upper layers (`H3_TE_PRUNE=1`) | 21.01 → **17.44GB** |
+| fp16 decode for the video VAE (`H3_VIDEO_VAE_FP16=1`) | decode phase 16.29 → **about 11.4GB** |
+| Streaming the uint8 conversion (2026-08-10) | decode-phase intermediates +2.65 → **+0.03GB** |
+| Moving decode denormalization to the CPU (2026-08-12) | the **838MiB** bulk fp32 upcast at 768²×124 frames leaves the GPU |
+
+Stacking all of this is what produces the
+"[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" at the top — running on
+a single real 16GB card, and on 8GB×2.
+
 ## An honest note on speed
 
 **The low-VRAM configs run, but they are slow.** `H3_LOWVRAM=group` streams the int8 weights
