@@ -489,6 +489,23 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
 # at once and keeps the existing one-resident-at-a-time behaviour unchanged.
 H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
 
+# ref2va リクエストの終わりに、入口で解放した t2va 用 `transformer` を**その場で**
+# 積み直すか (2026-08-12 に既定を「積み直さない」へ変更)。
+#
+# 旧既定 (eager) の問題: 復元は**そのリクエストの所要時間に含まれる**ため、ユーザーは
+# 自分の動画とは無関係なロードを待たされる (実測 12.5s、初回は 36.9s)。しかも次も
+# ref2va なら入口でまた解放されるので**完全な無駄**であり、復元した瞬間に両 transformer
+# が載って VRAM 高水位が 49GB → 74.3GB へ跳ね上がる (48GB 級で運用する場合に致命的)。
+# 元のコメントが根拠にしていた収支は 32B TE (21GB) 前提のもので、投影TE (3.11GB) を
+# 使う現在の既定構成には当てはまらない。
+#
+# 遅延 (既定) にしても壊れない理由: t2va リクエストは入口で `_switch_to_variant("t2va")`
+# → `_ensure_transformer()` を必ず通り、未ロードならそこでロードする (冪等)。つまり
+# コストは**消える**のではなく、**それを必要とするリクエスト側へ移る**。連続 ref2va では
+# まるごと消え、ref2va→t2va と切り替えたときだけ t2va 側が払う。
+# 旧挙動に戻すには H3_EAGER_VARIANT_RESTORE=1。
+H3_EAGER_VARIANT_RESTORE = os.environ.get("H3_EAGER_VARIANT_RESTORE", "0").strip() == "1"
+
 # EXPERIMENTAL, opt-in. "0" (default) = every mode above is untouched -- this flag is
 # read nowhere else unless it is "1" or "group". "1" = 48GB-class low-VRAM mode: TE
 # (bnb-4bit nf4, ~21GB) and the big transformer (int8, ~34GB) are never allowed to be
@@ -6219,7 +6236,7 @@ class MiniMaxH3Runner:
                         # the two big reloads are not competing for VRAM at the same time,
                         # mirroring generate()'s own force_free_te reload ordering.
                         self._load_text_encoder(progress)
-                    if H3_TRANSFORMER_BOTH_RESIDENT:
+                    if H3_TRANSFORMER_BOTH_RESIDENT and H3_EAGER_VARIANT_RESTORE:
                         # Restore the int8 both-resident steady state (`transformer` +
                         # `transformer_ref` + TE-nf4 all resident) for the *next* request.
                         # `transformer` (t2va's) was freed at this method's entry to make
