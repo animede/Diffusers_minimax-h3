@@ -2761,6 +2761,47 @@ group offload は turbo と併用不可(`cpu_param_dict` の制約)で 30 ステ
 > 緩めるときは、その先に未走行のコードがあると想定して検証すること(今回は緩和 →
 > 即 device 不一致 → 修正、という順で顕在化した)。
 
+## 2026-08-13: `upscale=1`(2段アップスケール)が壊れている — PR #14355 移行の取り残し
+
+「小さく生成してアップスケール」で 48GB に収める案を検証しようとして発覚。**現在の
+コードでは `upscale=1` が必ず失敗する**(今日の変更とは無関係の既存不具合)。
+
+```
+`token_tags` and `timestep_indices` must both be `(seq_len,)` tensors matching
+`position_ids`, got [21760] and [85696] for seq_len=21760
+```
+
+turbo 4steps でも 8steps でも同じで、**ステップ数には依存しない**。
+
+### 原因
+
+hires-fix のパス2は、解像度が変わるのでレイアウト(`position_ids`/`token_tags`/各 indices)を
+`build_packed_sequence()` で作り直す。この再構築は `2edc525`(PR #14355 **以前**)に書かれ、
+**`block_state.token_tags = ...` のように block_state の属性へ直接代入**している。
+
+ところがマージ版(f37ab93)の `MiniMaxH3DenoiseStep` は、レイアウト値を
+**`block_state.denoiser_input_fields`(新設の `kwargs_type` グループ)経由で読む**ように
+変わった。この dict は state 側の出力から組まれるため、**属性代入だけでは反映されない**。
+結果、`row_timestep_plan`(こちらは `state.set()` で書いている)だけがパス2の長さ(85696)に
+なり、`token_tags`/`position_ids` はパス1のまま(21760)で不整合になる。
+
+**移行時の回帰セットに upscale が入っていなかった**のが根本原因(第1段は t2i/t2va/バッチ、
+第2段は ref2va 系で、`upscale=1` は対象外だった)。
+
+### 修正方針(未実装)
+
+再構築した各テンソルを **`state.set()` で書き戻す**(`row_timestep_plan` と同じ扱いにする)。
+その上で 768²→1536² の実行と、旧実測(96GB機・bf16時代: 645s / ピーク 88.0GB)に対する
+現構成(int8 + 投影TE)でのピーク再測定が要る。
+
+### なお、今回の用途(48GB で 1344×768 の ref2va)には**そもそも使えない**
+
+`upscale=1` は **t2va 専用**で、`fl2va` は明示的に `ValueError`、`ref2va` にはそもそも
+経路が無い(`still=1` との併用も拒否)。さらに **低VRAMモード(`H3_LOWVRAM=1`/`group`)では
+400 で拒否**される(パス2の系列長が約4倍になるため未検証扱い)。したがって
+「小さく生成して upscale」は参照系の VRAM 対策にはならず、**TE を2枚目GPUへ逃がす**のが
+引き続き正解(前節の実測: 49.73GB → 46.36GB)。
+
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
 ### 1. diffusers PR #14355 — **マージ済み(2026-08-05)、追従も完了(2026-08-09)**
