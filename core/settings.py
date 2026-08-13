@@ -429,15 +429,27 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
         # now-invalid turbo=on state for the next request to trip over. Mirrors
         # validate_instant_settings()'s own rule, evaluated against the *proposed* new
         # state instead of the current one.
-        if runner.H3_TURBO_LORA and (new_lowvram_any or new_transformer_both_resident):
+        # comfy 形式(融合QKV)の LoRA だけが int8/lowvram と非互換 (Int8Tensor に
+        # aten.cat カーネルが無い)。diffusers ネイティブ形式 (lightx2v、2026-08-08 の
+        # c49ce1e で解禁・現在の既定) は int8/both_resident/lowvram=1 と併用可能で、
+        # validate_instant_settings() (上) と constraints (下) は当時この条件で緩和済み
+        # だったが、**この apply 側ガードだけ条件が付け忘れられていた** (2026-08-13 の
+        # 回帰監査で発覚)。その結果、H3_TURBO_LORA=1 のプロセスでは new_transformer_
+        # both_resident が int8 で常に真になり、te_proj 切替を含む**あらゆる**
+        # /api/settings/apply が一律 400 になっていた (リロード設定 UI が実質使用不能)。
+        if (
+            runner.H3_TURBO_LORA
+            and runner.turbo_lora_expected_format() == "comfy"
+            and (new_lowvram_any or new_transformer_both_resident)
+        ):
             raise ValueError(
                 "Cannot apply this reload configuration while the turbo LoRA default "
                 "(H3_TURBO_LORA env var) is on: lowvram/transformer_both_resident are "
-                "confirmed incompatible with turbo (Int8Tensor has no aten.cat kernel, "
-                "see validate_instant_settings()'s docstring). Note this only refers to "
-                "the startup env var default, not any single request's instant turbo=1 "
-                "override (those are validated independently, per request, by "
-                "validate_instant_settings())."
+                "confirmed incompatible with the comfy-format turbo LoRA (Int8Tensor "
+                "has no aten.cat kernel, see validate_instant_settings()'s docstring). "
+                "Note this only refers to the startup env var default, not any single "
+                "request's instant turbo=1 override (those are validated independently, "
+                "per request, by validate_instant_settings())."
             )
 
         # ---- resolve the actual H3_TE_PROJ string to commit ----

@@ -2134,11 +2134,15 @@ reloadApplyBtn.addEventListener('click', async () => {
   const fd = new FormData();
   fd.append('transformer_quant', reloadTransformerQuantEl.value);
   fd.append('te_quant', reloadTeQuantEl.value);
-  fd.append('te_prune', reloadTePruneEl.checked ? '1' : '');
-  fd.append('te_proj', reloadTeProjEl.checked ? '1' : '');
+  // bool 項目は '0' を送る (空文字は不可 -- FastAPI の Optional[bool] は '' を
+  // None=「変更なし」に解釈するため、'' だと OFF が**黙って無視**される。
+  // 2026-08-13 の回帰監査ケース15の検証中に発覚: リロードパネルからは te_proj 等を
+  // 一度も OFF にできていなかった)。
+  fd.append('te_prune', reloadTePruneEl.checked ? '1' : '0');
+  fd.append('te_proj', reloadTeProjEl.checked ? '1' : '0');
   fd.append('te_proj_quant', reloadTeProjQuantEl.value);
   fd.append('lowvram', reloadLowvramEl.value);
-  fd.append('video_vae_fp16', reloadVideoVaeFp16El.checked ? '1' : '');
+  fd.append('video_vae_fp16', reloadVideoVaeFp16El.checked ? '1' : '0');
   try {
     const res = await fetch('/api/settings/apply', { method: 'POST', body: fd });
     const data = await res.json();

@@ -2930,6 +2930,53 @@ markup 側の `style="display:none;"` だけ外しても `updateStillControls()`
 「小さく生成して upscale」は参照系の VRAM 対策にはならず、**TE を2枚目GPUへ逃がす**のが
 引き続き正解(前節の実測: 49.73GB → 46.36GB)。
 
+## 2026-08-13: 全機能の回帰監査 — 21項目、実バグ2件を発見・修正
+
+upscale が「回帰セット外だったため4日間壊れたまま」だった事故を受けて、**全エンドポイント・
+全経路の監査**を実施した(等価性アンカー2件・実行テスト16件・静的精査3件)。
+
+### 結果: 19/21 健全。発見した実バグは2件(いずれも設定リロード系、修正済み)
+
+**バグ1: `/api/settings/apply` が turbo 既定 ON のプロセスで一律 400**(`core/settings.py`)。
+comfy 形式 LoRA の非互換ガード(2026-08-06)を、diffusers ネイティブ形式の解禁(08-08)の際に
+`validate_instant_settings` と UI 用 `constraints` では形式条件付きに緩和したのに、
+**apply 側の1箇所だけ条件を付け忘れていた**。int8 では `transformer_both_resident` が常に
+真になるため、**あらゆるフィールドの適用が拒否**され、リロード設定 UI が実質使用不能だった
+(`<d>` のために案内している「投影TEをOFF」もこの経路 — 案内が機能していなかった)。
+他2箇所と同じ `turbo_lora_expected_format() == "comfy"` 条件を追加して修正。
+
+**バグ2: リロードパネルの bool 項目が UI から OFF にできない**(`static/index.html`)。
+バグ1の修正を検証中に発覚。UI は OFF を**空文字**で送るが、FastAPI の `Optional[bool]` は
+空文字を **None=「変更なし」に解釈**するため、te_proj/te_prune/video_vae_fp16 の OFF は
+**黙って無視**されていた。`'0'` を送るよう修正。
+
+**修正後の検証(往復 E2E)**: te_proj OFF 適用 → 32B TE で `<d>[Japanese] こんにちは</d>`
+入り t2va が**受理されて完走** → te_proj ON へ復帰 → 通常生成 8.03s。案内していた
+`<d>` の運用がこれで実際に機能する。
+
+### 環境起因1件(コードのバグではない)
+
+ref2va_batch + TE@GPU1 が OOM — ただし GPU1 には別サービス(ace-server、約10GB)が常駐して
+おり、純粋な容量不足。**`_te_external_usable_for()` の閾値判定は「TE用GPUの総容量」だけを
+見ており、他プロセスの使用量を見ない**ため、同居環境では判定を通過してから実行時に OOM する。
+実測空きを見る判定への変更は設計判断が要るため未実施(参照枚数で必要量が変わり、固定の
+床値では1枚参照の成功ケースを誤って弾く)。
+
+### 監査で確認できた健全性(抜粋)
+
+- 等価性アンカー2件とも一致: turbo=0 基底経路(`f3622b6d`)・旧 v0.1 LoRA 後方互換(`596a718e`)
+- 未検証だった経路が全て PASS: fl2va の last_image のみ/両端指定、複数参照、音声参照+尺自動
+  導出、mute×バッチ、バッチ×turbo(steps 既定4)、**バッチ×外部TE**(ガード緩和で初開通の
+  経路 — ref2i_batch は device 不一致なく完走)、LLM brief/translate、concat
+- 静的精査: hires と同型の「denoiser_input_fields 更新漏れ」は他に無し。死んだ旧 API 参照も無し
+
+### 回帰基準(regression_baselines.json)の再設計が必要
+
+現行9ケースは **48GB機 + 32B TE(cuda:1)+ v0.1 LoRA 前提**で、96GB機では 32B TE が
+16GB の cuda:1 に載らず**全件再現不能**。さらに監査で判明した空白: fl2va・複数参照・
+音声参照・mute・upscale・**投影TE経路**(現在の実用構成なのに1件も無い)・both_resident 構成・
+settings/apply 往復・旧LoRA後方互換・バッチ×turbo。基準セットの作り直しは別途(方針判断待ち)。
+
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
 ### 1. diffusers PR #14355 — **マージ済み(2026-08-05)、追従も完了(2026-08-09)**
