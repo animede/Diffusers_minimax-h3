@@ -760,7 +760,11 @@
         </div>
       </div>
 
-      <div class="row" id="upscale-row">
+      <!-- 2026-08-13: upscale は UI から非表示 (機能自体は残す)。表示の可否は JS 側の
+           `UPSCALE_UI_VISIBLE` 一箇所で決まる -- ここの style だけ外しても
+           `updateStillControls()` がモード切替のたびに display を上書きするので戻らない。
+           理由と実測は README の「upscale=1 は基本的に使わなくてよい」節および懸念リスト。 -->
+      <div class="row" id="upscale-row" style="display:none;">
         <label style="display:flex;align-items:center;gap:8px;">
           <input type="checkbox" id="upscale" style="width:auto;">
           <span data-i18n="label.upscale">2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ)</span>
@@ -1331,6 +1335,12 @@ const ref2vaBatchEl = document.getElementById('ref2va-batch');
 const ref2vaStillHintEl = document.getElementById('ref2va-still-hint');
 const secondsColEl = document.getElementById('seconds-col');
 const upscaleRowEl = document.getElementById('upscale-row');
+// UI に upscale のチェックボックスを出すかどうか (2026-08-13 に false へ)。
+// 実測で直接生成の下位互換と判明したため隠している: 写実系で細部 -25%、1.5〜1.7倍の時間、
+// 利点はピークが約3GB低いことだけ (README の該当節と懸念リスト参照)。**API は無効化して
+// いない** -- `upscale=1` を直接叩けば従来どおり動くので、VRAM が3GB足りない隙間を埋める
+// 用途には使える。UI に戻すときはここを true にするだけでよい。
+const UPSCALE_UI_VISIBLE = false;
 const sizeRow = document.getElementById('size-row');
 const customSizeRow = document.getElementById('custom-size-row');
 const customWidthEl = document.getElementById('custom-width');
@@ -1540,7 +1550,7 @@ function isStillMode(m) { return m === 't2i' || m === 'ref2i'; }
 // ここでは触らない (動画バッチ = /api/ref2va_batch もある)。
 function updateStillControls() {
   secondsColEl.style.display = isStillMode(mode) ? 'none' : '';
-  upscaleRowEl.style.display = isStillMode(mode) ? 'none' : '';
+  upscaleRowEl.style.display = (UPSCALE_UI_VISIBLE && !isStillMode(mode)) ? '' : 'none';
   ref2vaStillHintEl.style.display = (mode === 'ref2i') ? '' : 'none';
   ref2iFramesRowEl.style.display = (mode === 'ref2i') ? '' : 'none';
 }
