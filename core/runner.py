@@ -4492,19 +4492,30 @@ class MiniMaxH3Runner:
             # the reference. Fail loudly rather than silently mis-render.
             raise ValueError("upscale=1 (hires-fix) is only supported for t2va requests, not fl2va.")
         if do_upscale:
-            # 2026-08-13: PR #14355 移行後の upscale は「動くが絵が壊れる」状態。
-            # denoiser_input_fields の取り残し (下の _upscale_block_state_2x のコメント参照) を
-            # 直して**実行はできる**ようになったが、出力にはアップスケール起因の破綻が残る:
-            #   - turbo 4steps (パス2=1step): 動く腕などの輪郭が二重になる
-            #   - 30steps (パス2=10step): 空・電線あたりに格子状のモザイク
-            # ステップ数を増やしても消えないので「パス2のステップ不足」ではなく、
-            # 移行でレイアウト/パッチ規約が変わったことに 2x 補間が追随できていない疑いが濃い
-            # (要調査)。**黙って壊れた絵を返さない**よう、使うたびに警告を出す。
-            logger.warning(
-                "upscale=1 (hires-fix) の出力には既知の破綻があります (2026-08-13時点、"
-                "PR #14355 移行後の未修復): 4steps では動く輪郭の二重化、30steps では格子状の"
-                "モザイクが出ます。検証用途に限って使ってください。"
+            # 2026-08-13 のステップ掃引 (README 当日節) で確定した品質特性:
+            #   パス2 = 1 step (turbo 既定4): 動く輪郭が激しく二重化
+            #   パス2 = 3 step (8steps)     : 半透明のゴーストが残る
+            #   パス2 = 4 step (12steps)    : クリーン (推奨)
+            # sage は無関係 (SDPA でも同一の破綻を確認)。パッキング往復・x0/再ノイズ式は
+            # マージ版スケジューラと一致済みで、律速は純粋にパス2のステップ数。
+            # turbo なし 30steps (パス2=10) では別種の格子モザイクが出る (int8/投影TE との
+            # 相互作用を疑うが未切り分け -- bf16+32B 時代の実測では出ていなかった)。
+            n2_projected = num_inference_steps - max(
+                1, min(num_inference_steps - 1, round(num_inference_steps * (1.0 - H3_HIRES_DENOISE)))
             )
+            if n2_projected < 4:
+                logger.warning(
+                    "upscale=1: このステップ数 (%d) ではパス2が %d ステップしか取れず、"
+                    "動く輪郭の二重化/ゴーストが出ます (実測)。turbo なら "
+                    "num_inference_steps=12 (パス2=4) を推奨します。",
+                    num_inference_steps, n2_projected,
+                )
+            if not instant["turbo"]:
+                logger.warning(
+                    "upscale=1 + turbo なしの組合せは、現在の既定構成 (int8/投影TE) で"
+                    "格子状モザイクが出ることを実測済みです (原因未切り分け、2026-08-13)。"
+                    "turbo=1 + 12steps を推奨します。"
+                )
         if do_upscale and H3_LOWVRAM_ANY:
             # Not verified to fit: pass 2 runs full self-attention over a ~4x longer
             # packed sequence (~16x pass 1's attention activation cost), and neither
