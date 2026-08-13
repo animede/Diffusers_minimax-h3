@@ -4259,6 +4259,34 @@ class MiniMaxH3Runner:
         block_state.video_indices = new_video_indices.to(device)
         block_state.audio_indices = new_audio_indices.to(device)
         block_state.text_indices = new_text_indices.to(device)
+
+        # PR #14355 (f37ab93) 対応 -- **これが無いとパス2が必ず落ちる** (2026-08-13 修正)。
+        # マージ版の `MiniMaxH3LoopDenoiser` はレイアウト値を個々の属性からではなく
+        # `block_state.denoiser_input_fields`(レイアウト段の OutputParam に付いた
+        # `kwargs_type="denoiser_input_fields"` でまとめられた dict)から読む:
+        #
+        #     layout_kwargs = {name: value
+        #                      for name, value in block_state.denoiser_input_fields.items()
+        #                      if name in inspect.signature(transformer.forward).parameters}
+        #
+        # この dict はパス1のレイアウトを作った時点の**古いテンソルを参照したまま**なので、
+        # 上の属性代入だけでは反映されない。結果、`state.set()` で書いている
+        # row_timestep_plan だけがパス2の長さになり、token_tags/position_ids はパス1のまま
+        # 残って `token_tags と timestep_indices の seq_len 不一致` で落ちていた
+        # (この経路はマージ追従の回帰セット (t2i/t2va/バッチ/ref2va) に入っておらず、
+        #  移行以降ずっと壊れていた)。
+        # 既にあるキーだけを差し替える (新しいフィールドを勝手に生やさない)。
+        _fields = getattr(block_state, "denoiser_input_fields", None)
+        if isinstance(_fields, dict):
+            for _name, _value in (
+                ("token_tags", block_state.token_tags),
+                ("position_ids", block_state.position_ids),
+                ("video_indices", block_state.video_indices),
+                ("audio_indices", block_state.audio_indices),
+                ("text_indices", block_state.text_indices),
+            ):
+                if _name in _fields:
+                    _fields[_name] = _value
         # t2va only (enforced by the caller): no conditioning rows, so both stay 0 --
         # matches what `build_packed_sequence` itself returns for an empty
         # `keyframe_anchors` (`_new_num_condition_video_rows`/`_new_num_condition_audio_rows`
