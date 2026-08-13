@@ -3433,13 +3433,24 @@ class MiniMaxH3Runner:
         """TE を計算用GPUとは別のデバイスへ常駐させる構成か(`H3_TE_DEVICE` 参照)。"""
         return bool(H3_TE_DEVICE) and H3_TE_DEVICE != str(DEVICE)
 
+    # ref2va で TE 外部常駐を許すのに必要な、TE用GPUの総容量 (10進GB)。
+    # **32B TE**: 24GB。2048px 短辺の参照を 32B の vision tower に通す活性化が大きく、
+    #   TE-nf4 17.45GB + 参照エンコード 3.22GB 以上 = 20.67GB 以上を要するため
+    #   (20GB 級カードで 19.25GB 使用中に 204MB 不足する OOM を実測済み)。
+    # **投影TE (H3_TE_PROJ)**: 8GB。こちらの vision tower は Qwen3-VL-4B で、重みが
+    #   NF4 3.11GB。2026-08-11 の 8GiB×2 検証では TE 側の実測ピークが約 5.7GB で
+    #   ref2i/ref2va が完走している。24GB を課すのは 32B 前提の値の流用で、16GB や
+    #   20GB の2枚目GPUを不当に弾いてしまう (2026-08-13 に分離)。
+    _TE_EXTERNAL_MIN_GB_REF2VA_32B = 24.0
+    _TE_EXTERNAL_MIN_GB_REF2VA_PROJ = 8.0
+
     def _te_external_usable_for(self, mode: str) -> bool:
         """このモードで TE 外部常駐を使ってよいか。
 
-        ref2va は 2048px 短辺の参照を vision tower に通すため活性化が大きく、20GB 級では
-        OOM することを実測済み(`H3_TE_DEVICE` のコメント参照)。TE 用GPUの総容量が
-        24GB 未満なら ref2va は従来経路へフォールバックする — 「動くはず」で走らせて
-        OOM させるより、確実に動く経路を選ぶ。
+        ref2va は参照画像を vision tower に通すぶん TE 側の活性化が大きいので、TE用GPUの
+        総容量が足りなければ従来経路 (TE を計算用GPUへ同居) へフォールバックする --
+        「動くはず」で走らせて OOM させるより、確実に動く経路を選ぶ。必要量は**どちらの
+        TE を使っているかで大きく違う**ので、閾値は上の2定数で分けている。
         """
         if not self._te_external:
             return False
@@ -3449,7 +3460,9 @@ class MiniMaxH3Runner:
             total_gb = torch.cuda.get_device_properties(torch.device(H3_TE_DEVICE).index).total_memory / 1e9
         except Exception:
             return False
-        return total_gb >= 24.0
+        need = (self._TE_EXTERNAL_MIN_GB_REF2VA_PROJ if H3_TE_PROJ
+                else self._TE_EXTERNAL_MIN_GB_REF2VA_32B)
+        return total_gb >= need
 
     @property
     def _encode_device(self) -> torch.device:
@@ -5824,8 +5837,10 @@ class MiniMaxH3Runner:
             raise ValueError(
                 f"ref2va は H3_TE_DEVICE={H3_TE_DEVICE!r} との併用ができません "
                 "(参照画像を vision tower に通す活性化が入らず OOM するため、TE用GPUには "
-                "24GB 以上が必要 -- 20GB 級で実測確認済み)。ref2va を使うときは "
-                "H3_TE_DEVICE を外して起動してください(t2va/fl2va/t2i は併用可能)。"
+                f"{self._TE_EXTERNAL_MIN_GB_REF2VA_PROJ if H3_TE_PROJ else self._TE_EXTERNAL_MIN_GB_REF2VA_32B:.0f}GB "
+                f"以上が必要 -- {'投影TE(4B)' if H3_TE_PROJ else '32B TE'} 使用時の実測値)。"
+                "ref2va を使うときは H3_TE_DEVICE を外して起動してください"
+                "(t2va/fl2va/t2i は併用可能)。"
             )
         # PR #14355 後: `packing_ref2va.reference_kind(index, entry)` は削除され、
         # `kind`/`has_audio` は各 MiniMaxH3*Reference インスタンス自身の属性になった
@@ -6092,16 +6107,25 @@ class MiniMaxH3Runner:
             # (modular_blocks_minimax_h3.py) exactly: the conditioning noise (image/video
             # references) has to be drawn from the request's generator BEFORE the
             # generated rows' own noise, and packed into `latents`/`audio_latents` AFTER.
-            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
-            _, state = layout_step(pipe, state)
-            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
-            _, state = condition_latents_step(pipe, state)
-            latents_step = MiniMaxH3PrepareLatentsStep()
-            _, state = latents_step(pipe, state)
-            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
-            _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
-            _, state = timesteps_step(pipe, state)
+            #
+            # TE 外部常駐 (`H3_TE_DEVICE`) のときはピン窓の中で回す。TE を切り離すと
+            # `_execution_device` が CPU 上の audio_vae に落ち、layout がテンソルを CPU に
+            # 作ってしまい、デノイズの transformer forward で `cuda:0 and cpu` の
+            # device 不一致になる (generate() の非 lowvram 分岐で 2026-08-12 に踏んだのと
+            # 同型)。**この経路は 2026-08-13 に `_te_external_usable_for()` の 24GB 判定を
+            # 投影TE向けに分離するまでガードで塞がれており、一度も走っていなかった** --
+            # 緩和と同時に発火した。TE 同居時 (既定) は素通しで挙動はバイト単位で不変。
+            with self._pin_execution_device_to_compute() if self._te_external else _NullContext():
+                layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                _, state = condition_latents_step(pipe, state)
+                latents_step = MiniMaxH3PrepareLatentsStep()
+                _, state = latents_step(pipe, state)
+                ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+                _, state = ref2va_latents_step(pipe, state)
+                timesteps_step = MiniMaxH3SetTimestepsStep()
+                _, state = timesteps_step(pipe, state)
         else:
             # `none` mode: TE's job is done -- free it and bring in transformer_ref
             # (vae is already permanently resident in this mode, so `_vae_to_gpu()` is a
@@ -6117,16 +6141,28 @@ class MiniMaxH3Runner:
             _, state = reference_encoder_step(pipe, state)
 
             # --- layout / condition latents / latents / ref2va latents / timesteps ---
-            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
-            _, state = layout_step(pipe, state)
-            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
-            _, state = condition_latents_step(pipe, state)
-            latents_step = MiniMaxH3PrepareLatentsStep()
-            _, state = latents_step(pipe, state)
-            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
-            _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
-            _, state = timesteps_step(pipe, state)
+            # TE 外部常駐 (`H3_TE_DEVICE`) のときはピン窓の中で回す。TE を切り離すと
+            # `_execution_device` が CPU 上の audio_vae に落ち、layout がレイアウト用
+            # テンソルを CPU に作ってしまい、デノイズで rope が
+            # `cuda:0 and cpu` の device 不一致で落ちる (generate() の非 lowvram 分岐で
+            # 2026-08-12 に踏んだのと同型)。**この経路は 2026-08-13 に
+            # `_te_external_usable_for()` の 24GB 判定を投影TE向けに緩めるまで
+            # ガードで塞がれており、一度も走っていなかった** -- 緩和と同時に発火した。
+            # `_pin_execution_device_to_compute()` は text_encoder/vae/audio_vae を一時的に
+            # 外して transformer(_ref) を先頭に見せる (transformer_ref は直前の
+            # `_ensure_transformer_ref()` でロード済みなので前提を満たす)。
+            # TE 同居時 (既定) は従来どおり素通しで、挙動はバイト単位で不変。
+            with self._pin_execution_device_to_compute() if self._te_external else _NullContext():
+                layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                _, state = condition_latents_step(pipe, state)
+                latents_step = MiniMaxH3PrepareLatentsStep()
+                _, state = latents_step(pipe, state)
+                ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+                _, state = ref2va_latents_step(pipe, state)
+                timesteps_step = MiniMaxH3SetTimestepsStep()
+                _, state = timesteps_step(pipe, state)
 
         # bnb-4bit mode (bf16 transformer_ref): force-free TE-nf4 (~21GB) before denoise,
         # unconditionally (unlike generate()'s hires-fix-only `force_free_te` -- a
