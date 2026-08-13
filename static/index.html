@@ -763,7 +763,7 @@
       <div class="row" id="upscale-row">
         <label style="display:flex;align-items:center;gap:8px;">
           <input type="checkbox" id="upscale" style="width:auto;">
-          <span data-i18n="label.upscale">2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ・約3.6倍時間)</span>
+          <span data-i18n="label.upscale">2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ)</span>
         </label>
       </div>
 
@@ -974,7 +974,8 @@ const I18N = {
     'label.customHeight': '高さ (px、256〜2048)',
     'label.steps': 'ステップ数',
     'label.seed': 'seed (空欄でランダム)',
-    'label.upscale': '2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ・約3.6倍時間)',
+    'label.upscale': '2x latentアップスケール(768²で生成→1536²で仕上げ。T2VAのみ)',
+    'hint.upscaleCaution': '⚠ 直接その解像度で生成するほうが基本的に速く高品質です(実測: 写実系で細部 -25%、1.5〜1.7倍の時間)。VRAM が 3GB 足りないときの逃げ道と考えてください。使うなら turbo ON + ステップ 12 以上(それ未満は輪郭が二重化)。',
     'settings.instantTitle': '即反映設定(生成のたびに反映・再ロード不要)',
     'label.turbo': 'Turbo LoRA(4ステップ推奨・lightx2v蒸留)',
     'label.mute': '無音で出力(音声トラックを付けない)',
@@ -1167,7 +1168,8 @@ const I18N = {
     'label.customHeight': 'Height (px, 256–2048)',
     'label.steps': 'Steps',
     'label.seed': 'Seed (blank for random)',
-    'label.upscale': '2x latent upscale (generate at 768², finish at 1536². T2VA only, ~3.6x time)',
+    'label.upscale': '2x latent upscale (generate at 768², finish at 1536². T2VA only)',
+    'hint.upscaleCaution': '⚠ Generating at the target resolution directly is usually faster and sharper (measured: 25% less fine detail on photoreal content, 1.5-1.7x the time). Treat this as an escape hatch for when you are ~3GB short on VRAM. If you do use it, keep turbo on and set 12+ steps — fewer doubles moving contours.',
     'settings.instantTitle': 'Instant-apply settings (applied on every generation, no reload needed)',
     'label.turbo': 'Turbo LoRA (4 steps recommended, lightx2v distillation)',
     'label.mute': 'Silent output (no audio track)',
@@ -1412,6 +1414,10 @@ function updateInstantHint() {
   if (promptHasDialogueTag() && reloadTeProjEl && reloadTeProjEl.checked) {
     parts.push(t('hint.dialogueNeedsTe32B'));
   }
+  // upscale の注意は runner 側でも logger.warning を出しているが、それはサーバログにしか
+  // 出ず UI 利用者には届かない。2026-08-13 の実測で「直接生成の下位互換」と分かったので、
+  // チェックが入っているあいだは画面にも出す。
+  if (upscaleEl && upscaleEl.checked) parts.push(t('hint.upscaleCaution'));
   instantHintEl.textContent = parts.join(' / ');
 }
 
@@ -1422,6 +1428,7 @@ function promptHasDialogueTag() {
 
 document.getElementById('prompt').addEventListener('input', updateInstantHint);
 if (reloadTeProjEl) reloadTeProjEl.addEventListener('change', updateInstantHint);
+if (upscaleEl) upscaleEl.addEventListener('change', updateInstantHint);
 
 cacheEnabledEl.addEventListener('change', () => {
   cacheThresholdEl.disabled = !cacheEnabledEl.checked;
