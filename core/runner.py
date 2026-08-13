@@ -4491,6 +4491,20 @@ class MiniMaxH3Runner:
             # which is unverified territory this task did not have time to check against
             # the reference. Fail loudly rather than silently mis-render.
             raise ValueError("upscale=1 (hires-fix) is only supported for t2va requests, not fl2va.")
+        if do_upscale:
+            # 2026-08-13: PR #14355 移行後の upscale は「動くが絵が壊れる」状態。
+            # denoiser_input_fields の取り残し (下の _upscale_block_state_2x のコメント参照) を
+            # 直して**実行はできる**ようになったが、出力にはアップスケール起因の破綻が残る:
+            #   - turbo 4steps (パス2=1step): 動く腕などの輪郭が二重になる
+            #   - 30steps (パス2=10step): 空・電線あたりに格子状のモザイク
+            # ステップ数を増やしても消えないので「パス2のステップ不足」ではなく、
+            # 移行でレイアウト/パッチ規約が変わったことに 2x 補間が追随できていない疑いが濃い
+            # (要調査)。**黙って壊れた絵を返さない**よう、使うたびに警告を出す。
+            logger.warning(
+                "upscale=1 (hires-fix) の出力には既知の破綻があります (2026-08-13時点、"
+                "PR #14355 移行後の未修復): 4steps では動く輪郭の二重化、30steps では格子状の"
+                "モザイクが出ます。検証用途に限って使ってください。"
+            )
         if do_upscale and H3_LOWVRAM_ANY:
             # Not verified to fit: pass 2 runs full self-attention over a ~4x longer
             # packed sequence (~16x pass 1's attention activation cost), and neither
