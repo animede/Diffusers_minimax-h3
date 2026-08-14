@@ -3441,28 +3441,57 @@ class MiniMaxH3Runner:
     #   NF4 3.11GB。2026-08-11 の 8GiB×2 検証では TE 側の実測ピークが約 5.7GB で
     #   ref2i/ref2va が完走している。24GB を課すのは 32B 前提の値の流用で、16GB や
     #   20GB の2枚目GPUを不当に弾いてしまう (2026-08-13 に分離)。
-    _TE_EXTERNAL_MIN_GB_REF2VA_32B = 24.0
-    _TE_EXTERNAL_MIN_GB_REF2VA_PROJ = 8.0
+    # ref2va の参照ビジョンエンコードに要る「TE用GPU上の**空き** VRAM」(10進GB)。
+    # 2026-08-14 に「総容量」判定から「実測空き」判定へ変更 (回帰監査ケース9の教訓:
+    # 総容量だけ見ると、同じGPUに別プロセスが同居しているとき判定を通過してから
+    # 実行時に OOM する。空きで判定すれば同居環境でも安全側に倒れる)。
+    #
+    # 値の根拠 (判定時点で TE は常駐済みなので、常駐分を**含まない**追加要求量):
+    # - 32B: 旧ルール「総容量 24GB 以上」から TE-nf4 常駐 17.45GB を引いた 6.5GB。
+    #   (参照1枚の vision 活性化 3.22GB 以上 + 余裕。20GB カードで 204MB 不足の OOM を
+    #    実測した経緯は H3_TE_DEVICE のコメント参照)
+    # - 投影 (4B): 4.0GB。8GiB×2 検証 (2026-08-11) では参照1枚で TE 側ピーク 5.7GB
+    #   (= 常駐 3.11 + 活性化 ~2.6GB)。回帰監査 (08-13) では空き 2.3GB で1枚は成功・
+    #   2枚は OOM だったので、2〜3枚分の余裕を見て 4.0GB とする。専有 GPU なら
+    #   16GB カードでも空き ~12GB で余裕で通る。同居で足りないときは 400 で
+    #   「H3_TE_DEVICE を外せ」と案内される (黙って OOM するよりよい)。
+    _TE_EXTERNAL_MIN_FREE_GB_REF2VA_32B = 6.5
+    _TE_EXTERNAL_MIN_FREE_GB_REF2VA_PROJ = 4.0
 
     def _te_external_usable_for(self, mode: str) -> bool:
         """このモードで TE 外部常駐を使ってよいか。
 
         ref2va は参照画像を vision tower に通すぶん TE 側の活性化が大きいので、TE用GPUの
-        総容量が足りなければ従来経路 (TE を計算用GPUへ同居) へフォールバックする --
-        「動くはず」で走らせて OOM させるより、確実に動く経路を選ぶ。必要量は**どちらの
-        TE を使っているかで大きく違う**ので、閾値は上の2定数で分けている。
+        **実測空き VRAM** が足りなければ拒否する (呼び出し側が 400 で案内する) --
+        「動くはず」で走らせて OOM させるより、理由を添えて明確に断る。必要量は**どちらの
+        TE を使っているか**で大きく違うので、閾値は上の2定数で分けている。
+
+        空きは `torch.cuda.mem_get_info()` で読む。これは**他プロセスの使用分も反映**する
+        ので、同じ GPU にほかのサービスが同居していても正しく安全側に倒れる
+        (`H3_VRAM_LIMIT_GB` の上限はここには映らない -- あれは自プロセスの確保上限で、
+        mem_get_info が返す物理空きとは別勘定。同居運用で TE 側にも上限を掛けたい場合は
+        物理空きがそのまま判定に効くのでこのままでよい)。
         """
         if not self._te_external:
             return False
         if mode != "ref2va":
             return True
         try:
-            total_gb = torch.cuda.get_device_properties(torch.device(H3_TE_DEVICE).index).total_memory / 1e9
+            device_index = torch.device(H3_TE_DEVICE).index
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(device_index)
         except Exception:
             return False
-        need = (self._TE_EXTERNAL_MIN_GB_REF2VA_PROJ if H3_TE_PROJ
-                else self._TE_EXTERNAL_MIN_GB_REF2VA_32B)
-        return total_gb >= need
+        free_gb = free_bytes / 1e9
+        need = (self._TE_EXTERNAL_MIN_FREE_GB_REF2VA_PROJ if H3_TE_PROJ
+                else self._TE_EXTERNAL_MIN_FREE_GB_REF2VA_32B)
+        if free_gb < need:
+            logger.warning(
+                "ref2va with external TE refused: %s has %.2fGB free but %.1fGB is "
+                "needed for the reference vision encode (%s TE). Another process may "
+                "be sharing this GPU.",
+                H3_TE_DEVICE, free_gb, need, "projected 4B" if H3_TE_PROJ else "32B",
+            )
+        return free_gb >= need
 
     @property
     def _encode_device(self) -> torch.device:
@@ -5888,11 +5917,12 @@ class MiniMaxH3Runner:
         # 「動くはず」で走らせて OOM させるより、理由を添えて明確に拒否する。
         if self._te_external and not self._te_external_usable_for("ref2va"):
             raise ValueError(
-                f"ref2va は H3_TE_DEVICE={H3_TE_DEVICE!r} との併用ができません "
-                "(参照画像を vision tower に通す活性化が入らず OOM するため、TE用GPUには "
-                f"{self._TE_EXTERNAL_MIN_GB_REF2VA_PROJ if H3_TE_PROJ else self._TE_EXTERNAL_MIN_GB_REF2VA_32B:.0f}GB "
-                f"以上が必要 -- {'投影TE(4B)' if H3_TE_PROJ else '32B TE'} 使用時の実測値)。"
-                "ref2va を使うときは H3_TE_DEVICE を外して起動してください"
+                f"ref2va は H3_TE_DEVICE={H3_TE_DEVICE!r} との併用ができません: "
+                "参照画像を vision tower に通す活性化のぶん、TE用GPU に空き "
+                f"{self._TE_EXTERNAL_MIN_FREE_GB_REF2VA_PROJ if H3_TE_PROJ else self._TE_EXTERNAL_MIN_FREE_GB_REF2VA_32B:.1f}GB "
+                f"以上が必要です ({'投影TE(4B)' if H3_TE_PROJ else '32B TE'} 使用時の実測値。"
+                "同じGPUを他のプロセスと共有している場合はそちらの使用分も空きを減らします)。"
+                "そのGPUを空けるか、H3_TE_DEVICE を外して起動してください"
                 "(t2va/fl2va/t2i は併用可能)。"
             )
         # PR #14355 後: `packing_ref2va.reference_kind(index, entry)` は削除され、
@@ -6581,9 +6611,12 @@ class MiniMaxH3Runner:
         # (`generate_ref2va()` の同じガードのコメント参照)。
         if self._te_external and not self._te_external_usable_for("ref2va"):
             raise ValueError(
-                f"参照バッチは H3_TE_DEVICE={H3_TE_DEVICE!r} との併用ができません "
-                "(TE用GPUに 24GB 以上が必要 -- 20GB 級で OOM を実測確認済み)。"
-                "H3_TE_DEVICE を外して起動してください(t2i バッチは併用可能)。"
+                f"参照バッチは H3_TE_DEVICE={H3_TE_DEVICE!r} との併用ができません: "
+                "参照ビジョンエンコードのぶん、TE用GPU に空き "
+                f"{self._TE_EXTERNAL_MIN_FREE_GB_REF2VA_PROJ if H3_TE_PROJ else self._TE_EXTERNAL_MIN_FREE_GB_REF2VA_32B:.1f}GB "
+                "以上が必要です(同居プロセスの使用分も空きを減らします)。"
+                "そのGPUを空けるか、H3_TE_DEVICE を外して起動してください"
+                "(t2i バッチは併用可能)。"
             )
         if still:
             if still_frames not in STILL_FRAME_CHOICES:
