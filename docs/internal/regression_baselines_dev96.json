@@ -1,0 +1,301 @@
+{
+  "_meta": {
+    "box": "dev96: RTX PRO 6000 Blackwell 96GB (sm_120), CUDA_VISIBLE_DEVICES=0",
+    "recorded": "2026-08-14",
+    "diffusers": "f37ab93",
+    "torch": "2.9.0+cu128",
+    "attn": "sage (sm_120 build)",
+    "turbo_lora": "lightx2v/Minimax-h3-Turbo minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors (scale=1.0 metadata, video shift 6 per-request)",
+    "notes": "MD5 は sm_120 + sage + この LoRA に依存。別の箱・別 LoRA では一致しない。48GB機用の旧基準は regression_baselines.json (触っていない・別系統)。設定リロード往復 (te_proj OFF→ON) は対象外 -- 32B TE のロードが重く、機能検証は別途の監査で済んでいるため。"
+  },
+  "groups": {
+    "A": {
+      "server_env": "CUDA_VISIBLE_DEVICES=0 H3_TRANSFORMER_QUANT=int8 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_TURBO_LORA=1",
+      "cases": {
+        "t2i_turbo4": {
+          "endpoint": "/api/t2i",
+          "params": {
+            "prompt": "A serene mountain lake at sunrise, mist rising from the water, snow-capped peaks reflected on the surface, photorealistic",
+            "seed": 4242,
+            "turbo": 1
+          },
+          "md5": {
+            "png": "d8bdffed4dce7694c2daf141f70f41a2",
+            "mp4": "021469eb4cb19d894ff4090e4755e49d"
+          },
+          "runtime_s": 9.28
+        },
+        "t2i_30steps": {
+          "endpoint": "/api/t2i",
+          "params": {
+            "prompt": "A serene mountain lake at sunrise, mist rising from the water, snow-capped peaks reflected on the surface, photorealistic",
+            "seed": 4242,
+            "turbo": 0,
+            "num_inference_steps": 30
+          },
+          "md5": {
+            "png": "f3622b6d0229feac608f2e4f666aa410",
+            "mp4": "fdb8a8d85e876c61f684467327d88e6c"
+          },
+          "checks": {
+            "known_anchor_png": "f3622b6d0229feac608f2e4f666aa410"
+          },
+          "runtime_s": 26.97
+        },
+        "t2va_turbo4": {
+          "endpoint": "/api/t2va",
+          "params": {
+            "prompt": "2D-animated, cinematic anime style. A schoolgirl in a sailor uniform walks up a sunlit residential slope in Tokyo, cherry blossom petals drifting in the breeze.",
+            "seconds": 5,
+            "seed": 555,
+            "turbo": 1
+          },
+          "md5": {
+            "mp4": "875204e9fdcc629a561b08969b3278a6"
+          },
+          "runtime_s": 28.68
+        },
+        "fl2va_first": {
+          "endpoint": "/api/fl2va",
+          "params": {
+            "prompt": "The person in the reference photo walks through a sunny public park.",
+            "image": "outputs/ab_ref2va/input_image_person.png",
+            "seconds": 5,
+            "seed": 999,
+            "turbo": 1
+          },
+          "md5": {
+            "mp4": "31cd7dd0d8e656b51ac49e037a12943e"
+          },
+          "runtime_s": 39.95
+        },
+        "fl2va_both": {
+          "endpoint": "/api/fl2va",
+          "params": {
+            "prompt": "The person in the reference photo walks through a sunny public park.",
+            "image": "outputs/ab_ref2va/input_image_person.png",
+            "last_image": "outputs/ab_ref2va/input_image_scene.png",
+            "seconds": 5,
+            "seed": 999,
+            "turbo": 1
+          },
+          "md5": {
+            "mp4": "61ab1c1f319615834f166744981305ab"
+          },
+          "runtime_s": 48.15
+        },
+        "ref2i": {
+          "endpoint": "/api/ref2va",
+          "params": {
+            "prompt": "The person in the reference photo walks through a sunny public park.",
+            "references": [
+              "outputs/ab_ref2va/input_image_person.png"
+            ],
+            "still": 1,
+            "height": 768,
+            "width": 768,
+            "seed": 12345,
+            "turbo": 1
+          },
+          "md5": {
+            "png": "4ebf10d4cbdfb8aa8512d268882235ba",
+            "mp4": "e9aa8bb3e7c0ea54bcfdb4c8a17cc347"
+          },
+          "runtime_s": 109.53
+        },
+        "i2va": {
+          "endpoint": "/api/ref2va",
+          "params": {
+            "prompt": "The person in the reference photo walks through a sunny public park.",
+            "references": [
+              "outputs/ab_ref2va/input_image_person.png"
+            ],
+            "seconds": 5,
+            "height": 768,
+            "width": 768,
+            "seed": 12345,
+            "turbo": 1
+          },
+          "md5": {
+            "mp4": "628649cbf6125d3ecc78e366e4824754"
+          },
+          "runtime_s": 90.95
+        },
+        "ref2va_2refs": {
+          "endpoint": "/api/ref2va",
+          "params": {
+            "prompt": "The person in the reference photo walks through a sunny public park.",
+            "references": [
+              "outputs/ab_ref2va/input_image_person.png",
+              "outputs/ab_ref2va/input_image_scene.png"
+            ],
+            "seconds": 5,
+            "height": 768,
+            "width": 768,
+            "seed": 12345,
+            "turbo": 1
+          },
+          "md5": {
+            "mp4": "e8ee93fa2620f192fcc7afb54458fe44"
+          },
+          "runtime_s": 156.79
+        },
+        "ref2va_audio": {
+          "endpoint": "/api/ref2va",
+          "params": {
+            "prompt": "The person in the reference photo speaks to the camera in a sunny park.",
+            "references": [
+              "outputs/ab_ref2va/input_image_person.png",
+              "outputs/ab_ref2va/input_audio_looped.wav"
+            ],
+            "height": 768,
+            "width": 768,
+            "seed": 12345,
+            "turbo": 1
+          },
+          "md5": {
+            "mp4": "2250507563d71756129336d08551fe6a"
+          },
+          "checks": {
+            "num_frames": 175
+          },
+          "runtime_s": 106.81
+        },
+        "t2i_mute_off": {
+          "endpoint": "/api/t2i",
+          "params": {
+            "prompt": "A serene mountain lake at sunrise, mist rising from the water, snow-capped peaks reflected on the surface, photorealistic",
+            "seed": 31,
+            "turbo": 1
+          },
+          "md5": {
+            "png": "e19d128af33e820e21c84e5c23bb680f",
+            "mp4": "472c654e4757563f15543acccbe9161e"
+          },
+          "runtime_s": 55.79
+        },
+        "t2i_mute_on": {
+          "endpoint": "/api/t2i",
+          "params": {
+            "prompt": "A serene mountain lake at sunrise, mist rising from the water, snow-capped peaks reflected on the surface, photorealistic",
+            "seed": 31,
+            "turbo": 1,
+            "mute": 1
+          },
+          "md5": {
+            "png": "e19d128af33e820e21c84e5c23bb680f",
+            "mp4": "b852153faeb886d269108e983f0132b8"
+          },
+          "checks": {
+            "audio_streams": 0,
+            "same_png_as": "t2i_mute_off"
+          },
+          "runtime_s": 15.41
+        },
+        "upscale_12steps": {
+          "endpoint": "/api/t2va",
+          "params": {
+            "prompt": "2D-animated, cinematic anime style. A schoolgirl in a sailor uniform walks up a sunlit residential slope in Tokyo, cherry blossom petals drifting in the breeze.",
+            "seconds": 5,
+            "height": 768,
+            "width": 768,
+            "num_inference_steps": 12,
+            "seed": 555,
+            "turbo": 1,
+            "upscale": 1
+          },
+          "md5": {
+            "mp4": "44f4e6f9d8a058a5c6e0dc6f4e8df99b"
+          },
+          "runtime_s": 226.42
+        },
+        "dtag_rejected": {
+          "endpoint": "/api/t2va",
+          "params": {
+            "prompt": "A narrator speaks. <d>[Japanese] こんにちは</d> she says with a smile.",
+            "seconds": 5,
+            "turbo": 1
+          },
+          "expect_status": 400,
+          "checks": {
+            "http_400_contains": "台詞タグ"
+          },
+          "runtime_s": null
+        }
+      }
+    },
+    "B": {
+      "server_env": "CUDA_VISIBLE_DEVICES=0 H3_TRANSFORMER_QUANT=int8 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_TURBO_LORA=1 H3_TURBO_LORA_FILE=minimax_h3_fl2v_turbo_4step_v0.1.safetensors",
+      "cases": {
+        "t2i_v01_compat": {
+          "endpoint": "/api/t2i",
+          "params": {
+            "prompt": "A serene mountain lake at sunrise, mist rising from the water, snow-capped peaks reflected on the surface, photorealistic",
+            "seed": 4242,
+            "turbo": 1
+          },
+          "md5": {
+            "png": "596a718e4b5cf9a0b907d2ec479225d2",
+            "mp4": "6a1424029afc631e78ed2a2423ea2f68"
+          },
+          "checks": {
+            "known_anchor_png": "596a718e4b5cf9a0b907d2ec479225d2"
+          },
+          "runtime_s": 9.25
+        }
+      }
+    },
+    "C": {
+      "server_env": "CUDA_VISIBLE_DEVICES=0 H3_LOWVRAM=1 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_TURBO_LORA=1",
+      "cases": {
+        "t2i_batch3": {
+          "endpoint": "/api/t2i_batch",
+          "params": {
+            "prompts": [
+              "A serene mountain lake at sunrise, mist rising from the water, snow-capped peaks reflected on the surface, photorealistic",
+              "A dense pine forest in morning fog, sunbeams through branches, photorealistic",
+              "A rocky alpine summit above the clouds at golden hour, photorealistic"
+            ],
+            "height": 768,
+            "width": 768,
+            "seed": 4242,
+            "turbo": 1
+          },
+          "md5": {
+            "scenes_png": [
+              "682188da02e3fdf057ce5d63e2e560c6",
+              "67b16bbd6990dc85decc67607eea1491",
+              "80a698417b74171d947dc0d58d971682"
+            ]
+          },
+          "runtime_s": 63.8
+        },
+        "ref2i_batch3": {
+          "endpoint": "/api/ref2i_batch",
+          "params": {
+            "prompts": [
+              "The person in the reference photo stands in a sunny public park, smiling at the camera.",
+              "The person in the reference photo sits on a wooden bench reading a book, dappled light.",
+              "The person in the reference photo walks along a tree-lined path, looking ahead."
+            ],
+            "references": [
+              "outputs/ab_ref2va/input_image_person.png"
+            ],
+            "height": 768,
+            "width": 768,
+            "seed": 12345,
+            "turbo": 1
+          },
+          "md5": {
+            "scenes_png": [
+              "f32d8c7c62c9c34bce0b39b5f440fc84",
+              "6285da79ee6ff4c703591a1d319af3db",
+              "127577e5fa97e440c607749456e725cd"
+            ]
+          },
+          "runtime_s": 145.68
+        }
+      }
+    }
+  }
+}

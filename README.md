@@ -188,7 +188,7 @@ H3_VIDEO_VAE_FP16=1 H3_TE_PROJ=… H3_TURBO_LORA=1`)。
 | **コミュニティ改良の取り込み判断** | [docs/COMMUNITY_IMPROVEMENTS.md](docs/COMMUNITY_IMPROVEMENTS.md) |
 | どのモードで何がいつロード/解放されるか | [docs/RESIDENCY.md](docs/RESIDENCY.md) |
 | **次に何をやるか**(未着手・未検証) | 本 README の「[今後の外部イベント待ち](#今後の外部イベント待ち積み残し2026-08-06時点)」§3 |
-| diffusers を上げるときの回帰基準値 | [docs/internal/regression_baselines.json](docs/internal/regression_baselines.json) |
+| diffusers を上げるときの回帰基準値 | 96GB機: [regression_baselines_dev96.json](docs/internal/regression_baselines_dev96.json)(16ケース、`scripts/run_regression.py` で実行)/ 48GB機: [regression_baselines.json](docs/internal/regression_baselines.json) |
 
 **現在の状態**: diffusers はマージ版 **f37ab93** にピン留め(PR #14355 の追従完了、全経路が
 同一seed MD5 で等価)。**低VRAMの最終ゴール2つ(実16GB単体 / 8GB×2)を 2026-08-11 に達成**し、
@@ -2976,6 +2976,29 @@ ref2va_batch + TE@GPU1 が OOM — ただし GPU1 には別サービス(ace-serv
 16GB の cuda:1 に載らず**全件再現不能**。さらに監査で判明した空白: fl2va・複数参照・
 音声参照・mute・upscale・**投影TE経路**(現在の実用構成なのに1件も無い)・both_resident 構成・
 settings/apply 往復・旧LoRA後方互換・バッチ×turbo。基準セットの作り直しは別途(方針判断待ち)。
+
+## 2026-08-14: この箱向けの回帰基準セット(dev96)と実行ランナー
+
+前日の監査で「既存の回帰基準 9ケースは 48GB機+32B TE+旧LoRA 前提でこの箱では全件再現
+不能、しかも fl2va/投影TE/mute/upscale 等が空白」と判明したのを受けて、**96GB機向けの
+新基準セットを作成した**(既存ファイルは 48GB機用としてそのまま温存)。
+
+- **`docs/internal/regression_baselines_dev96.json`** — 3グループ16ケース。
+  A: 実用最速構成(int8 単騎+投影TE+turbo v1.0 768p)で t2i/t2va/fl2va(片端・両端)/
+  ref2i/i2va/複数参照/音声参照(尺自動導出 175フレームのチェック付き)/mute(音声
+  ストリーム0本 + mute有無で PNG 一致)/upscale 12steps/`<d>` 拒否メッセージ。
+  B: 旧 v0.1 LoRA 後方互換。C: `H3_LOWVRAM=1` のバッチ2種(場面ごと MD5)。
+- **`scripts/run_regression.py`** — サーバのライフサイクルごと管理する汎用ランナー
+  (グループごとに pkill → 当該 env で起動 → HTTP 実行 → MD5 比較、`--record` で採取)。
+  ケース追加は JSON 編集だけで済む。全 PASS で exit 0。
+- **採取後にもう一度全実行して 16/16 PASS = 決定論を実証**。非決定的ケースはゼロ。
+  既知アンカー2件(`f3622b6d` 基底経路 / `596a718e` 旧LoRA互換)とも一致し、新旧基準の
+  連続性を確認。
+- 注意: MD5 は **sm_120 + sage + v1.0 768p LoRA に依存**(_meta に明記)。runtime は
+  実行順に依存する参考値で、閾値チェックには使っていない。設定リロード往復は基準対象外
+  (機能検証は 08-13 の監査で済み)。
+
+使い方: `venv/bin/python scripts/run_regression.py`(全グループ実行)。
 
 ## 今後の外部イベント待ち(積み残し、2026-08-06時点)
 
