@@ -21,6 +21,10 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 import core.gallery as gallery
+# `runner` はこのモジュールでは MiniMaxH3Runner インスタンスの名前なので、モジュール
+# 自体は別名で持つ (`resolve_num_inference_steps()` が H3_TURBO_LORA をモジュール属性
+# として読むために必要)。
+import core.runner as runner_mod
 import core.settings as settings
 from core.llm import (
     H3SkillNotFetchedError,
@@ -41,11 +45,13 @@ from core.runner import (
     MAX_SECONDS,
     MIN_SECONDS,
     STILL_FRAME_CHOICES,
+    GenerationInterrupted,
     MiniMaxH3AudioReference,
     MiniMaxH3ImageReference,
     MiniMaxH3Runner,
     MiniMaxH3VideoReference,
     ProgressState,
+    interrupt_controller,
     seconds_to_num_frames,
 )
 
@@ -56,7 +62,7 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="MiniMax-H3 検証アプリ")
+app = FastAPI(title="MiniMax-H3")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
 
@@ -90,11 +96,38 @@ def round_canvas_value(value: int) -> int:
     value = max(CANVAS_MIN, min(CANVAS_MAX, int(value)))
     return int(round(value / CANVAS_MULTIPLE)) * CANVAS_MULTIPLE
 
-# H3_TURBO_LORA=1: the turbo LoRA is community-verified at 8 steps (see core/runner.py's
-# H3_TURBO_LORA module comment) -- default `num_inference_steps` to that instead of the
-# base model's 30 so a client that does not pass the field explicitly gets a sane value
-# for whichever mode the server was launched in. Still fully overridable per-request.
-DEFAULT_NUM_INFERENCE_STEPS = H3_TURBO_STEPS_DEFAULT if H3_TURBO_LORA else 30
+# ベースモデル(非蒸留)のステップ既定。
+NON_TURBO_NUM_INFERENCE_STEPS = 30
+
+# 後方互換のため残している「起動時の turbo 既定に対応するステップ数」。内部の既定解決は
+# 下の `resolve_num_inference_steps()` が担うので、この定数はもう既定値としては使わない
+# (README / docs が過去の不具合記録でこの名前を参照している)。
+DEFAULT_NUM_INFERENCE_STEPS = H3_TURBO_STEPS_DEFAULT if H3_TURBO_LORA else NON_TURBO_NUM_INFERENCE_STEPS
+
+
+def resolve_num_inference_steps(num_inference_steps: Optional[int], turbo: Optional[bool]) -> int:
+    """`num_inference_steps` 未指定時の既定を、そのリクエストの**実効 turbo** から決める。
+
+    turbo はリクエスト単位の即反映設定 (`core/settings.py` の
+    `resolve_instant_settings()`、LoRA は初回 ON 時に遅延ロードされる) なので、ステップ
+    既定も同じ粒度で決めないと食い違う。旧実装は起動時の `H3_TURBO_LORA` だけで固定した
+    `DEFAULT_NUM_INFERENCE_STEPS` を FastAPI の Form 既定値にしていたため、次の2ケースが
+    壊れていた (2026-08-20 修正。UI 側の同種の食い違いは core/runner.py の
+    `turbo_steps_default` のコメント参照):
+      - `H3_TURBO_LORA=0` のサーバへ `turbo=true` だけ送る -> 蒸留モデルに 30 ステップ
+        (無駄に遅い。4step 蒸留の想定外の領域でもある)
+      - `H3_TURBO_LORA=1` のサーバへ `turbo=false` だけ送る -> 非 turbo なのに 4 ステップ
+        (生成が破綻する)
+
+    turbo 未指定時の解決規則は `resolve_instant_settings()` と一致させること
+    (どちらも `core.runner.H3_TURBO_LORA` を見る)。**モジュール属性として読む**のが要点で、
+    import 時の値を焼き込むと、将来この既定が実行時に変更可能になったとき静かにずれる。
+    明示指定された値は turbo の状態に関わらず常にそのまま尊重する。
+    """
+    if num_inference_steps is not None:
+        return num_inference_steps
+    effective_turbo = turbo if turbo is not None else runner_mod.H3_TURBO_LORA
+    return H3_TURBO_STEPS_DEFAULT if effective_turbo else NON_TURBO_NUM_INFERENCE_STEPS
 
 
 @app.get("/")
@@ -140,6 +173,30 @@ def api_progress():
         if _current_progress is None:
             return {"phase": "idle"}
         return _current_progress.snapshot()
+
+
+@app.post("/api/interrupt")
+def api_interrupt(job_id: Optional[str] = Body(None, embed=True)):
+    """現在実行中の生成に中断を要求する。
+
+    `job_id` を**指定した**場合は、現在実行中のジョブと一致するときだけ中断する
+    (不一致なら何もしない -- 中止を押した直後に次のジョブが始まっていた場合に、
+    それを巻き添えにしないため)。**省略した場合は「いま動いているものを中断する」**
+    (呼び出し側がジョブIDを知らないことがあるため。mv_studio_V2 の中止ボタンは
+    この省略形で呼ぶので、ここを「省略なら何もしない」に変えると中止が効かなくなる)。
+    反応はステップ境界まで遅延する(H3の1ステップは実測6〜9秒 -- `core/runner.py` の
+    `GenerationInterrupted` docstring参照)。中断されたリクエストは HTTP 499 で返る。
+
+    生成中でなければ `interrupted: false` を返すだけ(エラーにはしない)。
+    """
+    with _progress_guard:
+        current_job_id = _current_progress.job_id if _current_progress else None
+    requested = interrupt_controller.request(job_id)
+    return {
+        "interrupted": requested,
+        "current_job_id": current_job_id,
+        "requested_job_id": job_id,
+    }
 
 
 @app.get("/api/settings")
@@ -209,11 +266,59 @@ def api_settings_apply(
         _generation_lock.release()
 
 
+@app.post("/api/admin/unload")
+def api_admin_unload():
+    """Phase 5a(diffusers-movie-server resident 切替)用: プロセスを残したまま
+    常駐モデルを全て解放する(runner.unload_all()、各 _free_* が gc + empty_cache 済み)。
+    生成中は 409。解放後も次の生成要求は generate()/generate_ref2va() の冪等な
+    _ensure_* 群で自動再ロードされる(遅延ロードで自然復帰)が、96gb 常駐構成の
+    プリロード状態へ戻したい場合は /api/admin/reload を使う。
+    """
+    acquired = _generation_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(409, "生成が進行中のためアンロードできません。完了を待ってから再試行してください。")
+    try:
+        runner.unload_all()
+        return {"result": "unloaded", "runner": runner.status()}
+    except Exception as e:
+        logger.exception("admin unload failed")
+        raise HTTPException(500, f"unload failed: {e}")
+    finally:
+        _generation_lock.release()
+
+
+@app.post("/api/admin/reload")
+def api_admin_reload():
+    """Phase 5a 用: preload_all() を再実行して定常常駐状態へ戻す(構成は起動時 env の
+    まま変わらない)。resident 切替の「復帰」で gateway から呼ばれる。生成中は 409。
+    """
+    acquired = _generation_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(409, "生成が進行中のため再ロードできません。完了を待ってから再試行してください。")
+    global _current_progress
+    progress = ProgressState(job_id=uuid.uuid4().hex[:12], phase="loading", started_at=time.time())
+    with _progress_guard:
+        _current_progress = progress
+    try:
+        progress.update(phase="loading", message="モデルを再ロード中(preload_all)...")
+        t0 = time.time()
+        runner.preload_all()
+        progress.update(phase="done", message="再ロード完了")
+        return {"result": "reloaded", "elapsed_s": round(time.time() - t0, 1),
+                "runner": runner.status()}
+    except Exception as e:
+        logger.exception("admin reload failed")
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(500, f"reload failed: {e}")
+    finally:
+        _generation_lock.release()
+
+
 def _run_generation(
     prompt: str,
     resolution: str,
     seconds: float,
-    num_inference_steps: int,
+    num_inference_steps: Optional[int],
     seed: Optional[int],
     image: Optional[Image.Image],
     last_image: Optional[Image.Image],
@@ -228,8 +333,13 @@ def _run_generation(
     still_frames: Optional[int] = None,
 ) -> dict:
     """still_frames を指定すると静止画モード (t2i): seconds は無視され、超短尺動画から
-    中央フレームの PNG を書き出す(core/runner.py の generate(still=True) 参照)。"""
+    中央フレームの PNG を書き出す(core/runner.py の generate(still=True) 参照)。
+
+    `num_inference_steps=None` はそのリクエストの実効 turbo から解決する
+    (`resolve_num_inference_steps()` 参照)。"""
     global _current_progress
+
+    num_inference_steps = resolve_num_inference_steps(num_inference_steps, turbo)
 
     # height/width を明示指定した場合はプリセットより優先し、H3の規則へ丸める
     # (エラーにはしない)。片方だけの指定は誤用なので 400。
@@ -264,6 +374,8 @@ def _run_generation(
     progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
     with _progress_guard:
         _current_progress = progress
+    # 前回の中断要求が残っていて今回の生成が即死しないよう、開始時に必ずクリアする。
+    interrupt_controller.begin(job_id)
 
     try:
         result = runner.generate(
@@ -292,11 +404,16 @@ def _run_generation(
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except GenerationInterrupted as e:
+        logger.info("generation interrupted: %s", e)
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(499, f"生成が中断されました: {e}")
     except Exception as e:
         logger.exception("generation failed")
         progress.update(phase="error", error=str(e))
         raise HTTPException(500, f"generation failed: {e}")
     finally:
+        interrupt_controller.end()
         _generation_lock.release()
 
 
@@ -305,7 +422,7 @@ def api_t2va(
     prompt: str = Form(...),
     resolution: str = Form("768x768"),
     seconds: float = Form(5.0),
-    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    num_inference_steps: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     upscale: int = Form(0),
     height: Optional[int] = Form(None),
@@ -346,7 +463,7 @@ def api_t2i(
     prompt: str = Form(...),
     resolution: str = Form("768x768"),
     frames: int = Form(22),
-    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    num_inference_steps: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     height: Optional[int] = Form(None),
     width: Optional[int] = Form(None),
@@ -399,7 +516,7 @@ def api_t2i_batch(
     prompts: list[str] = Form(...),
     resolution: str = Form("768x768"),
     frames: int = Form(22),
-    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    num_inference_steps: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     height: Optional[int] = Form(None),
     width: Optional[int] = Form(None),
@@ -417,7 +534,12 @@ def api_t2i_batch(
     大モデルが常駐していて位相並べ替えの利得がないため、逐次 generate() で同じ
     レスポンス形式を返す。seed は全場面共通(手動で同一 seed を N 回叩くのと同じ)。
     解像度・フレーム数・ステップ数も全場面共通で、変えられるのはプロンプトのみ。
+
+    `num_inference_steps=None` はそのリクエストの実効 turbo から解決する
+    (`resolve_num_inference_steps()` 参照)。バッチ全場面で同じ値を使う。
     """
+    num_inference_steps = resolve_num_inference_steps(num_inference_steps, turbo)
+
     if frames not in STILL_FRAME_CHOICES:
         raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
     cleaned = [p.strip() for p in prompts if p and p.strip()]
@@ -444,6 +566,7 @@ def api_t2i_batch(
     progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
     with _progress_guard:
         _current_progress = progress
+    interrupt_controller.begin(job_id)
 
     try:
         if H3_LOWVRAM:
@@ -500,11 +623,16 @@ def api_t2i_batch(
         return JSONResponse(result)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except GenerationInterrupted as e:
+        logger.info("t2i_batch generation interrupted: %s", e)
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(499, f"生成が中断されました: {e}")
     except Exception as e:
         logger.exception("t2i_batch generation failed")
         progress.update(phase="error", error=str(e))
         raise HTTPException(500, f"t2i_batch generation failed: {e}")
     finally:
+        interrupt_controller.end()
         _generation_lock.release()
 
 
@@ -513,7 +641,7 @@ def api_fl2va(
     prompt: str = Form(...),
     resolution: str = Form("768x768"),
     seconds: float = Form(5.0),
-    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    num_inference_steps: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     image: Optional[UploadFile] = File(None),
     last_image: Optional[UploadFile] = File(None),
@@ -593,7 +721,7 @@ def api_ref2va(
     height: Optional[int] = Form(None),
     width: Optional[int] = Form(None),
     seconds: Optional[float] = Form(None),
-    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    num_inference_steps: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     cache: Optional[str] = Form(None),
     cache_threshold: Optional[float] = Form(None),
@@ -602,6 +730,8 @@ def api_ref2va(
     mute: bool = Form(False),
     still: int = Form(0),
     frames: int = Form(22),
+    reference_image_short_edge: Optional[int] = Form(None),
+    vocal_lock: Optional[bool] = Form(None),
 ):
     """ref2va: 画像最大9・動画最大3・音声最大3(計12参照)からの動画+音声生成。
 
@@ -618,8 +748,26 @@ def api_ref2va(
     超短尺を生成し、中央フレームPNGを書き出す(レスポンスに image_url が付く)。
     キャラクター参照から場面ごとの一貫した静止画を作る用途(README
     「スパイク: Ref2VA×超短尺」参照)。
+
+    `num_inference_steps=None` はそのリクエストの実効 turbo から解決する
+    (`resolve_num_inference_steps()` 参照)。
+
+    `reference_image_short_edge` は任意パラメータ(未指定ならプロセス起動時の
+    H3_REF_IMAGE_SHORT_EDGE 環境変数の値、既定2048、を使う=挙動は完全に従来どおり)。
+    参照画像をQwen3-VL-32Bへ通す前に正規化する短辺サイズで、小さいほどプレフィックス
+    トークン数が減りエンコード・denoiseとも高速化するが、参照の細部再現度が下がる
+    (トレードオフの実測は core/runner.py の H3_REF_IMAGE_SHORT_EDGE コメント参照)。
+    不正値(正の整数でない)は400。
+
+    `vocal_lock` は任意パラメータ(未指定ならプロセス起動時の H3_VOCAL_LOCK
+    環境変数の値を使う=挙動は完全に従来どおり)。true/false を指定すると
+    その環境変数より優先される(このリクエストだけ Vocal Lock を有効/無効にする、
+    プロセス再起動不要)。詳細は core/runner.py の H3_VOCAL_LOCK コメント参照。
     """
     global _current_progress
+    runner_mod._tl("api_entry")
+
+    num_inference_steps = resolve_num_inference_steps(num_inference_steps, turbo)
 
     if not prompt or not prompt.strip():
         raise HTTPException(400, "prompt is required")
@@ -629,6 +777,10 @@ def api_ref2va(
         raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
     if (height is None) != (width is None):
         raise HTTPException(400, "height と width は両方指定するか、両方省略してください")
+    if reference_image_short_edge is not None and reference_image_short_edge <= 0:
+        raise HTTPException(
+            400, f"reference_image_short_edge は正の整数で指定してください: {reference_image_short_edge}"
+        )
     # 32の倍数でない値はエラーにせず丸める(t2va/fl2va と同じ方針。省略時はサーバが
     # H3 自身の 16:9 キャンバスを解決するので触らない)。
     if height is not None:
@@ -668,14 +820,33 @@ def api_ref2va(
             except Exception as e:
                 raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
 
+        runner_mod._tl("api_refs_built")
         acquired = _generation_lock.acquire(blocking=False)
         if not acquired:
             raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
+        runner_mod._tl("api_lock_acquired")
         job_id = uuid.uuid4().hex[:12]
         progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
         with _progress_guard:
             _current_progress = progress
+        interrupt_controller.begin(job_id)
+
+        # H3_DECODE_STREAM=1 のとき、runner が denoise 完了直後 (decode 開始前) に
+        # `_release_gen_lock()` を呼ぶ。そこで生成ロックと中断コントローラを手放し、decode+mux の
+        # 間に次の /api/ref2va を受け付けられるようにする。1回だけ実行されるようにガードし、
+        # 下の finally は「まだ手放していない場合だけ」手放す (二重 release / 次ジョブの
+        # interrupt 状態の巻き添えを防ぐ)。フラグ OFF (既定) では callback は None で、
+        # 従来どおり finally が解放する。
+        _gen_lock_released = False
+
+        def _release_gen_lock():
+            nonlocal _gen_lock_released
+            if _gen_lock_released:
+                return
+            _gen_lock_released = True
+            interrupt_controller.end()
+            _generation_lock.release()
 
         try:
             result = runner.generate_ref2va(
@@ -694,6 +865,9 @@ def api_ref2va(
                 mute=mute,
                 still=bool(still),
                 still_frames=frames,
+                reference_image_short_edge=reference_image_short_edge,
+                vocal_lock=vocal_lock,
+                on_denoise_done=_release_gen_lock if runner.decode_overlap_active() else None,
             )
             result["job_id"] = job_id
             result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
@@ -702,12 +876,16 @@ def api_ref2va(
             return JSONResponse(result)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except GenerationInterrupted as e:
+            logger.info("ref2va generation interrupted: %s", e)
+            progress.update(phase="error", error=str(e))
+            raise HTTPException(499, f"生成が中断されました: {e}")
         except Exception as e:
             logger.exception("ref2va generation failed")
             progress.update(phase="error", error=str(e))
             raise HTTPException(500, f"ref2va generation failed: {e}")
         finally:
-            _generation_lock.release()
+            _release_gen_lock()
     finally:
         for tmp_path in tmp_paths:
             tmp_path.unlink(missing_ok=True)
@@ -719,7 +897,7 @@ def _run_ref_batch(
     still: bool,
     frames: int,
     seconds: Optional[float],
-    num_inference_steps: int,
+    num_inference_steps: Optional[int],
     seed: Optional[int],
     height: Optional[int],
     width: Optional[int],
@@ -728,15 +906,22 @@ def _run_ref_batch(
     attn: Optional[str],
     turbo: Optional[bool],
     mute: bool = False,
+    reference_image_short_edge: Optional[int] = None,
 ) -> JSONResponse:
     """/api/ref2i_batch (still=True) と /api/ref2va_batch (still=False) の共通実装。
 
     `H3_LOWVRAM=1` ではモデルロード固定費をバッチ全体で1回に償却する位相並べ替え
     (core/runner.py の generate_ref_batch) を使い、他モードは逐次 generate_ref2va()
     で同じレスポンス形式を返す。参照・seed・解像度・尺・ステップ数は全場面共通
-    (変えられるのはプロンプトのみ)。
+    (変えられるのはプロンプトのみ)。reference_image_short_edge も全場面共通
+    (未指定なら /api/ref2va と同じくプロセスの H3_REF_IMAGE_SHORT_EDGE を使う)。
+
+    `num_inference_steps=None` はそのリクエストの実効 turbo から解決する
+    (`resolve_num_inference_steps()` 参照)。バッチ全場面で同じ値を使う。
     """
     global _current_progress
+
+    num_inference_steps = resolve_num_inference_steps(num_inference_steps, turbo)
 
     if still and frames not in STILL_FRAME_CHOICES:
         raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
@@ -756,6 +941,10 @@ def _run_ref_batch(
     if height is not None:
         height = round_canvas_value(height)
         width = round_canvas_value(width)
+    if reference_image_short_edge is not None and reference_image_short_edge <= 0:
+        raise HTTPException(
+            400, f"reference_image_short_edge は正の整数で指定してください: {reference_image_short_edge}"
+        )
 
     # 参照のスプールと構築は /api/ref2va と同じ手順 (tmp ファイル → MiniMaxH3*Reference.from_file)。
     tmp_paths: list[Path] = []
@@ -786,6 +975,7 @@ def _run_ref_batch(
         progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
         with _progress_guard:
             _current_progress = progress
+        interrupt_controller.begin(job_id)
 
         mode_label = "ref2i_batch" if still else "ref2va_batch"
         try:
@@ -806,6 +996,7 @@ def _run_ref_batch(
                     attn=attn,
                     turbo=turbo,
                     mute=mute,
+                    reference_image_short_edge=reference_image_short_edge,
                 )
             else:
                 # 常駐モード: 逐次 generate_ref2va() でも固定費はほぼ増えない。
@@ -818,6 +1009,7 @@ def _run_ref_batch(
                         seconds=seconds, num_inference_steps=num_inference_steps, seed=seed,
                         progress=progress, cache=cache, cache_threshold=cache_threshold,
                         attn=attn, turbo=turbo, mute=mute, still=still, still_frames=frames,
+                        reference_image_short_edge=reference_image_short_edge,
                     )
                     scenes.append({
                         "prompt": p,
@@ -841,6 +1033,9 @@ def _run_ref_batch(
                     "num_inference_steps": num_inference_steps, "seed": seed,
                     "total_elapsed_s": round(total, 2),
                     "per_image_s": round(total / len(cleaned), 2),
+                    # 全場面で同じ値 (reference_image_short_edge はバッチ全体で固定) なので
+                    # 代表として最後の scene の解決済み値を使う。
+                    "reference_image_short_edge": r["reference_image_short_edge"],
                     "scenes": scenes,
                 }
             result["job_id"] = job_id
@@ -851,11 +1046,16 @@ def _run_ref_batch(
             return JSONResponse(result)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except GenerationInterrupted as e:
+            logger.info("%s generation interrupted: %s", mode_label, e)
+            progress.update(phase="error", error=str(e))
+            raise HTTPException(499, f"生成が中断されました: {e}")
         except Exception as e:
             logger.exception("%s generation failed", mode_label)
             progress.update(phase="error", error=str(e))
             raise HTTPException(500, f"{mode_label} generation failed: {e}")
         finally:
+            interrupt_controller.end()
             _generation_lock.release()
     finally:
         for tmp_path in tmp_paths:
@@ -867,7 +1067,7 @@ def api_ref2i_batch(
     prompts: list[str] = Form(...),
     references: list[UploadFile] = File(...),
     frames: int = Form(22),
-    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    num_inference_steps: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     height: Optional[int] = Form(None),
     width: Optional[int] = Form(None),
@@ -876,14 +1076,19 @@ def api_ref2i_batch(
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
     mute: bool = Form(False),
+    reference_image_short_edge: Optional[int] = Form(None),
 ):
     """参照付き静止画のバッチ生成: 共通の references + プロンプト配列から、
     キャラクター一貫の場面静止画を連続生成する(/api/t2i_batch の ref2va 版)。
+
+    reference_image_short_edge は /api/ref2va と同じ任意パラメータ(全場面共通、
+    未指定ならプロセスの H3_REF_IMAGE_SHORT_EDGE を使う)。
     """
     return _run_ref_batch(
         prompts=prompts, references=references, still=True, frames=frames, seconds=None,
         num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
         cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo, mute=mute,
+        reference_image_short_edge=reference_image_short_edge,
     )
 
 
@@ -892,7 +1097,7 @@ def api_ref2va_batch(
     prompts: list[str] = Form(...),
     references: list[UploadFile] = File(...),
     seconds: float = Form(5.0),
-    num_inference_steps: int = Form(DEFAULT_NUM_INFERENCE_STEPS),
+    num_inference_steps: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     height: Optional[int] = Form(None),
     width: Optional[int] = Form(None),
@@ -901,16 +1106,21 @@ def api_ref2va_batch(
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
     mute: bool = Form(False),
+    reference_image_short_edge: Optional[int] = Form(None),
 ):
     """参照付き動画のバッチ生成: 共通の references + プロンプト配列から、
     物語の各場面の動画を連続生成する。尺 (seconds) は全場面共通で必須
     (音声参照からの尺自動導出はバッチでは使えない)。低VRAMモードでは
     モデルロード固定費 (~110s + 参照ビジョンエンコード) がバッチ全体で1回になる。
+
+    reference_image_short_edge は /api/ref2va と同じ任意パラメータ(全場面共通、
+    未指定ならプロセスの H3_REF_IMAGE_SHORT_EDGE を使う)。
     """
     return _run_ref_batch(
         prompts=prompts, references=references, still=False, frames=22, seconds=seconds,
         num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
         cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo, mute=mute,
+        reference_image_short_edge=reference_image_short_edge,
     )
 
 

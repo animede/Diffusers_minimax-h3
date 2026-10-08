@@ -512,6 +512,7 @@ VRAM・所要時間・PSNR・MD5・ASR判定など、品質や性能に関する
 | `H3_GROUP_OFFLOAD_MIN_RAM_GB` | `40` | groupモード起動に必要な空きRAMの下限 |
 | `H3_VAE_SMALLCLIP_FIX` | `1` | 超短尺(静止画モード)でのVAEデコード修正 |
 | `H3_REF_PREFIX_CACHE` | `1` | 参照バッチのKVプレフィックス共有 |
+| `H3_REF_PREFIX_CACHE_SINGLE` | `0` | 単発 ref2va のリクエスト間でもKVプレフィックスを再利用(画像参照のみ、+1.0GiB VRAM) |
 | `H3_LLM_URL` | `http://127.0.0.1:64650` | プロンプト強化に使うローカルLLM |
 
 このほかにも診断・デバッグ用の環境変数があるが、通常運用で変更するのは上記が中心である。UIから即時反映できる項目(FBC・Sage・Turbo)は、恒久的に変えたい場合のみ環境変数で指定すればよい。

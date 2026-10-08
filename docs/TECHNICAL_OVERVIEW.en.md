@@ -515,6 +515,7 @@ All claims about quality or performance — VRAM, time required, PSNR, MD5, ASR 
 | `H3_GROUP_OFFLOAD_MIN_RAM_GB` | `40` | Minimum free RAM required to start group mode |
 | `H3_VAE_SMALLCLIP_FIX` | `1` | VAE decode fix for ultra-short clips (still-image mode) |
 | `H3_REF_PREFIX_CACHE` | `1` | KV prefix sharing for reference batches |
+| `H3_REF_PREFIX_CACHE_SINGLE` | `0` | Also reuse the KV prefix *across* single ref2va requests (image references only, +1.0GiB VRAM) |
 | `H3_LLM_URL` | `http://127.0.0.1:64650` | Local LLM used for prompt enhancement |
 
 There are other environment variables for diagnostics/debugging as well, but the above are the ones typically changed in normal operation. For items that apply immediately from the UI (FBC, Sage, Turbo), specify them via environment variables only if you want to change them permanently.

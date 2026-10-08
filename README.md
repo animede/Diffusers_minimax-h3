@@ -18,6 +18,42 @@ Modular Pipeline(PR #14355、コミット **f37ab93** にピン留め)。**8GB×
 FirstBlockCache・Sage・Turbo・量子化・低VRAMモードなどは**再起動なしで**このパネルから切替。
 日英切替あり。*
 
+## 2026-10 更新: 24GB/32GB 単騎でリアルタイム会話生成
+
+8月の初版以降、会話アプリ用途(ref2va 連続生成)に向けた大幅な高速化・低VRAM化を
+本番リポジトリ(diffusers-movie-server)側で行い、本リポジトリへ再同期した。到達点:
+
+| 構成 | 条件 | 結果 |
+|---|---|---|
+| **32GB 単騎(RTX 5090 級)** | 320×448・141f(5.875s 分) | **5.57s = 実時間の 0.95 倍(リアルタイム)**、peak 25.6GB |
+| 24GB 単騎(RTX 4090 級) | 320×448・141f | 7.1s = 1.21 倍(短い応答なら実用圏)、peak 20.4GB |
+
+主な追加技術:
+- **ck-w4a8 量子化**(`H3_PRUNED_QUANT=ck-w4a8` / `H3_TRANSFORMER_QUANT=ck-w4a8`):
+  ComfyUI の W4A8 int8 カーネル(pip の `comfy-kitchen==0.2.37`、要インストール)。
+  AdaLN-pruned(multimodalart)と併用で 33B が**常駐 12.5〜14.9GB・denoise -28%・品質目視同等**
+- **pinned 退避**(`H3_VAE_PINNED` / `H3_BASE_PINNED` / `H3_REF_PINNED`):
+  モデルの退避を pinned メモリのポインタ付替えに(退避 0.3s / 復帰 2s)
+- **TE 削減**(`H3_TE_DIET` / `H3_TE_STREAM`)、量子化済みキャッシュ、参照 latent/prefix キャッシュ
+- lightx2v turbo 4step 蒸留(`H3_TURBO_LORA=1`)
+
+単騎実行の環境変数一式(32GB 級。24GB 級は `H3_KEEP_REF2VA_VAE=0` に変える):
+
+```bash
+H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_VIDEO_VAE_FP16=1 H3_TRANSFORMER_QUANT=ck-w4a8 H3_BASE_PINNED=1 H3_PRUNED=1 H3_PRUNED_QUANT=ck-w4a8 H3_REF_PINNED=1 H3_FL2VA_KEEP_TE=1 H3_KEEP_REF2VA=1 H3_KEEP_REF2VA_VAE=1 H3_REF_LATENT_CACHE=1 H3_DECODE_STREAM=1 H3_DECODE_VAE=light H3_VAE_PINNED=1 H3_TE_DIET=1 H3_VAE_SPLIT=1 H3_REF_PREFIX_CACHE_SINGLE=1 H3_REF_PREFIX_PARK=1 H3_TE_STREAM=1 H3_TURBO_LORA=1 ./run.sh
+```
+
+**注意点(必読)**:
+1. **GPU 専有前提**: 空き VRAM 23GiB(24GB級)/ 28GiB(32GB級)以上。TTS・LLM は同じ GPU に同居不可
+2. **初回キャッシュ作成**: ref 側は multimodalart/MiniMax-H3-Pruned の bf16(~38GB DL)から
+   自動量子化(**空きホスト RAM 45GB 必要**。24GB カード上での初回量子化は未検証)。
+   base 側は Kijai/MiniMax-H3-experimental の `minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`
+   (12.5GB)を `scripts/convert_kijai_w4a8.py` で変換(GPU 不要)
+3. **ホスト RAM**: pinned 常駐 ~45GiB。**RAM 64GB 機は `H3_REF_PINNED` か `H3_TE_STREAM` を外す**
+4. **24GB で `H3_KEEP_REF2VA_VAE=1` にしないこと**(発話⇄待機のプロンプト切替で OOM を実測)
+
+会話アプリとしての実例は [Realtime_Narration_Video](https://github.com/animede/Realtime_Narration_Video)(+ 音声会話クライアント [Realtime_Conversation_Video](https://github.com/animede/Realtime_Conversation_Video))を参照。
+
 ## VRAM×機能マトリクス(2026-08-11 実測)
 
 ○ = 実測で完走 / △ = 導出見込み(未実測)/ × = OOM。**時間は定常値**(初回のモデル
@@ -347,6 +383,8 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_TE_PROJ_QUANT` | `bnb-4bit` | 投影TE 4B の量子化(NF4 で 3.11GB。`none`=bf16 8.88GB / `bnb-8bit`) |
 | `H3_TE_DEVICE` | (無効) | TE を2枚目GPUへ常駐(例 `cuda:1`。32B TE は 20GB 級、投影TE なら 8GB 級で可) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` で transformer を 66.3→34GB |
+| `H3_PRUNED` | `0` | ref2va の transformer_ref を AdaLN-pruned 版(`multimodalart/MiniMax-H3-Pruned`)で読む(常駐 34→約21GB、`H3_TRANSFORMER_QUANT=int8` 併用必須。HyperFlow/`H3_LOWVRAM=group`/`H3_ADALN_PRECOMP` とは非互換) |
+| `H3_PRUNED_QUANT` | `int8wo` | pruned の量子化方式: `int8wo`(既定、4.60 s/step・peak 28GB)/ `int8dyn-convrot`(旧既定、7.60 s/step)/ `int8wo-convrot` / `fp8` / `fp8-convrot` / `bf16`。方式ごとに別キャッシュ(`models/prequant/transformer_ref_pruned_*`) |
 | `H3_LOWVRAM` | `0` | `1`=48GB級のフェーズ循環 / `group`=32GB級以下の block offload |
 | `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃(成立条件は該当節参照) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
@@ -525,6 +563,18 @@ int8同士は同一seedでmp4バイト一致の完全決定論)、デノイズ�
 expandable_segments:True` をrunnerが設定(int8ロード/解放サイクルの断片化で
 「54GBしか使っていないのに15GB確保失敗」が実機再現したため。diffusers-serverでも
 実績のある設定)。既定 `none` は従来とバイト一致(回帰確認済み)。
+
+### torchao の TF32 副作用の抑止 (`set_inductor_config=False`、2026-10-01)
+
+torchao の `quantize_()` は config の `set_inductor_config=True`(既定)だと
+`recommended_inductor_config_setter()` を呼び、`torch.set_float32_matmul_precision("high")`
+(fp32 matmul の TF32 化)等を**プロセス全体**に立てる。fresh 量子化を行ったプロセスだけ
+以後の fp32 計算(audio_vae 等)の数値が変わり、キャッシュ読み込みだけのプロセスと出力が
+一致しなくなるため、本リポジトリの全 config(上記 `Int8WeightOnlyConfig(version=2)` と
+`core/pruned.py` の各方式)は `set_inductor_config=False` で作る。量子化済み重みは
+変わらず(フラグの副作用だけ)、キャッシュの `meta.json` も不変なので既存キャッシュは
+そのまま使える。`/api/status` の `float32_matmul_precision` が `"highest"` のままで
+あることで観測できる。
 
 ## 48GB級VRAM対応 (`H3_LOWVRAM`、既定 `0`)
 
@@ -1553,6 +1603,79 @@ Sage Attention 既定化時と同種・同水準の epsilon 級ドリフト) が
 がそのまま効く。参照VAEエンコード (~数s/場面) は共有せず場面ごとのまま
 (効果が小さく、状態の別名参照リスクを増やさないため)。
 
+### 単発リクエスト間でのプレフィックス再利用 (`H3_REF_PREFIX_CACHE_SINGLE`、既定0、2026-08-24)
+
+上の共有プレフィックスを、バッチだけでなく **単発 `/api/ref2va` のリクエスト間** でも
+持ち越す。同じ参照画像に別々の音声・別々のプロンプトを当てる運用(mv_studio の
+リップシンク生成がまさにこれ)で、~52s の参照ビジョンエンコードが2回目以降まるごと消える。
+
+**既定 OFF**。プロセス寿命の KV キャッシュ(実測 1.04GiB VRAM)をリクエストをまたいで
+持つため、「既存挙動を変えない」を優先している。有効化は gateway の overrides:
+`{"backend":"h3","preset":"96gb","overrides":{"H3_REF_PREFIX_CACHE_SINGLE":"1"}}`。
+
+**成立条件(コードが機械的に判定し、外れたら黙って従来経路へ落ちる)**:
+
+- **画像参照のみ**(音声参照は何本あってもよい)。音声は `_build_presentation` が
+  `"<Audio j>: "` のラベルしか出さず波形が conditioner に届かないため、**音声の中身も
+  長さも変わってプレフィックスのトークン列はビット単位で不変**。
+- **動画参照が1つでもあると使わない**(動画はピクセルがプレフィックスに入るため)。
+  この場合はキャッシュを破棄して従来のフル計算に落ちる。
+
+**キー**はファイル名ではなく「実際にプレフィックス forward へ入る値」
+(トークン列 + 画像テンソルのバイト列 + `image_grid_thw`)の SHA-256。参照の枚数・順序・
+解像度・ピクセルの中身のどれが変わっても必ず別キーになる(キー計算は実測 0.14-0.35s)。
+
+**バッチ版に無い安全装置(`_encode_ref2va_prompt_prefix_cached` の docstring 参照)**:
+
+1. `model.rope_deltas` は `Qwen3VLModel` の**インスタンス状態**で、プレフィックスが書き
+   継続が読む。リクエストをまたぐと間に t2va のエンコードや `/api/prompt/enhance` が
+   挟まって上書きされうるので、プレフィックス時の値を clone して持ち、**継続の直前に
+   必ず書き戻す**。
+2. `weakref` で text_encoder の同一性を見る。TE が解放/再ロード/量子化変更されたら無効。
+   `_free_text_encoder()` 側でも能動的に捨てる(VRAM を即返すため)。
+3. 継続のたびに `DynamicCache.crop(prefix_len)`(例外で抜けた場合の保険として、継続前にも
+   長さを確認して切り戻す)。
+
+**実測(96GB 機、preset=96gb + `H3_TRANSFORMER_QUANT=int8`、768x448・8秒・turbo・
+4steps・seed 777、画像1枚+音声1本)**:
+
+| | 1本目 | 2本目 | ピークVRAM |
+|---|---|---|---|
+| OFF(既定・従来経路) | 136.6s | **94.5s** | 73.79GB |
+| **ON** | 140.4s(MISS、プレフィックス 52.5s) | **41.9s (-56%)** | 74.92GB (+1.1GB) |
+
+- 同じ画像+**別音声**(8.0s→6.6s の別ファイル)も HIT: 37.0s。
+- 参照画像を差し替えると `cache cleared` → MISS(93.6s)→ 元に戻すとまた MISS(94.1s、
+  ただしキーは元の値に戻る=キーは決定論的)。
+- ref バッチ経路も resident モードでは逐次 `generate_ref2va()` なので恩恵を受ける:
+  ref2i_batch の2場面目が 71s → **21s**。
+
+**数値**: MISS(その場でプレフィックス計算)と HIT(再利用)の出力は**ビット一致**
+(192フレーム・音声とも `max diff = 0`)。つまりリクエスト跨ぎの再利用そのものは
+完全に等価。一方、従来経路(丸ごと1本でエンコード)とはビット一致しない — 
+プレフィックス/継続に分割することによる ~1.5% の丸め差が turbo 4steps で増幅されるためで、
+バッチ経路(`H3_REF_PREFIX_CACHE`)が既に受け入れているのと同じ性質・同じ原因:
+
+| 比較 | 平均画素差 | PSNR | 音声相関 |
+|---|---|---|---|
+| ON(HIT) vs OFF ※入力が完全同一のケース | 2.46/255 | 31.7dB | 0.9909 |
+| **ON(HIT) vs OFF ※本来の用途(同じ画像・別音声)** | **12.14/255** | **20.45dB** | 音声 max diff 24943 |
+| ON(MISS) vs ON(HIT) | **0(ビット一致)** | ∞ | 1.0 |
+
+**2行目が本機能の狙いのケース**で、1行目より 11dB 悪い(画素の 67% が差 > 2)。
+目視では構図・キャラクター同一性・口の形まで区別がつかず、これは劣化ではなく
+**軌道の分岐**(同等品質の別の絵)だが、31.7dB だけを見て「ほぼ同一」と判断しないこと。
+
+「MISS と HIT がビット一致」= **リクエストを跨いだ再利用そのものは完全に等価**。
+差は「プレフィックス/継続に分割したこと」だけに由来する。
+
+ビット再現が要る対照実験は `H3_REF_PREFIX_CACHE_SINGLE=0`(既定)のままにすること。
+
+**H3_LOWVRAM 系との関係**: lowvram は毎リクエスト TE を解放するので、キャッシュはその
+たびに捨てられる(= 効果なし)。実機で 48gb-lowvram + ON を確認済み: 毎回
+`cache cleared: text_encoder freed` → 次リクエストは MISS、VRAM リークも例外もなし
+(TE prune 併用の 51 層 TE ではキャッシュサイズも 0.84GiB に自動追従する)。
+
 ### 参照付き動画のバッチ生成 (`/api/ref2va_batch`、2026-08-08 本実装)
 
 ref2i と同じ位相並べ替え(実装は同一メソッド `generate_ref_batch(still=False)`)を
@@ -2368,7 +2491,8 @@ turbo LoRA は `transformer` でしか実測しておらず `transformer_ref` �
 
 - **47s のビジョンエンコード**が参照系の本丸。バッチ経路には既に場面間共有
   (`H3_REF_PREFIX_CACHE`)があるが、**単発リクエストの繰り返しでは共有されない**
-  (同じ参照画像を使い回す運用ではプロセス跨ぎのキャッシュが効くはず — 未実装)。
+  (同じ参照画像を使い回す運用ではリクエスト跨ぎのキャッシュが効くはず)。
+  → **2026-08-24 に `H3_REF_PREFIX_CACHE_SINGLE`(既定 0)として実装した**(次節)。
 - **13s の再ロード**は、ref2va 完了時に「t2va の定常状態」へ戻す設計のため。
   次も ref2va なら不要で、`H3_KEEP_TRANSFORMER` と同種の「戻さない」判断を
   入れられる余地がある(**未実装**)。

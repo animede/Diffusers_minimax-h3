@@ -95,6 +95,13 @@ def resolve_instant_settings(
         turbo = runner.H3_TURBO_LORA
     turbo = bool(turbo)
 
+    if getattr(runner, "H3_HYPERFLOW", False):
+        # HyperFlow(8step flow-map 蒸留)構成では turbo と FBC を強制無効にする:
+        # turbo の _TurboLoRALinear は HyperFlow の PEFT アダプタと同じ Linear 群へ
+        # 二重適用になり、FBC は蒸留短工程に安全な窓が無い(turbo と同じ理屈)。
+        turbo = False
+        cache = "none"
+
     # A handful of turbo steps (4-8) leaves no redundant-computation window for FBC's
     # residual-similarity skip to safely exploit, and caching on top of an
     # already-short trajectory risks compounding drift for no measured benefit -- same
@@ -184,6 +191,33 @@ def validate_instant_settings(resolved: dict) -> None:
             "LoRA (lightx2v/Minimax-h3-Turbo) or change the reload-group settings."
         )
 
+    # H3_ADALN_PRECOMP + turbo=True (v2 coexistence, core/adaln_precompute.py's module
+    # docstring has the full derivation/verification): NOT a blanket conflict any more.
+    # The default diffusers-native turbo LoRA (H3_TURBO_LORA_REPO=lightx2v/Minimax-h3-
+    # Turbo) never wraps `adaln_proj` at all (verified against every non-comfyui-mirror
+    # checkpoint file it ships), so a precomputed table serves turbo=True and
+    # turbo=False requests identically off the same table -- no rebuild, no rejection
+    # needed. Only the comfy-format LoRA (`_TURBO_COMFY_REPOS`) genuinely conflicts (its
+    # checkpoint DOES carry an adaln_proj/norm_out delta): that combination is still
+    # rejected, both here (fast, no download needed -- same repo-name heuristic
+    # `runner.turbo_lora_expected_format()` uses) and, as the actual enforcement point,
+    # by `core/adaln_precompute.py`'s `_reject_turbo_wrapped_adaln()` once the real
+    # checkpoint keys are known (catches an operator pointing H3_TURBO_LORA_REPO/
+    # H3_TURBO_LORA_FILE at some other, not-yet-known comfy-format checkpoint under a
+    # different repo name, which this heuristic alone would miss).
+    if resolved["turbo"] and runner.H3_ADALN_PRECOMP and runner.turbo_lora_expected_format() == "comfy":
+        raise ValueError(
+            "turbo=1 with the comfy-format turbo LoRA is not supported while "
+            "H3_ADALN_PRECOMP=1 (this process's env config): that checkpoint format "
+            "wraps adaln_proj.linear/norm_out.linear with a real LoRA delta, which a "
+            "precomputed table (baked once from a fixed schedule, adaln_proj deleted "
+            "afterwards) cannot represent. See core/adaln_precompute.py's module "
+            "docstring for the full derivation. Use the default diffusers-native turbo "
+            "LoRA (H3_TURBO_LORA_REPO=lightx2v/Minimax-h3-Turbo, or leave "
+            "H3_TURBO_LORA_REPO/H3_TURBO_LORA_FILE unset) to use turbo with "
+            "H3_ADALN_PRECOMP=1, or restart with H3_ADALN_PRECOMP=0."
+        )
+
 
 def validate_instant_settings_for_upscale(resolved: dict, do_upscale: bool) -> None:
     """`upscale=1` (hires-fix) + turbo=1 works and is the recommended way to run
@@ -257,6 +291,15 @@ def current_settings_snapshot() -> dict:
             "turbo_incompatible_with_lowvram_group": True,
             "turbo_incompatible_with_transformer_both_resident": runner.turbo_lora_expected_format() == "comfy",
             "turbo_incompatible_with_upscale": False,
+            # H3_ADALN_PRECOMP (process-wide env flag, not a reload-group field -- see
+            # runner.py's own module comment) only rejects turbo=True for the
+            # comfy-format LoRA (v2 coexistence -- see validate_instant_settings()'s
+            # matching guard above and core/adaln_precompute.py's module docstring for
+            # the full derivation). Format-conditional like the three turbo_incompatible_
+            # with_* fields above it, not the blanket True v1 had.
+            "turbo_incompatible_with_adaln_precomp": bool(
+                runner.H3_ADALN_PRECOMP and runner.turbo_lora_expected_format() == "comfy"
+            ),
             "transformer_both_resident": runner.H3_TRANSFORMER_BOTH_RESIDENT,
             # te_proj (H3_TE_PROJ, 4B+投影) が ON のとき te_quant/te_prune は無効:
             # 32B TE 自体をロードしないため、この2つを変えても何も起きない (適用しても

@@ -20,6 +20,38 @@ into the official H3 guide format via a local LLM, and FirstBlockCache / Sage / 
 quantization / low-VRAM mode are toggled from this panel **without a restart**. Includes a
 Japanese/English switch.*
 
+## Oct 2026 update: realtime conversational generation on a single 24GB/32GB GPU
+
+Since the initial August release, major speed / low-VRAM work for conversational use
+(continuous ref2va) was done in the production repository (diffusers-movie-server) and
+re-synced here. Where it landed:
+
+| Setup | Condition | Result |
+|---|---|---|
+| **Single 32GB (RTX 5090 class)** | 320x448, 141f (5.875s of video) | **5.57s = 0.95x realtime**, peak 25.6GB |
+| Single 24GB (RTX 4090 class) | 320x448, 141f | 7.1s = 1.21x (usable for short replies), peak 20.4GB |
+
+Key additions:
+- **ck-w4a8 quantization** (`H3_PRUNED_QUANT=ck-w4a8` / `H3_TRANSFORMER_QUANT=ck-w4a8`):
+  ComfyUI's W4A8 int8 kernels (`pip install comfy-kitchen==0.2.37`). Combined with the
+  AdaLN-pruned checkpoints (multimodalart), the 33B transformer fits in **12.5-14.9GB
+  resident with -28% denoise time and visually equal quality**
+- **Pinned parking** (`H3_VAE_PINNED` / `H3_BASE_PINNED` / `H3_REF_PINNED`): model
+  eviction becomes a pinned-memory pointer swap (park 0.3s / restore 2s)
+- **TE reduction** (`H3_TE_DIET` / `H3_TE_STREAM`), prequantized weight caches,
+  reference latent / prefix caches
+- lightx2v 4-step turbo distillation (`H3_TURBO_LORA=1`)
+
+Env set for single-GPU operation (32GB class; for 24GB change to `H3_KEEP_REF2VA_VAE=0`):
+see the Japanese section above for the full command line.
+
+**Caveats**: the GPU must be dedicated (TTS/LLM cannot co-reside); first-run cache
+creation needs ~38GB of downloads and **45GB of free host RAM** for the ref side, plus
+converting Kijai's `minimax_h3_fl2va_pruned_w4a8_mixed.safetensors` (12.5GB) with
+`scripts/convert_kijai_w4a8.py` for the base side; pinned host RAM totals ~45GiB
+(on 64GB boxes drop `H3_REF_PINNED` or `H3_TE_STREAM`); on 24GB do NOT set
+`H3_KEEP_REF2VA_VAE=1` (OOMs on the speech/idle prompt switch).
+
 ## VRAM × feature matrix (measured 2026-08-11)
 
 ○ = completes (measured) / △ = derived estimate (not yet measured) / × = OOM. **Times are
@@ -1751,6 +1783,75 @@ phase, the same reduction applies directly (~130s/3 scenes). The reference VAE e
 (~a few seconds/scene) is not shared and stays per-scene (the benefit is small, and this
 avoids increasing the risk of state aliasing).
 
+### Reusing the prefix across single requests (`H3_REF_PREFIX_CACHE_SINGLE`, default 0, 2026-08-24)
+
+Carries the shared prefix above across **separate single `/api/ref2va` requests**, not just
+within one batch call. For workflows that pair one reference image with many different audio
+tracks and prompts (exactly what mv_studio's lip-sync generation does), the ~52s reference
+vision encode disappears from the second request onward.
+
+**Default OFF.** It keeps a process-lifetime KV cache (measured 1.04GiB of VRAM) alive between
+requests, so "do not change existing behaviour" wins by default. Enable it through the gateway
+overrides: `{"backend":"h3","preset":"96gb","overrides":{"H3_REF_PREFIX_CACHE_SINGLE":"1"}}`.
+
+**When it applies** (decided mechanically; anything else silently falls back to the legacy path):
+
+- **Image references only** (any number of audio references is fine). `_build_presentation` emits
+  only the `"<Audio j>: "` label for audio and the waveform never reaches the conditioner, so
+  **changing the audio's content and length leaves the prefix token sequence bit-identical**.
+- **Never used when any video reference is present** (a video's pixels do enter the prefix). That
+  case drops the cache and falls back to the full encode.
+
+The **key** is a SHA-256 of what actually enters the prefix forward (token ids + the image tensor's
+bytes + `image_grid_thw`), not of filenames — the count, order, resolution or pixels of the
+references all change the key. Key computation measured at 0.14-0.35s.
+
+**Safeguards the batch version does not need** (see `_encode_ref2va_prompt_prefix_cached`'s
+docstring):
+
+1. `model.rope_deltas` is *instance state* on `Qwen3VLModel`: the prefix writes it, the
+   continuation reads it. Across requests, a t2va encode or `/api/prompt/enhance` can overwrite it
+   in between, so the value is cloned at prefix time and **written back right before every
+   continuation**.
+2. A `weakref` checks text_encoder identity — a freed/reloaded/re-quantized TE invalidates the
+   cache. `_free_text_encoder()` also drops it actively so the VRAM comes back immediately.
+3. `DynamicCache.crop(prefix_len)` after every continuation (plus a length check before it, as
+   insurance against an exception unwinding mid-continuation).
+
+**Measured** (96GB box, preset=96gb + `H3_TRANSFORMER_QUANT=int8`, 768x448 / 8s / turbo / 4 steps /
+seed 777, one image + one audio reference):
+
+| | 1st | 2nd | Peak VRAM |
+|---|---|---|---|
+| OFF (default, legacy path) | 136.6s | **94.5s** | 73.79GB |
+| **ON** | 140.4s (MISS, prefix 52.5s) | **41.9s (-56%)** | 74.92GB (+1.1GB) |
+
+- Same image + **different audio** (a different 6.6s file vs 8.0s) also hits: 37.0s.
+- Swapping the reference image logs `cache cleared` and misses (93.6s); swapping back misses again
+  (94.1s) but restores the original key (keys are deterministic).
+- The ref batch endpoints benefit too, since in resident mode they loop `generate_ref2va()`:
+  the second scene of ref2i_batch went 71s -> **21s**.
+
+**Numerics**: a MISS (prefix computed in this request) and a HIT (prefix reused) produce
+**bit-identical** output (`max diff = 0` over 192 frames and the audio), so cross-request reuse
+itself is exactly equivalent. Against the legacy path (one monolithic encode) it is *not*
+bit-identical — the ~1.5% rounding difference from splitting prefix/continuation is amplified by
+turbo's 4 steps, the same property and the same cause the batch path (`H3_REF_PREFIX_CACHE`)
+already accepts:
+
+| Comparison | Mean pixel diff | PSNR | Audio correlation |
+|---|---|---|---|
+| ON (HIT) vs OFF | 2.46/255 | 31.7dB | 0.9909 |
+| ON (MISS) vs ON (HIT) | **0 (bit-identical)** | inf | 1.0 |
+
+Visually the composition, character identity and even mouth shape are indistinguishable. Keep
+`H3_REF_PREFIX_CACHE_SINGLE=0` (default) for A/B tests that need bit reproducibility.
+
+**Interaction with H3_LOWVRAM**: lowvram frees the TE every request, so the cache is dropped every
+time (no benefit). Verified on hardware with 48gb-lowvram + ON: every request logs
+`cache cleared: text_encoder freed`, the next one misses, and there is no VRAM leak or exception
+(with TE prune the 51-layer TE makes the cache 0.84GiB, sized automatically).
+
 ### Batch generation of reference-conditioned videos (`/api/ref2va_batch`, production implementation 2026-08-08)
 
 Applies the same phase reordering as ref2i (implemented via the same method,
@@ -2676,8 +2777,9 @@ to reference-conditioned trajectories unchanged.**
 
 - **The 47s vision encode is the real target** for reference modes. The batch paths already share
   it across scenes (`H3_REF_PREFIX_CACHE`), but **repeated single requests do not share anything**
-  — a cross-request cache would pay off whenever the same reference image is reused (not
-  implemented).
+  — a cross-request cache would pay off whenever the same reference image is reused.
+  → **Implemented on 2026-08-24 as `H3_REF_PREFIX_CACHE_SINGLE` (default 0)**; see the section
+  "Reusing the prefix across single requests" above.
 - **The 13s reload** comes from restoring the "t2va steady state" when a ref2va request finishes.
   If the next request is also ref2va it is unnecessary, and the same "don't restore" judgment as
   `H3_KEEP_TRANSFORMER` could apply (**not implemented**).

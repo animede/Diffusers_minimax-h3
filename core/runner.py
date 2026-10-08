@@ -103,12 +103,15 @@ There are two loading strategies, selected by the `H3_TE_QUANT` env var:
 from __future__ import annotations
 
 import gc
+import hashlib
 import io
+import itertools
 import json
 import logging
 import os
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -228,6 +231,329 @@ if H3_VRAM_LIMIT_GB:
 TE_QUANT = os.environ.get("H3_TE_QUANT", "bnb-4bit").strip().lower()
 if TE_QUANT not in ("none", "bnb-4bit"):
     raise ValueError(f"H3_TE_QUANT must be 'none' or 'bnb-4bit', got {TE_QUANT!r}")
+
+# EXPERIMENTAL, opt-in, diagnostic-only (2026-08-27 ref2va encode-phase profiling task).
+# "0" (default) = zero overhead, byte-for-byte identical to pre-this-flag behaviour --
+# every `_PhaseTimer.mark()`/`.report()` call below is a single `if not H3_PHASE_TIMING:
+# return` early-out, no timing, no CUDA sync, no logging. "1" = emits one INFO log line
+# per named checkpoint inside `generate_ref2va()` (and the handful of shared helpers it
+# calls -- `_ensure_vaes`/`_load_text_encoder`/`_vae_to_gpu`/`_vae_to_cpu`/
+# `_ensure_transformer_ref` already have their own unconditional timing logs; this flag
+# only adds NEW checkpoints inside the encode phase those don't cover: reference
+# setup/normalize (PIL resize), vision-tower feature gathering, presentation tokenize,
+# and the 32B/4B conditioner forward itself) with a `torch.cuda.synchronize()`
+# immediately before each timestamp so GPU-async work (the conditioner forward, VAE
+# encode) is attributed to the checkpoint that actually did it rather than bleeding into
+# the next (CPU-only) one. Never changes control flow, return values, or what is
+# computed -- purely additive logging for profiling `docs/h3-adaln-precompute-
+# 20260826.md`'s open question ("~100s of fixed cost, TE-size and vision-tower FLOP
+# estimates both failed to explain it -- where does the time actually go?").
+H3_PHASE_TIMING = os.environ.get("H3_PHASE_TIMING", "0").strip() == "1"
+H3_TIMELINE = os.environ.get("H3_TIMELINE", "0").strip() == "1"  # probe 2026-10-05: 一時的な壁時計タイムライン
+
+
+# H3_DENOISE_CUDAGRAPH=1 (probe 2026-10-05, 既定 0): transformer_ref.forward を CUDA Graph 化する (core/h3_cudagraph.py)。
+import core.h3_cudagraph as _h3_graph  # noqa: E402
+
+H3_DENOISE_CUDAGRAPH = os.environ.get("H3_DENOISE_CUDAGRAPH", "0").strip() == "1"
+
+
+def _tl(msg):
+    if H3_TIMELINE:
+        logger.info("[TL] %s t=%.3f", msg, time.time() % 1000)
+
+
+class _PhaseTimer:
+    """Tiny opt-in wall-clock breakdown, one instance per `generate_ref2va()` call.
+
+    `mark(label)` records the elapsed time since the previous `mark()` (or since
+    construction, for the first call) under `label`, CUDA-synced first so GPU-async work
+    lands on the checkpoint that issued it rather than the next one. `report()` logs the
+    full breakdown plus a sum-check against the caller-supplied total. A fresh instance
+    per call (rather than a module-level singleton) means concurrent requests -- were
+    this ever called from more than one thread, which today's single `_load_lock`/
+    `generation_lock` structure prevents -- can never interleave their marks; not
+    exercised by this task (H3 serializes generation), but cheap to get right.
+
+    No-op-shaped when `H3_PHASE_TIMING=0`: `mark()`/`report()` both check the flag first
+    and return immediately, so the only cost on the default path is one attribute read
+    per call site plus this object's own (never accessed) construction.
+    """
+
+    __slots__ = ("_t0", "_last", "_marks", "_label")
+
+    def __init__(self, label: str = "ref2va"):
+        self._label = label
+        self._marks: list[tuple[str, float]] = []
+        if not H3_PHASE_TIMING:
+            return
+        torch.cuda.synchronize()
+        self._t0 = self._last = time.time()
+
+    def mark(self, name: str) -> None:
+        if not H3_PHASE_TIMING:
+            return
+        torch.cuda.synchronize()
+        now = time.time()
+        self._marks.append((name, now - self._last))
+        self._last = now
+
+    def report(self, total_hint: float | None = None) -> None:
+        if not H3_PHASE_TIMING:
+            return
+        total = self._last - self._t0
+        breakdown = ", ".join(f"{name}={dt:.2f}s" for name, dt in self._marks)
+        hint = f" (caller total={total_hint:.2f}s)" if total_hint is not None else ""
+        logger.info("[H3_PHASE_TIMING] %s breakdown: %s -- sum=%.2fs%s", self._label, breakdown, total, hint)
+
+
+def _install_qwen3vl_submodule_timing(text_encoder) -> None:
+    """H3_PHASE_TIMING drill-down (2026-08-27 encode-phase profiling task): split
+    `get_qwen3vl_prompt_embeds()`'s single `text_encoder.model(...)` forward call --
+    which `_encode_ref2va_prompt`'s own `conditioner_forward` checkpoint already times as
+    one ~90s black box -- into "vision tower" (`Qwen3VLModel.get_image_features()`, which
+    the model forward calls once per request when `pixel_values is not None`) vs.
+    "language_model / text decoder" (`Qwen3VLModel.language_model(...)`, the 64
+    Qwen3-VL-32B decoder layers run over the full presentation sequence, images-as-tokens
+    included) time. No-op when `H3_PHASE_TIMING=0` (both wrapped methods early-out to the
+    original bound method before doing anything else -- a single attribute check, no
+    timing, no sync).
+
+    Called once per fresh `text_encoder` load (from `_load_text_encoder()`, mirroring
+    `enable_adaln_precompute()`'s own "re-arm on every fresh load" pattern a few call
+    sites away in this file) -- `text_encoder.model` is a new `Qwen3VLModel` instance
+    every time the bnb-4bit TE is (re)quantized from disk, so the patch has to be
+    reapplied, not applied once at import time. Idempotent (`_h3_phase_timing_patched`
+    guard) so calling it again on an already-patched instance is a harmless no-op --
+    relevant because this project's `H3_TE_PROJ` path loads a *different* model class
+    (`AutoModelForImageTextToText` resolving to Qwen3-VL-4B, whose `.model` is a plain
+    `Qwen3VLModel` too, so this patch generalizes to that path for free, in case a future
+    profiling task wants the same drill-down for the 4B TE_PROJ config).
+    """
+    if not H3_PHASE_TIMING:
+        return
+    model = getattr(text_encoder, "model", None)
+    if model is None or getattr(model, "_h3_phase_timing_patched", False):
+        return
+
+    orig_get_image_features = model.get_image_features
+    orig_language_model_forward = model.language_model.forward
+
+    def _timed_get_image_features(pixel_values, image_grid_thw=None, **kwargs):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        result = orig_get_image_features(pixel_values, image_grid_thw=image_grid_thw, **kwargs)
+        torch.cuda.synchronize()
+        grid_str = image_grid_thw.tolist() if image_grid_thw is not None else None
+        logger.info(
+            "[H3_PHASE_TIMING] Qwen3VLModel.get_image_features (vision tower): %.2fs "
+            "(pixel_values=%s, image_grid_thw=%s)",
+            time.time() - t0, tuple(pixel_values.shape), grid_str,
+        )
+        return result
+
+    def _timed_language_model_forward(*args, **kwargs):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        result = orig_language_model_forward(*args, **kwargs)
+        torch.cuda.synchronize()
+        logger.info("[H3_PHASE_TIMING] Qwen3VLModel.language_model (text decoder, 64 layers): %.2fs", time.time() - t0)
+        return result
+
+    model.get_image_features = _timed_get_image_features
+    model.language_model.forward = _timed_language_model_forward
+
+    # One level deeper (2026-08-27, same task): `get_image_features` -> `self.visual(...)`
+    # is `Qwen3VLVisionModel.forward()` -- patch_embed (a `kernel_size==stride` patchify
+    # `nn.Conv3d`, `modeling_qwen3_vl.py`'s `Qwen3VLVisionPatchEmbed.forward`, called once
+    # with a huge batch dim = num_patches and a tiny spatial extent per patch) vs. the 27
+    # `Qwen3VLVisionBlock` self-attention/MLP layers vs. the final `merger`. This exact
+    # "huge-batch x tiny-spatial, kernel==stride Conv3d" shape is the one flagged in the
+    # sibling diffusers-server repo's CLAUDE.md #46 as falling into a pathologically slow
+    # cuDNN kernel on this machine's sm_120 (Blackwell) GPUs -- Qwen3-VL's vision
+    # patch_embed uses the identical pattern, so this drill-down exists to confirm or rule
+    # out the same root cause here. `visual` is `model.visual` (`Qwen3VLVisionModel`);
+    # `blocks` timing is accumulated across all 27 sequential block calls into one number
+    # (individually wrapping each would be noisy for no extra insight -- the hypothesis
+    # under test is "patch_embed alone" vs. "everything else", not per-block variance).
+    visual = getattr(model, "visual", None)
+    if visual is not None:
+        orig_patch_embed_forward = visual.patch_embed.forward
+        orig_merger_forward = visual.merger.forward
+        orig_block_forwards = [blk.forward for blk in visual.blocks]
+        _blocks_total = {"s": 0.0}
+
+        def _timed_patch_embed_forward(hidden_states, *args, **kwargs):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            result = orig_patch_embed_forward(hidden_states, *args, **kwargs)
+            torch.cuda.synchronize()
+            logger.info(
+                "[H3_PHASE_TIMING]   visual.patch_embed (Conv3d, kernel==stride): %.2fs (input=%s)",
+                time.time() - t0, tuple(hidden_states.shape),
+            )
+            return result
+
+        def _timed_merger_forward(*args, **kwargs):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            result = orig_merger_forward(*args, **kwargs)
+            torch.cuda.synchronize()
+            logger.info("[H3_PHASE_TIMING]   visual.merger: %.2fs", time.time() - t0)
+            return result
+
+        def _make_timed_block_forward(orig_fwd):
+            def _timed_block_forward(*args, **kwargs):
+                torch.cuda.synchronize()
+                t0 = time.time()
+                result = orig_fwd(*args, **kwargs)
+                torch.cuda.synchronize()
+                _blocks_total["s"] += time.time() - t0
+                return result
+
+            return _timed_block_forward
+
+        visual.patch_embed.forward = _timed_patch_embed_forward
+        visual.merger.forward = _timed_merger_forward
+        for blk, orig_fwd in zip(visual.blocks, orig_block_forwards):
+            blk.forward = _make_timed_block_forward(orig_fwd)
+
+        orig_visual_forward = visual.forward
+
+        def _timed_visual_forward(*args, **kwargs):
+            _blocks_total["s"] = 0.0
+            result = orig_visual_forward(*args, **kwargs)
+            logger.info(
+                "[H3_PHASE_TIMING]   visual.blocks (all %d Qwen3VLVisionBlock, sum): %.2fs",
+                len(visual.blocks), _blocks_total["s"],
+            )
+            return result
+
+        visual.forward = _timed_visual_forward
+
+    model._h3_phase_timing_patched = True
+    logger.info("[H3_PHASE_TIMING] installed vision-tower/language-model sub-timing on text_encoder.model")
+
+
+# "1" (default) = replace `Qwen3VLVisionPatchEmbed.proj` (a `kernel_size==stride`
+# `nn.Conv3d(in_channels=3, embed_dim=1152, kernel_size=[2,16,16], stride=[2,16,16],
+# bias=True)`) with a mathematically-equivalent `nn.functional.linear` on every fresh
+# `text_encoder` load. "0" = stock Conv3d, unchanged behaviour (escape hatch).
+#
+# Why: on this box's sm_120 (Blackwell) GPUs, cuDNN picks a pathologically slow kernel
+# for this exact shape -- huge batch dim (num_patches, 28,160 for the profiled
+# 768x448/8s ref2va request logged in `_install_qwen3vl_submodule_timing`'s own
+# `visual.patch_embed` checkpoint) x tiny spatial extent (2x16x16 = one "patch" worth of
+# voxels, matching kernel_size exactly so there is only ever one output position per
+# input). This is the identical pathology diffusers-server's CLAUDE.md #46 (JoyAI
+# integration) already found and fixed for JoyImageEditPlusTransformer3DModel's
+# `img_in` (same class of Conv3d) AND for this exact `Qwen3VLVisionPatchEmbed` in that
+# repo's `families/joyai/pipeline.py` (`PatchifyLinear`) -- ~146x speedup there. Isolated
+# microbench with THIS process's exact real shapes (`scratchpad/probe_patchify_conv3d.py`,
+# run on this box 2026-08-27): Conv3d call = 87-91s *per call* (not a one-time cuDNN
+# algo-search cost -- 3 repeated calls at the same shape averaged 90.8s/call), the
+# reshape+linear form = 0.0007-0.005s, mean abs diff 6.4e-07 / max abs diff 1.56e-2
+# (bf16 rounding-level; consistent with CLAUDE.md #46's own 6.18e-07 for JoyAI).
+#
+# For `kernel_size == stride` and no padding, a Conv3d degenerates to exactly one output
+# position per input window, so `conv(x).view(N, out_ch)` is bit-identical (up to
+# floating-point summation order, which bf16 rounds away) to
+# `F.linear(x.flatten(1), conv.weight.reshape(out_ch, -1), conv.bias)` -- verified against
+# THIS repo's pinned transformers `Qwen3VLVisionPatchEmbed.forward()`
+# (`transformers/models/qwen3_vl/modeling_qwen3_vl.py`), which reshapes its input to
+# exactly `(-1, in_channels, temporal_patch_size, patch_size, patch_size)` before calling
+# `self.proj(...)` -- i.e. batch dim first, no other axis reordering, so `x.flatten(1)`
+# on that same 5D tensor lines up with `conv.weight.reshape(out_ch, -1)`'s
+# `(in_ch, kt, kh, kw)` -> flat layout with no extra permute needed (this project's
+# layout was independently re-derived and confirmed here, not assumed to match JoyAI's
+# transformer -- the two use different upstream input tensor orderings in general, but
+# for THIS class they happen to already agree since `forward()` does the `.view()`
+# itself right before the conv call, batch-dim-first).
+H3_PATCH_EMBED_LINEAR = os.environ.get("H3_PATCH_EMBED_LINEAR", "1").strip() == "1"
+
+
+class _PatchEmbedLinear(torch.nn.Module):
+    """Drop-in replacement for a `kernel_size==stride` `nn.Conv3d` patchify layer.
+
+    Ported from diffusers-server's `families/joyai/pipeline.py::PatchifyLinear`
+    (CLAUDE.md #46) with the mechanism kept verbatim -- only the class name and this
+    module's own call site are new. `weight`/`bias` properties are required because
+    `Qwen3VLVisionPatchEmbed.forward()` reads `self.proj.weight.dtype` (to cast its
+    input) before calling `self.proj(...)` -- a plain buffer without the alias would
+    make that line raise `AttributeError` (the exact bug CLAUDE.md #46 records hitting
+    and fixing on its first attempt at this same pattern for JoyAI's `img_in`).
+    """
+
+    def __init__(self, conv: torch.nn.Conv3d):
+        super().__init__()
+        self.out_channels = conv.out_channels
+        self.register_buffer("_weight_flat", conv.weight.reshape(conv.out_channels, -1))
+        self.register_buffer("_bias", conv.bias if conv.bias is not None else None)
+
+    @property
+    def weight(self):
+        return self._weight_flat
+
+    @property
+    def bias(self):
+        return self._bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # `Qwen3VLVisionPatchEmbed.forward()` passes in the already-5D
+        # `(N, in_channels, temporal_patch_size, patch_size, patch_size)` tensor and
+        # itself does `.view(-1, embed_dim)` on this call's return value, so returning
+        # the plain 2D `(N, out_channels)` linear output (rather than reshaping back to
+        # 5D the way `PatchifyLinear.forward()` does for JoyAI's `img_in`, whose caller
+        # expects a 5D shape back) is correct here -- confirmed by reading
+        # `Qwen3VLVisionPatchEmbed.forward()` itself, not assumed from the JoyAI
+        # precedent.
+        return torch.nn.functional.linear(x.flatten(1), self._weight_flat, self._bias)
+
+
+def _install_patch_embed_linear(text_encoder) -> None:
+    """Replace `text_encoder.model.visual.patch_embed.proj` with `_PatchEmbedLinear` on
+    a freshly-loaded `text_encoder` (no-op if `H3_PATCH_EMBED_LINEAR=0`, or if this
+    instance's vision tower is missing/already patched).
+
+    Must be re-armed on every fresh `text_encoder` load, same reasoning as
+    `_install_qwen3vl_submodule_timing` a few call sites away in this file (each
+    (re)quantization/reload of the bnb-4bit TE, or each `H3_TE_PROJ` 4B load, produces a
+    brand new `Qwen3VLModel`/`Qwen3VLVisionModel` instance with its own fresh
+    `nn.Conv3d`) -- called from the same 4 `_load_text_encoder*` call sites, right next
+    to the existing `_install_qwen3vl_submodule_timing(...)` calls. Idempotent per
+    instance (`isinstance(..., _PatchEmbedLinear)` guard), so calling it again on an
+    already-patched instance is a harmless no-op.
+
+    Covers both the 32B TE path (`H3_TE_QUANT=none`/`bnb-4bit`, `.model.visual` is
+    `Qwen3VLModel.visual`) and the `H3_TE_PROJ` 4B path (`AutoModelForImageTextToText`
+    resolving to Qwen3-VL-4B-Instruct, same `Qwen3VLVisionPatchEmbed` class, same
+    pathological shape family just with fewer patches) for free -- both are plain
+    `Qwen3VLModel` instances exposing `.model.visual.patch_embed.proj`, no branching on
+    which load path called this needed.
+    """
+    if not H3_PATCH_EMBED_LINEAR:
+        return
+    model = getattr(text_encoder, "model", None)
+    visual = getattr(model, "visual", None) if model is not None else None
+    patch_embed = getattr(visual, "patch_embed", None) if visual is not None else None
+    if patch_embed is None:
+        return
+    proj = getattr(patch_embed, "proj", None)
+    if proj is None or isinstance(proj, _PatchEmbedLinear):
+        return  # already patched, or not the Conv3d-based patchify this targets
+
+    device = next(proj.parameters()).device
+    n_params_before = sum(p.numel() for p in proj.parameters())
+    replacement = _PatchEmbedLinear(proj).to(device)
+    patch_embed.proj = replacement
+    logger.info(
+        "[H3_PATCH_EMBED_LINEAR] replaced Qwen3VLVisionPatchEmbed.proj (Conv3d, "
+        "kernel==stride) with reshape+linear on %s (weight=%s, params=%d) -- "
+        "sm_120 pathological-kernel avoidance, CLAUDE.md #46 lineage. "
+        "Set H3_PATCH_EMBED_LINEAR=0 to revert to stock Conv3d.",
+        device, tuple(replacement.weight.shape), n_params_before,
+    )
+
 
 # EXPERIMENTAL, opt-in. "0" (default) = text_encoder is built with its checkpoint's
 # native 64 decoder layers, byte-for-byte identical to pre-this-flag behaviour. "1" =
@@ -489,6 +815,59 @@ if H3_CACHE not in ("none", "fbc"):
     raise ValueError(f"H3_CACHE must be 'none' or 'fbc', got {H3_CACHE!r}")
 H3_CACHE_THRESHOLD = float(os.environ.get("H3_CACHE_THRESHOLD", "0.05"))
 
+# Overrides diffusers' `ConfigSpec("reference_image_short_edge", 2048)`
+# (modular_pipelines/minimax_h3/before_encoder.py), which ref2va's prefix-encode step
+# uses to normalize every reference image's short edge before it goes into Qwen3-VL-32B:
+# `scale = reference_image_short_edge / min(width, height)` -- this is applied even when
+# it means *upscaling* the reference, and there is no area cap on top of it. Measured on
+# this box: a 1280x720 reference gets scaled up to 3648x2048, producing a 7,309-token
+# prefix that alone takes ~92.9s to encode (of a ~140s scene; denoise is only 20-27s) --
+# see the "single ref-prefix cache MISS: encoded 7309 prefix tokens in 92.9s" log line.
+# Default 2048 matches diffusers' own default exactly, so leaving this unset reproduces
+# current behaviour byte-for-byte (`_ensure_pipe_shell` below skips the
+# `register_to_config` call entirely in that case). Lowering it shrinks the prefix (fewer
+# tokens -> faster encode) but also shrinks how much detail of the reference survives
+# into the prefix, which can affect character consistency -- this has NOT been quality
+# A/B'd, so treat any non-default value as experimental and eyeball the output.
+H3_REF_IMAGE_SHORT_EDGE_RAW = os.environ.get("H3_REF_IMAGE_SHORT_EDGE", "").strip()
+H3_REF_IMAGE_SHORT_EDGE_DEFAULT = 2048
+if H3_REF_IMAGE_SHORT_EDGE_RAW:
+    try:
+        H3_REF_IMAGE_SHORT_EDGE = int(H3_REF_IMAGE_SHORT_EDGE_RAW)
+        if H3_REF_IMAGE_SHORT_EDGE <= 0:
+            raise ValueError
+    except ValueError:
+        logger.warning(
+            "H3_REF_IMAGE_SHORT_EDGE=%r is not a positive integer -- ignoring, using "
+            "diffusers' default of %d.",
+            H3_REF_IMAGE_SHORT_EDGE_RAW, H3_REF_IMAGE_SHORT_EDGE_DEFAULT,
+        )
+        H3_REF_IMAGE_SHORT_EDGE = H3_REF_IMAGE_SHORT_EDGE_DEFAULT
+else:
+    H3_REF_IMAGE_SHORT_EDGE = H3_REF_IMAGE_SHORT_EDGE_DEFAULT
+
+
+def _resolve_ref_image_short_edge(override: int | None) -> int:
+    """Per-request counterpart of `H3_REF_IMAGE_SHORT_EDGE` (see that env var's own
+    comment above for the mechanism and the measured encode/denoise-time tradeoff).
+
+    `override is None` (the only case app.py's `/api/ref2va` etc. hit when the caller
+    omits the field entirely) returns `H3_REF_IMAGE_SHORT_EDGE` unchanged -- i.e. this
+    process's env-var-resolved default, byte-for-byte the same value `_ensure_pipe_shell`
+    would already have applied. Explicit values are validated the same way the env var
+    is (positive int), but raise `ValueError` instead of warning-and-falling-back, since
+    this is a live request the caller can correct and resubmit (unlike an env var typo
+    baked in at process start).
+    """
+    if override is None:
+        return H3_REF_IMAGE_SHORT_EDGE
+    if not isinstance(override, int) or isinstance(override, bool) or override <= 0:
+        raise ValueError(
+            f"reference_image_short_edge は正の整数で指定してください: {override!r}"
+        )
+    return override
+
+
 # EXPERIMENTAL, opt-in, not yet A/B'd against the committed default at task-write time
 # (this env var and its wiring are themselves the subject of that pending A/B -- see
 # dev_notes/ or the task that added this comment). "none" (default) = transformer stays
@@ -501,8 +880,9 @@ H3_CACHE_THRESHOLD = float(os.environ.get("H3_CACHE_THRESHOLD", "0.05"))
 # Only the transformer is affected; transformer_ref (ref2va) and the text_encoder
 # (H3_TE_QUANT, already bnb-4bit nf4 by default) are untouched by this flag.
 H3_TRANSFORMER_QUANT = os.environ.get("H3_TRANSFORMER_QUANT", "none").strip().lower()
-if H3_TRANSFORMER_QUANT not in ("none", "int8"):
-    raise ValueError(f"H3_TRANSFORMER_QUANT must be 'none' or 'int8', got {H3_TRANSFORMER_QUANT!r}")
+if H3_TRANSFORMER_QUANT not in ("none", "int8", "ck-w4a8"):
+    raise ValueError(
+        f"H3_TRANSFORMER_QUANT must be 'none', 'int8' or 'ck-w4a8', got {H3_TRANSFORMER_QUANT!r}")
 
 # Upstream PR #14355's documented int8 recipe for the MiniMax-H3 transformer: skip
 # quantizing these modules (small, and/or numerically sensitive input/output
@@ -516,6 +896,15 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
     "time_embedder", "time_proj", "token_refiner",
     "norm_out", "proj_out", "audio_proj_out",
 ]
+# H3_TRANSFORMER_PREQUANT のメタデータ用の「定義時点のスナップショット」。
+# diffusers の `TorchAoHfQuantizer._process_model_before_weight_loading()` は
+# `quantization_config.modules_to_not_convert`(= 上のリストそのもの)を **in-place で
+# extend する**(keep_in_fp32_modules の "rope" 追加や、複数回ロードでの重複追加。
+# 2026-08-27 の実機 meta.json で確認)。そのため上のリストはプロセス内のロード回数に
+# 応じて中身が変わってしまい、キャッシュ無効化メタデータの比較キーには使えない。
+# 量子化の実効レシピ(「どの層を変換しないか」)は重複や "rope" の有無で変わらない
+# (マッチ判定は any() なので同値)ため、pristine なスナップショットを比較キーにする。
+_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE = tuple(H3_INT8_MODULES_TO_NOT_CONVERT)
 
 # int8 shrinks each big transformer from ~66.3GB (bf16) to ~34.0GB (measured, see
 # logs/server_int8.log), so transformer(34.0) + transformer_ref(~34, same recipe) +
@@ -527,7 +916,68 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
 # skip freeing the other variant's transformer when this is True). Only meaningful
 # together with `H3_TRANSFORMER_QUANT=int8`; bf16 mode (~66.3GB each) cannot fit both
 # at once and keeps the existing one-resident-at-a-time behaviour unchanged.
-H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
+H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT in ("int8", "ck-w4a8")
+
+# 量子化済み transformer/transformer_ref のディスクキャッシュ (既定ON、H3_TE_PREQUANT と
+# 同じ設計思想)。
+#
+# 動機: `H3_TRANSFORMER_QUANT=int8` は起動のたびに 66GB の bf16 重みを読み、
+# `quantize_()` (torchao `Int8WeightOnlyConfig(version=2)`) でその場から int8 へ量子化
+# する。この量子化はモデルが変わらない限り決定的な処理なので、**量子化後の重みを
+# 一度保存しておけば次回以降は読むだけで済む**という H3_TE_PREQUANT と全く同じ理屈が
+# そのまま当てはまる。
+#
+# 実現可能性は本タスクで実機検証済み (2026-08-27、Phase 1 probe):
+# diffusers の `save_pretrained()`/`from_pretrained()` の既定 (`safe_serialization=True`)
+# が、torchao>=0.16.0 の `flatten_tensor_state_dict`/`unflatten_tensor_state_dict`
+# (safetensors ネイティブ経路、`torchao.prototype.safetensors.safetensors_support`) を
+# 経由して `Int8Tensor` をそのまま安全に直列化できることを確認した。小型ダミー
+# ModelMixin (Linear層 + modules_to_not_convert 相当の除外層) で
+# 量子化 → save_pretrained → 別インスタンスへ from_pretrained → 固定入力での
+# forward 出力を比較し、`torch.equal` で完全一致 (max_abs_diff 0.0)。
+# H3_TE_PREQUANT の bnb-4bit 直列化 (transformers 側の実装) とは別の直列化機構
+# (diffusers+torchao 側) だが、対応する版が両方ともビット一致で動くことを確認済み。
+#
+# TE 側との違い: TE は「設定ごとに別ディレクトリ」だけで衝突を防いでいたが、
+# transformer は 2 インスタンス (`transformer` / `transformer_ref`) が別々の
+# チェックポイント "スロット" (同一モデルクラス/config だが `_ensure_transformer` と
+# `_ensure_transformer_ref` で個別にロード・保存される) を持つため、キャッシュも
+# 個別ディレクトリにする (`models/prequant/transformer_int8/` /
+# `models/prequant/transformer_ref_int8/`)。
+#
+# **保存する瞬間の注意**: `H3_TURBO_LORA` の構造的な Linear wrap や
+# `_apply_turbo_setting` の遅延 turbo LoRA 適用より**前** (量子化直後、
+# `_transformer_loaded = True` を立てる直前) に保存する。turbo LoRA は Linear モジュール
+# 自体を差し替えるため、保存済みキャッシュに焼き込んでしまうと「turbo無効のはずの
+# リクエストでも turbo 適用済みの重みしか手に入らない」事故になる。attention backend
+# 切替 (属性代入のみ)・FBC (HookRegistry フック)・AdaLN precompute
+# (`adaln_proj` サブモジュール差し替えは遅延実行、ロード時点ではまだ発生しない) は
+# いずれも `state_dict()` に影響しないため、この保存点より後で構わない
+# (本タスクで各実装のソースを確認して裏付け済み)。
+#
+# ディスク消費は各インスタンドあたり int8 で ~34GB (bf16 66GB の約半分)、2インスタンス
+# で ~68GB。空きが `H3_TRANSFORMER_PREQUANT_MIN_FREE_GB` を下回る場合は保存をスキップし、
+# 警告だけ出して**生成は続行する** (H3_TE_PREQUANT と同じ fail-open 方針、キャッシュは
+# あくまで高速化であって機能ではない)。"0" で完全無効化できる。
+H3_TRANSFORMER_PREQUANT = os.environ.get("H3_TRANSFORMER_PREQUANT", "1").strip() == "1"
+H3_TRANSFORMER_PREQUANT_DIR = Path(
+    os.environ.get("H3_TRANSFORMER_PREQUANT_DIR", str(H3_TE_PREQUANT_DIR))
+)
+# TE (17-21GB) よりシャードがはるかに大きい (~34GB/インスタンス) ため、TE の既定 25GB
+# より大きい下限を既定にする。
+H3_TRANSFORMER_PREQUANT_MIN_FREE_GB = float(
+    os.environ.get("H3_TRANSFORMER_PREQUANT_MIN_FREE_GB", "40")
+)
+# 保存前に確認する空きホスト RAM の下限 (GB)。`save_pretrained` は
+# `max_shard_size="10GB"` のシャード単位で `state.dict()` (GPU上のテンソルのまま) を
+# safetensors へ直列化するため、34GB 全体を一度に CPU へコピーするわけではない
+# (本タスクでソースを確認: `modeling_utils.py` の `save_pretrained` はシャードごとに
+# `safetensors.torch.save_file(shard, ...)` を呼ぶだけで、GPU テンソルの CPU コピーは
+# safetensors 内部がシャード単位で行う) が、念のため CLAUDE.md #33 と同じ流儀で
+# 事前ガードを掛ける。
+H3_TRANSFORMER_PREQUANT_MIN_RAM_GB = float(
+    os.environ.get("H3_TRANSFORMER_PREQUANT_MIN_RAM_GB", "15")
+)
 
 # ref2va リクエストの終わりに、入口で解放した t2va 用 `transformer` を**その場で**
 # 積み直すか (2026-08-12 に既定を「積み直さない」へ変更)。
@@ -607,7 +1057,8 @@ if H3_LOWVRAM_ANY:
             "(it will default to int8 under H3_LOWVRAM) or set "
             "H3_TRANSFORMER_QUANT=int8 explicitly."
         )
-    H3_TRANSFORMER_QUANT = "int8"
+    if H3_TRANSFORMER_QUANT == "none":
+        H3_TRANSFORMER_QUANT = "int8"
     H3_TRANSFORMER_BOTH_RESIDENT = False
     # Every `H3_LOWVRAM`/`H3_LOWVRAM_GROUP` branch further down in this file
     # (generate()/generate_ref2va()) is written assuming TE_QUANT == "bnb-4bit" (it is
@@ -622,6 +1073,67 @@ if H3_LOWVRAM_ANY:
             f"got H3_TE_QUANT={TE_QUANT!r}. bf16 TE (~66.3GB) cannot coexist with "
             "anything else on a 24-48GB-class card."
         )
+
+# ---- AdaLN-pruned transformer_ref (2026-10-01、core/pruned.py 参照) -------------
+# multimodalart/MiniMax-H3-Pruned: AdaLN 入力射影の構造リファクタ(13.03B 削減、
+# ほぼロスレス)。ref2va 用 transformer_ref を pruned + int8 weight-only で読む
+# (既定 int8wo: 4.60 s/step・peak 28GB 実測。常駐 ~21GB)。現状 ref2va(transformer_ref)専用 -- t2va 側の
+# pruned 化は未実装(transformer/ サブフォルダを取得していない)。
+H3_PRUNED = os.environ.get("H3_PRUNED", "0").strip() == "1"
+H3_PRUNED_REPO = os.environ.get("H3_PRUNED_REPO", "multimodalart/MiniMax-H3-Pruned").strip()
+H3_PRUNED_CONVROT_GROUP = int(os.environ.get("H3_PRUNED_CONVROT_GROUP", "256"))
+# pruned transformer_ref の量子化方式(core/pruned.py の PRUNED_QUANT_SPECS)。既定は
+# `int8wo`(torchao Int8WeightOnlyConfig(version=2, PerRow)、ConvRot なし。2026-10-01 に
+# int8dyn-convrot から変更: 実測 4.60 vs 7.60 s/step、peak 28GB、品質同等。速度差の主因は
+# torchao int8 動的量子化の eager 経路)。`int8dyn-convrot`(旧既定)・`int8wo-convrot`・
+# `fp8`・`fp8-convrot`・`bf16` も選べる。キャッシュ dir 名・meta.json は方式ごとに別
+# (旧既定 int8dyn-convrot のキャッシュも従来のまま使える)。
+# 未知の値・torchao に無い config は初回リクエストまで持ち越さず、起動時にここで落とす。
+if H3_TRANSFORMER_QUANT == "ck-w4a8" and not H3_PRUNED:
+    raise RuntimeError(
+        "H3_TRANSFORMER_QUANT=ck-w4a8 は現状 H3_PRUNED=1 と併用してください"
+        "(非 pruned の transformer_ref への ck-w4a8 適用は未実装。base(t2va/fl2va)側のみ対応)。"
+    )
+H3_PRUNED_QUANT = os.environ.get("H3_PRUNED_QUANT", "int8wo").strip().lower()
+if H3_PRUNED:
+    from core import pruned as _pruned_mod
+
+    H3_PRUNED_QUANT_SPEC = _pruned_mod.get_quant_spec(H3_PRUNED_QUANT)
+    H3_PRUNED_QUANT_SPEC.check_available()
+    H3_PRUNED_QUANT = H3_PRUNED_QUANT_SPEC.name
+else:
+    H3_PRUNED_QUANT_SPEC = None
+# H3_PRUNED_COMPILE=1: ConvRot 系の方式(int8dyn-convrot 等)のとき、ロード後に 300 の ConvRot
+# Linear(回転 + 量子化 GEMM)へ torch.compile(dynamic=True)を適用する(core/pruned.py の
+# compile_convrot_layers)。torchao int8 動的量子化 eager 経路の未融合 per-token 量子化を
+# 融合して GEMM を ~3 倍速くする。既定 0(完全に従来どおり)。ConvRot 無しの方式では無効。
+_h3_pc = os.environ.get("H3_PRUNED_COMPILE", "0").strip()
+# 1 = ConvRot Linear のみ compile。2 = さらに turbo LoRA ラッパー(base + LoRA 加算)も compile
+# (実験: LoRA の mul/add を融合して elementwise の素通しを減らす)。
+H3_PRUNED_COMPILE_LEVEL = int(_h3_pc) if _h3_pc in ("1", "2", "3") else 0  # 3 = probe: 2 + transformer ブロック単位 compile (attention は graph break)
+H3_PRUNED_COMPILE = H3_PRUNED_COMPILE_LEVEL >= 1
+if H3_PRUNED_COMPILE and not (H3_PRUNED and H3_PRUNED_QUANT_SPEC is not None and H3_PRUNED_QUANT_SPEC.convrot and H3_PRUNED_QUANT_SPEC.quantized):
+    logging.getLogger("minimax_h3").warning(
+        "H3_PRUNED_COMPILE=1 は H3_PRUNED=1 かつ ConvRot 系の量子化方式(H3_PRUNED_QUANT=int8dyn-convrot 等)"
+        "でのみ有効です。現在の設定では無視します。"
+    )
+    H3_PRUNED_COMPILE = False
+    H3_PRUNED_COMPILE_LEVEL = 0
+if H3_PRUNED and H3_TRANSFORMER_QUANT not in ("int8", "ck-w4a8"):
+    # pruned は ref2va の transformer_ref 専用で、その量子化方式は H3_PRUNED_QUANT が決める。
+    # H3_TRANSFORMER_QUANT は t2va 側の transformer と両常駐(H3_TRANSFORMER_BOTH_RESIDENT)
+    # / LOWVRAM 経路を決めるため別軸だが、pruned との組み合わせは int8 でしか検証して
+    # いないので従来どおり int8 を要求する。
+    raise RuntimeError(
+        "H3_PRUNED=1 は H3_TRANSFORMER_QUANT=int8 と併用してください(pruned 側の量子化"
+        "方式は H3_PRUNED_QUANT で選ぶ。H3_TRANSFORMER_QUANT は t2va 側/両常駐/LOWVRAM の"
+        "経路を決める別軸で、pruned との組み合わせは int8 のみ検証済み)。"
+    )
+if H3_PRUNED and H3_LOWVRAM_GROUP:
+    raise RuntimeError(
+        "H3_PRUNED=1 と H3_LOWVRAM=group は併用できません(group offload 経路の "
+        "pruned 対応は未実装。pruned は常駐 19.6GB なので group が必要な場面も薄い)。"
+    )
 
 # EXPERIMENTAL, opt-in. `H3_LOWVRAM=1` は毎リクエスト、デコード直前に transformer を
 # 解放し次リクエストで再ロードする (実測 14.8-32.7s の固定費、RESIDENCY.md §5.5)。
@@ -694,6 +1206,276 @@ if H3_KEEP_TRANSFORMER:
             "OR H3_TE_PROJ set) AND H3_VIDEO_VAE_FP16=1 (see this flag's module comment "
             "for the VRAM budget derivation). Missing: " + "; ".join(_keep_transformer_missing)
         )
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_KEEP_REF2VA=1`: ref2va の transformer_ref と
+# TE をリクエスト間で GPU に常駐させる (`H3_LOWVRAM=1` 専用)。
+#
+# 背景: `H3_LOWVRAM=1` の ref2va は毎リクエスト「TE ロード → 参照エンコード → TE 解放 →
+# transformer_ref ロード → denoise → transformer_ref 解放 → decode」を回すため、
+# denoise 以外に ~43s の固定費がある (うち TE ロード 12.8s + transformer_ref ロード 13.2s)。
+# H3_PRUNED=1 (AdaLN-pruned + int8wo) なら transformer_ref の常駐は 21.6GB、TE
+# (nf4, prune) は 17.5GB なので、同一GPUへ両方載せたまま回せる見込みがある
+# (denoise 活性化 +6.4GB)。このフラグは次の 4 箇所の解放だけを gate する:
+#   (1) generate_ref2va() 入口の `_free_transformer_ref()`
+#   (2) H3_LOWVRAM 分岐の「参照エンコード後の TE 解放」
+#   (3) decode 窓の `_free_transformer_ref()`
+#   (4) `H3_KEEP_REF2VA_VAE=1` のときだけ: VAE pair の CPU 退避 (既定 0 = 従来どおり
+#       参照エンコード後と decode 後に CPU へ退避。VAE を GPU に置いたままにすると
+#       denoise の予算が +5.8GB 増えるため、収支の取れる GPU だけで明示的に使う)
+# 上記以外は一切触らない。既定 (H3_KEEP_REF2VA=0) は 1バイトも挙動が変わらない。
+#
+# 制約と設計判断:
+#   - H3_LOWVRAM=1 以外は起動時エラー。LOWVRAM=0 (int8) は元々 transformer_ref+TE を
+#     常駐させる設計 (H3_TRANSFORMER_BOTH_RESIDENT)、group は CPU 常駐で別設計のため。
+#   - TE を別GPUへ置く構成 (H3_TE_DEVICE) や投影TE (H3_TE_PROJ) でも害はない
+#     (`_free_text_encoder` が元々 no-op / 小さい)。KEEP_TRANSFORMER のような
+#     「TE 別GPU必須」ガードは要らない: pruned の transformer_ref は 21.6GB で、
+#     TE 17.5 + 21.6 = 39.1GB が 48GB 級の予算内に収まるため (KEEP_TRANSFORMER の
+#     ガードは TE 17.45 + int8 transformer 34.3 = 51.75GB > 49.8GB が根拠だった)。
+#   - **非 pruned** (transformer_ref int8 34.3GB) では TE 17.5 + 34.3 + 活性化 6.4 =
+#     58.2GB 必要になり、48GB 級には載らない。起動時に GPU 総容量と突き合わせ、
+#     足りなければ RuntimeError、足りるなら (96GB 級) 警告ログのみとする。
+#   - VRAM が足りないときは素直に CUDA OOM にする。transformer を丸ごと CPU へ
+#     スワップして凌ぐ実装は入れない (diffusers-server CLAUDE.md #33 の事故パターン)。
+#   - 他リクエスト (t2va/fl2va/t2i/ref バッチ) は従来どおり `_free_transformer_ref()` で
+#     transformer_ref を落とし、TE も force 解放するので、常駐は自然に解消される。
+#     次の ref2va が `_load_text_encoder`/`_ensure_transformer_ref` (冪等) で再構築する。
+#   - H3_REF_PREFIX_CACHE_SINGLE=1 のプレフィックス KV (~0.84GiB) は TE と寿命を共にする
+#     (`_free_text_encoder` で捨てる) ので、TE が常駐するこのモードでは同一参照の
+#     リクエスト間で HIT し続ける (VRAM +0.84GiB を常駐させる点に注意)。
+H3_KEEP_REF2VA = os.environ.get("H3_KEEP_REF2VA", "0").strip() == "1"
+H3_KEEP_REF2VA_VAE = os.environ.get("H3_KEEP_REF2VA_VAE", "0").strip() == "1"
+if H3_KEEP_REF2VA:
+    if H3_LOWVRAM_RAW != "1":
+        raise RuntimeError(
+            f"H3_KEEP_REF2VA=1 requires H3_LOWVRAM=1 (got {H3_LOWVRAM_RAW!r}): LOWVRAM=0 "
+            "(int8) already keeps transformer_ref+TE resident by design, and 'group' keeps "
+            "its transformer CPU-resident via a different design -- neither needs this flag."
+        )
+    _keep_ref2va_need_gb = 17.5 + (21.6 if H3_PRUNED else 34.3) + 6.4
+    _keep_ref2va_total_gb = None
+    try:
+        if torch.cuda.is_available():
+            _keep_ref2va_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    except Exception:  # pragma: no cover - 診断用なので落とさない
+        pass
+    if _keep_ref2va_total_gb is not None and _keep_ref2va_need_gb > _keep_ref2va_total_gb * 0.98:
+        raise RuntimeError(
+            f"H3_KEEP_REF2VA=1 needs ~{_keep_ref2va_need_gb:.1f}GB resident+denoise "
+            f"(TE 17.5 + transformer_ref {'pruned 21.6' if H3_PRUNED else 'int8 34.3'} + "
+            f"activations 6.4) but this GPU has {_keep_ref2va_total_gb:.1f}GB total. "
+            "Use H3_PRUNED=1 or drop H3_KEEP_REF2VA."
+        )
+    if not H3_PRUNED:
+        logger.warning(
+            "H3_KEEP_REF2VA=1 without H3_PRUNED=1: resident set ~%.1fGB (TE 17.5 + int8 "
+            "transformer_ref 34.3 + denoise activations 6.4) -- only fits 80GB-class "
+            "cards, will OOM on 48GB-class.", _keep_ref2va_need_gb,
+        )
+    if not H3_VIDEO_VAE_FP16:
+        logger.warning(
+            "H3_KEEP_REF2VA=1 without H3_VIDEO_VAE_FP16=1: the decode window must fit "
+            "TE + transformer_ref + the fp32 VAE decode peak (16.3GB) -- set H3_VIDEO_VAE_FP16=1."
+        )
+    logger.info(
+        "H3_KEEP_REF2VA=1: ref2va keeps text_encoder + transformer_ref resident across "
+        "requests (pruned=%s, vae_resident=%s, prefix_cache_single=%s)",
+        H3_PRUNED, H3_KEEP_REF2VA_VAE, os.environ.get("H3_REF_PREFIX_CACHE_SINGLE", "0"),
+    )
+
+
+def _keep_ref2va_active() -> bool:
+    """H3_KEEP_REF2VA が今も有効か。`core.settings.apply_reload_settings()` が lowvram を
+    実行時に書き換えうる (そのとき unload_all() で常駐は消える) ので、import 時の定数
+    ではなく呼び出しのたびに LOWVRAM=1 かどうかも併せて見る。"""
+    return H3_KEEP_REF2VA and H3_LOWVRAM
+
+
+# `H3_KEEP_REF2VA=1` 専用 (2026-10-06)。**ref2va スタック (TE + transformer_ref) を常駐させたまま
+# t2va/fl2va/t2i の base transformer を同居ロードする** (両常駐)。
+#
+# 動機 (実測): r-n-v の H3 運用では、会話ターンの合間に待機プール補充 (fl2va = base transformer)
+# が走る。従来は fl2va の入口が `_free_transformer_ref()` で transformer_ref を、さらに encode 後に
+# `_free_text_encoder(force=True)` で TE を解放していたため、次の会話ターンの先頭 ref2va が TE +
+# transformer_ref の再ロードを払い、6秒 → 22〜40秒に劣化した。
+# 収支 (RTX PRO 6000 96GB): TE 17.4 + transformer_ref(pruned) 22.2 + VAE ほか ~6 = ~46〜50GB 常駐
+# + base transformer(int8) ~34.3 + denoise 活性化 ~6.4 = ~85〜90GB。96GB 級では収まるが、
+# 32GB/48GB 級 (低VRAM構成) では収まらないので、**実行時に空きVRAMを測って判定**し、足りなければ
+# 従来どおり解放する (黙って OOM させない)。判定根拠は `_keep_ref2va_coexist()` が INFO ログ1行で出す。
+#   H3_KEEP_REF2VA_COEXIST=0                : 両常駐を使わない (従来挙動: 常に解放)
+#   H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB=42.7 : 同居に必要な空き (base 34.3 + 活性化 6.4 + 余裕 2.0)。
+#                                             TE 未ロードなら +17.5GB を自動加算する。
+# KEEP_REF2VA なし (既定) ではどちらも参照されず、挙動は 1 バイトも変わらない。
+H3_KEEP_REF2VA_COEXIST = os.environ.get("H3_KEEP_REF2VA_COEXIST", "1").strip() != "0"
+H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB = float(os.environ.get("H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB", "42.7"))
+
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_TE_DIET=1`: bnb-4bit text_encoder の VRAM ダイエット。
+# LTX-2.5 の `LTX25_TE_DIET` (backends/ltx2_5/app/tediet.py) と同じ発想を H3 の TE
+# (Qwen3-VL-32B, H3_TE_PRUNE=1 の 51 層) に適用する。H3 が読むのは
+# `text_encoder.model(...)` の `hidden_states[50]` だけなので:
+#   (1) `lm_head` (151936x5120 bf16 = 1.449GiB) は一度も呼ばれない (encoders.py も本ファイルの
+#       `_encode_ref2va_prompt*` も `text_encoder.model` を直接呼ぶ。`tie_word_embeddings=false`
+#       なので embed と共有でもない) -> ロード直後に重みを解放する。
+#   (2) `embed_tokens` (151936x5120 bf16 = 1.449GiB, bnb は Linear しか量子化しないので bf16 の
+#       まま GPU 常駐していた) -> モジュールごと CPU へ置き、forward を「input_ids を CPU へ ->
+#       CPU で gather -> 呼び出し元デバイスへ戻す」ブリッジに差し替える (往復は数千トークン x
+#       10KB = 数十MB 以下)。TE 全体を CPU へ動かすのではなく、埋め込みテーブル 1 枚だけの
+#       配置換え (粒度が小さく、diffusers-server CLAUDE.md #33 の禁止パターンには当たらない)。
+# 合計 常駐 -2.9GiB。**どちらも計算経路の外か値の等価な配置換えのみなので出力はビット一致**
+# (CPU gather は同じ bf16 値を返し、lm_head は計算に参加しない)。既定 (0) は挙動不変。
+# 適用対象は bnb-4bit の TE のみ (H3_TE_QUANT=none / H3_TE_PROJ は対象外)。
+H3_TE_DIET = os.environ.get("H3_TE_DIET", "0").strip() == "1"
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_TE_STREAM=1`: bnb-4bit text_encoder の LM 層
+# (H3_TE_PRUNE=1 の 51 層、~13GiB) を pinned host に置き、エンコード中だけ窓付きで層単位に
+# GPU へ流す (LTX-2.5 の `LTX25_TE_STREAM`、`core/testream.py`)。TE が呼ばれるのは参照
+# プレフィックスのエンコード (cache MISS 時) と各リクエストのプロンプト継続 forward だけで、
+# denoise / decode の間は LM 層は使われない -> その間の GPU 常駐を ~13GiB 減らす。
+# 層単位の移動 (モジュール丸ごとのスワップではない)・値は不変なので出力はビット一致。
+# 適用は `_apply_te_diet` の直後 (同じ2箇所)。TE が計算用 GPU に載る bnb-4bit 構成専用
+# (H3_TE_DEVICE 外部常駐・H3_TE_QUANT=none・H3_TE_PROJ では無視)。ホスト RAM は pinned
+# 確保分 (~14GiB) + 余裕を MemAvailable で確認し、足りなければ RuntimeError。
+# `H3_TE_STREAM_WINDOW` (既定 2 = LTX-2.5 と同じ): 先読みする層数。既定 (0) は挙動不変。
+H3_TE_STREAM = os.environ.get("H3_TE_STREAM", "0").strip() == "1"
+H3_TE_STREAM_WINDOW = max(1, int(os.environ.get("H3_TE_STREAM_WINDOW", "2").strip() or "2"))
+H3_TE_STREAM_MIN_FREE_RAM_GB = float(os.environ.get("H3_TE_STREAM_MIN_FREE_RAM_GB", "10").strip() or "10")
+
+
+def _apply_te_stream(text_encoder) -> float:
+    """`H3_TE_STREAM`: 適用して pinned GiB を返す。冪等。呼び出し側が `not self._te_external` を保証する。"""
+    from core.testream import apply_te_stream
+
+    pinned = apply_te_stream(
+        text_encoder, window=H3_TE_STREAM_WINDOW, min_free_ram_gb=H3_TE_STREAM_MIN_FREE_RAM_GB
+    )
+    if pinned > 0.0:
+        gc.collect()
+        torch.cuda.empty_cache()
+    return pinned
+
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_REF_PREFIX_PARK=1`: `H3_REF_PREFIX_CACHE_SINGLE=1` の
+# プレフィックス KV (~0.84GiB) を、エンコードしていない間は CPU (pinned) に置く。KV を使うのは
+# 次のリクエストの `_encode_ref2va_prompt_prefix_cached()` の継続 forward だけで、denoise/decode
+# の間は不要。HIT 時にその直前で GPU へ戻す (~100 テンソル / ~1GiB の PCIe 転送、同一値の
+# 移動なので出力はビット一致)。`H3_KEEP_REF2VA=1` では TE (=キャッシュの寿命) が常駐するため
+# キャッシュも常駐し続け、decode 窓の VRAM を 0.84GiB 食う -- それを返すためのフラグ。
+# 既定 (0) は挙動不変。
+H3_REF_PREFIX_PARK = os.environ.get("H3_REF_PREFIX_PARK", "0").strip() == "1"
+
+# 診断用 (既定 0): ref2va の decode 窓の割り当て量とピークをログに出す。ピーク統計を窓の前で
+# リセットするため (結果の peak_vram_gb は窓前のピークと合成して保つ) ふつうは使わない。
+H3_DEBUG_DECODE_MEM = os.environ.get("H3_DEBUG_DECODE_MEM", "0").strip() == "1"
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_VAE_SPLIT=1` (`H3_KEEP_REF2VA=1` 専用): ref2va で VAE を
+# GPU へ送る 2 つの窓のうち、参照エンコード窓には encode 側 (video encoder 0.34GiB + audio
+# encoder 系 ~0.3GiB)、デコード窓には decode 側 (video decoder 4.5GiB + audio decoder ~0.25GiB)
+# だけを送る。従来は両方の窓で pair 全体 (6.3GiB) を送っており、KEEP_REF2VA のように TE +
+# transformer_ref が常駐している間は **この 2 窓が VRAM のピークを決めていた** (実測: 窓前の
+# 割り当て 41.1GB -> 窓内 46.9GB、denoise 自体は窓より低い)。配置換えのみなので出力はビット一致。
+# 既定 (0) は挙動不変。
+H3_VAE_SPLIT = os.environ.get("H3_VAE_SPLIT", "0").strip() == "1"
+
+# `H3_VAE_PINNED=1`: VAE の GPU<->CPU 退避 (`_vae_to_gpu`/`_vae_to_cpu`) を pinned CPU
+# マスター方式にする。VAE の重みは推論中に変化しないので、初回に pinned CPU コピー
+# (マスター) を作って以後は (1) ->CPU は `p.data` をマスターへ付け替えるだけ
+# (D2H コピー自体を省略)、(2) ->GPU は pinned からの高速 H2D、にできる。
+# 動機 = 単機 32GB 構成 (KEEP_REF2VA_VAE=0 で毎チャンク pageable 往復 2.4s が固定費、
+# 2026-10-07 実測: ->GPU 0.83s + ->CPU 1.61s @ 141f)。ホスト RAM を VAE サイズぶん
+# (~5-6GiB) pinned で常駐消費する。既定 0 = 従来どおり `.to()` で挙動不変。
+H3_VAE_PINNED = os.environ.get("H3_VAE_PINNED", "0").strip() == "1"
+
+# `H3_BASE_PINNED=1`: base transformer (t2va/fl2va) の解放・再ロードを pinned CPU
+# マスター方式の退避に置き換える (H3_VAE_PINNED と同型のポインタ付け替え)。
+# H3_LOWVRAM の振り付けは待機 (fl2va) のたびに base を `_free_transformer()` ->
+# `_ensure_transformer()` で作り直すが、ck-w4a8 base はこの再ロードが毎回 7.7〜8.4s
+# (12.5GB キャッシュの torch.load + H2D。int8 時代の 4.2s より悪化) かかる。重みは
+# 推論中に不変なので、モジュールを壊さず保持し、重み実体だけを pinned CPU マスターと
+# GPU の間で付け替える: 退避は `p.data = master` のみ (D2H 無し・一時二重化無し =
+# CLAUDE.md #33 の丸ごと `.to()` スワップとは異なり RAM スパイクしない)、復帰は
+# pinned H2D (~12.5GB で実測 0.5s 級)。turbo LoRA ラップ・attention backend 設定も
+# モジュールごと保持されるので再適用も不要になる。
+# ck-w4a8 (pruned base ~12.5GB) 専用: int8 base (~33GB) を pinned 常駐させる設計は
+# 未検証のため、quant が ck-w4a8 以外 (または group mode) では無効化して警告する。
+# ホスト RAM を ~12.5GiB pinned で常駐消費する。既定 0 = 従来どおり。
+H3_BASE_PINNED = os.environ.get("H3_BASE_PINNED", "0").strip() == "1"
+if H3_BASE_PINNED and (H3_TRANSFORMER_QUANT != "ck-w4a8" or H3_LOWVRAM_GROUP):
+    logger.warning(
+        "H3_BASE_PINNED=1 は H3_TRANSFORMER_QUANT=ck-w4a8 (非 group) 専用です "
+        "(quant=%r, group=%s) -- 無効化して従来のロード経路を使います",
+        H3_TRANSFORMER_QUANT, H3_LOWVRAM_GROUP,
+    )
+    H3_BASE_PINNED = False
+
+# `H3_REF_PINNED=1`: transformer_ref (ref2va) にも H3_BASE_PINNED と同じ pinned CPU
+# マスター退避を適用する。H3_LOWVRAM の低VRAM構成 (TE_STREAM/VAE_SPLIT 系) では
+# decode 窓と fl2va 入口の `_free_transformer_ref()` が走るため、**連続する会話ターン
+# ですら毎回 ck キャッシュの再ロード ~9.5s を払っていた** (2026-10-08 の 32GB/24GB 窓
+# サイクル実測)。pinned 退避で park 0.3s / restore ~2s に縮む。
+# ck-w4a8 pruned ref (~13GB) 専用 (int8wo pruned 20GB の pinned 常駐は未検証)。
+# ホスト RAM を ~13.6GiB pinned で常駐消費する。既定 0 = 従来どおり。
+H3_REF_PINNED = os.environ.get("H3_REF_PINNED", "0").strip() == "1"
+if H3_REF_PINNED and (not H3_PRUNED or H3_PRUNED_QUANT != "ck-w4a8" or H3_LOWVRAM_GROUP):
+    logger.warning(
+        "H3_REF_PINNED=1 は H3_PRUNED=1 + H3_PRUNED_QUANT=ck-w4a8 (非 group) 専用です "
+        "(pruned=%s, pruned_quant=%r, group=%s) -- 無効化して従来のロード経路を使います",
+        H3_PRUNED, H3_PRUNED_QUANT, H3_LOWVRAM_GROUP,
+    )
+    H3_REF_PINNED = False
+
+# `H3_FL2VA_KEEP_TE=1`: H3_LOWVRAM の t2va/fl2va が encode 後に行う
+# `_free_text_encoder(force=True)` をスキップし、TE (bnb-4bit、TE_STREAM 後の GPU
+# 常駐 ~4GB) を待機生成の間も残す。TE を解放すると次の会話ターンが TE 再ロード
+# (8s) + TE_DIET/TE_STREAM 再適用 (7s) + ref-prefix 再エンコード (3s、prefix cache
+# は TE free で消される) を払う (2026-10-08 実測、speech 定常 43s の主因)。
+# int8 base 33GB 時代は TE と base の同居余地が無く解放が必須だったが、ck-w4a8
+# base (13GB) なら fl 窓 peak +~4.3GB で済む (24GB 窓でも収支が合う)。
+# 既定 0 = 従来どおり。KEEP_REF2VA 両常駐 (coexist) が成立する環境では不要
+# (coexist が TE ごと残すため、このフラグは coexist 不成立時の部分的 keep)。
+H3_FL2VA_KEEP_TE = os.environ.get("H3_FL2VA_KEEP_TE", "0").strip() == "1"
+
+
+def _apply_te_diet(text_encoder) -> float:
+    """`H3_TE_DIET`: lm_head の重みを解放し、embed_tokens を CPU ブリッジ化する。
+
+    Returns: GPU から解放された GiB。冪等 (2回目以降は 0.0)。
+    """
+    inner = getattr(text_encoder, "model", None)
+    lang = getattr(inner, "language_model", None) if inner is not None else None
+    embed = getattr(lang, "embed_tokens", None) if lang is not None else None
+    if embed is None or getattr(embed, "_h3_te_diet", False):
+        return 0.0
+    freed = 0
+    # (1) lm_head: 使われないので、1 要素のダミー重みに差し替えて実体を解放する
+    #     (属性ごと消すと `PreTrainedModel` の tie/重み管理が参照して壊れうるため、形だけ残す)。
+    lm_head = getattr(text_encoder, "lm_head", None)
+    w = getattr(lm_head, "weight", None)
+    if w is not None and not getattr(w, "is_meta", False):
+        freed += w.numel() * w.element_size()
+        lm_head.weight = torch.nn.Parameter(
+            torch.empty(1, 1, dtype=w.dtype, device=w.device), requires_grad=False
+        )
+    # (2) embed_tokens: CPU ブリッジ。`embed.weight.device` が cpu でも `text_encoder.device`
+    #     (最初のパラメータ = vision tower) は変わらない。
+    orig_forward = embed.forward
+    freed += embed.weight.numel() * embed.weight.element_size()
+
+    def _bridged_embed_forward(input_ids: torch.Tensor) -> torch.Tensor:
+        return orig_forward(input_ids.to("cpu")).to(input_ids.device)
+
+    embed.to("cpu")
+    embed.forward = _bridged_embed_forward
+    embed._h3_te_diet = True
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+    freed_gib = freed / 1024**3
+    logger.info(
+        "[H3_TE_DIET] lm_head released + embed_tokens -> CPU bridge: %.2fGiB freed from GPU", freed_gib
+    )
+    return freed_gib
+
 
 # "group" mode's own RAM guard (see H3_LOWVRAM_GROUP's design comment further down):
 # the int8 transformer (~34GB) is loaded once and stays resident in host RAM for the
@@ -878,6 +1660,14 @@ H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "lightx2v/Minimax-h3-T
 H3_TURBO_LORA_FILE = os.environ.get(
     "H3_TURBO_LORA_FILE", "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
 )
+# 【2026-10-07 追加】base transformer (t2va/fl2va) 専用の turbo LoRA 指定。未指定 (既定) は
+# 従来どおり上の REPO/FILE が base/ref 両 transformer に共通適用される (挙動不変)。
+# 動機: 両常駐運用 (run.sh 既定 = ref2v 8step) だと待機 (fl2va = base transformer) にも
+# ref2v 用 LoRA が転用され、かつファイル名が `_fl2v_` でないため video shift 6 の自動切替も
+# 効かない。`H3_TURBO_LORA_FILE_BASE=minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors`
+# なら base だけ fl2v 4step LoRA + shift 6、ref2va 側は従来どおり。
+H3_TURBO_LORA_REPO_BASE = os.environ.get("H3_TURBO_LORA_REPO_BASE", "").strip() or H3_TURBO_LORA_REPO
+H3_TURBO_LORA_FILE_BASE = os.environ.get("H3_TURBO_LORA_FILE_BASE", "").strip() or H3_TURBO_LORA_FILE
 
 # 既知の comfy (融合QKV) 形式リポジトリ。int8 との組み合わせ拒否 (import 時と
 # リクエスト時の両方) はこの形式のときだけ必要 -- diffusers ネイティブ形式は
@@ -916,10 +1706,12 @@ if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
     )
 
 # スケジューラの exponential shift の上書き (既定は空 = 触らない)。H3 の既定は
-# video 12.0 / audio 3.0 (scheduler_config.json) で、turbo v0.1・8step v1.0 も同じ格子で
-# 蒸留されているため通常は不要。**turbo 4step v1.0 768p だけは video shift 6 で蒸留**
-# されており (上流 ModelTC/Minimax-H3-Turbo の Model specs 表: Training shifts 6 / 3)、
-# その LoRA を使うときは `H3_VIDEO_SHIFT=6` を併せて指定しないとサンプリング格子が
+# video 12.0 / audio 3.0 (scheduler_config.json)。lightx2v turbo LoRA の訓練 shift は
+# **fl2v 系の `_768p` バリアントだけが video shift 6** で、それ以外 (fl2v 非768p、
+# ref2v 系は 768p 表記を含め全て) は基底と同じ 12 / 3
+# (上流 ModelTC/Minimax-H3-Turbo の Model specs 表 + ref2v 8step v1.0 768p は
+# HF discussions/51 の公式推奨 "video shift 12 / audio shift 3" で確認。2026-09-09)。
+# fl2v 768p 系を使うときは `H3_VIDEO_SHIFT=6` を併せて指定しないとサンプリング格子が
 # 蒸留時とずれる。適用箇所は `_ensure_vaes` のスケジューラロード直後 (プロセスに1回。
 # scheduler は _pipe/_pipe_ref で同一オブジェクトを共有するため1箇所で足りる)。
 H3_VIDEO_SHIFT = os.environ.get("H3_VIDEO_SHIFT", "").strip()
@@ -933,16 +1725,29 @@ H3_AUDIO_SHIFT = os.environ.get("H3_AUDIO_SHIFT", "").strip()
 # ごとに on/off できる) なので、shift もそれに追従する必要がある (固定してしまうと
 # turbo=0 のリクエストが誤った格子で走る)。
 # 解決規則: 明示指定があればその値を最優先。空なら
-# H3_TURBO_LORA_FILE のファイル名に `_768p` を含むかどうかで自動判定する
-# (768p 系だけ video shift 6 で蒸留されている -- 上の H3_VIDEO_SHIFT のコメント参照)。
-# 該当しなければ「切替なし」(turbo=1 でも配布既定/H3_VIDEO_SHIFT のまま)。
+# H3_TURBO_LORA_FILE のファイル名が「fl2v 系かつ `_768p`」のときだけ 6 に切り替える
+# (video shift 6 で蒸留されているのは fl2v の 768p バリアントだけ -- 上の
+# H3_VIDEO_SHIFT のコメント参照)。該当しなければ「切替なし」(turbo=1 でも
+# 配布既定/H3_VIDEO_SHIFT のまま)。
+# 【2026-09-09 修正】旧規則は `_768p` だけを見ていたため、ref2v 8step v1.0 768p
+# (訓練/推奨 shift 12) に shift 6 を誤適用していた (gateway ログ 2026-09-03 21:52:11
+# で実害を確認 -- mv_studio_V3 の balance tier がこの誤 shift で走っていた)。
+# A/B 実測は outputs/ab_8step4_20260909/README.md 参照。
 H3_TURBO_VIDEO_SHIFT_RAW = os.environ.get("H3_TURBO_VIDEO_SHIFT", "").strip()
 if H3_TURBO_VIDEO_SHIFT_RAW:
     H3_TURBO_VIDEO_SHIFT: float | None = float(H3_TURBO_VIDEO_SHIFT_RAW)
-elif "_768p" in H3_TURBO_LORA_FILE:
+elif "_fl2v_" in H3_TURBO_LORA_FILE and "_768p" in H3_TURBO_LORA_FILE:
     H3_TURBO_VIDEO_SHIFT = 6.0
 else:
     H3_TURBO_VIDEO_SHIFT = None
+# base transformer (generate/generate_still_batch) 用の shift。明示指定 (RAW) は base/ref 共通、
+# なければ H3_TURBO_LORA_FILE_BASE のファイル名から判定 (BASE 未指定なら上と同一 = 不変)。
+if H3_TURBO_VIDEO_SHIFT_RAW:
+    H3_TURBO_VIDEO_SHIFT_BASE: float | None = H3_TURBO_VIDEO_SHIFT
+elif "_fl2v_" in H3_TURBO_LORA_FILE_BASE and "_768p" in H3_TURBO_LORA_FILE_BASE:
+    H3_TURBO_VIDEO_SHIFT_BASE = 6.0
+else:
+    H3_TURBO_VIDEO_SHIFT_BASE = None
 if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
     raise RuntimeError(
         "H3_TURBO_LORA=1 with the comfy-format (fused-QKV) LoRA "
@@ -955,9 +1760,83 @@ if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_AN
         "(lightx2v/Minimax-h3-Turbo) instead, or drop the other flag."
     )
 
+# HyperFlow (Video Rebirth の 8-step flow-map 蒸留 LoRA、2026-09-26 統合、A/B 検証用)。
+# rank256/alpha256(scale=1.0)の PEFT LoRA + TwoTimeEmbedder(現在時刻 t と step 終端 r の
+# 2時刻条件付け、gate=0.25)+ 焼き込み9点σグリッド(8 NFE、shift はスケジューラ設定値を
+# 実行時に適用 -- 既定 12/3 は蒸留時と同一)。**ref2va 専用**(t2va/fl2va は generate() 側で
+# 明確に拒否する。LoRA 自体は3タスク対応だが transformer(非ref)側への配線は未実装)。
+# 適用機構は hyperflow_h3 パッケージ(公式、pip 導入済み):
+#   - runner 名前空間の MiniMaxH3SetTimestepsStep を HyperFlowSetTimestepsStep へ丸ごと
+#     差し替える(下)。未ロード時の _hyperflow_is_disabled() は False(=有効扱い)を
+#     返す実装のため、transformer_ref のロードが set_timesteps より後でも正しく
+#     HyperFlow グリッドが組まれる(実装確認済み)。
+#   - denoise 側は _maybe_hyperflowify_denoise_step() が LoopDenoiser サブブロックを
+#     HyperFlowLoopDenoiser へ差し替える(endpoint_context の配線はそちらが担う)。
+#   - LoRA 本体のロードは apply_instant_settings(is_ref=True) 直前の
+#     _ensure_hyperflow_ref()(単一チョークポイント、ref2va と ref バッチ両方を通る)。
+# フェーズA probe 実測(2026-09-26): int8 prequant transformer_ref に PEFT が
+# TorchaoLoraLinear でそのまま適用可、LoRA 常駐 +2.87GB、ロード 6.5s。
+H3_HYPERFLOW = os.environ.get("H3_HYPERFLOW", "0").strip() == "1"
+H3_HYPERFLOW_LORA = os.environ.get("H3_HYPERFLOW_LORA", "videorebirth/hyperflow").strip()
+if H3_HYPERFLOW and H3_TURBO_LORA:
+    raise RuntimeError(
+        "H3_HYPERFLOW=1 と H3_TURBO_LORA=1 は併用できません (turbo の _TurboLoRALinear と "
+        "HyperFlow の PEFT アダプタが同じ Linear 群へ二重適用になる)。どちらか一方にしてください。"
+    )
+if H3_HYPERFLOW and H3_PRUNED:
+    raise RuntimeError(
+        "H3_HYPERFLOW=1 と H3_PRUNED=1 は併用できません (pruned は time_proj/"
+        "time_embedder MLP を補間テーブルへ置換しており、HyperFlow の TwoTimeEmbedder が "
+        "ラップする対象が存在しない)。HyperFlow 品質 tier は非 pruned のまま使うこと。"
+    )
+def _make_set_timesteps_step():
+    """ref2va 経路の set_timesteps ブロックを返す。H3_HYPERFLOW 時は HyperFlow 版。
+
+    グローバル名の import 差し替えではなくインスタンス化ヘルパーにしたのは、
+    generate_ref2va() が関数ローカルで公式 `MiniMaxH3SetTimestepsStep` を import して
+    おり、モジュールグローバルの上書きが効かない(= denoise 側だけ差し替わって
+    set_timesteps 側が公式のまま 2-tuple を作りエラーになる)ため。両ブロックを
+    必ず対で HyperFlow 版にするための単一ソース。
+    """
+    if H3_HYPERFLOW:
+        from hyperflow_h3 import HyperFlowSetTimestepsStep
+        return HyperFlowSetTimestepsStep()
+    from diffusers.modular_pipelines.minimax_h3.before_denoise import MiniMaxH3SetTimestepsStep
+    return MiniMaxH3SetTimestepsStep()
+
+
+def _maybe_hyperflowify_denoise_step(step):
+    """H3_HYPERFLOW 時、denoise 複合ブロック内の LoopDenoiser を HyperFlow 版へ差し替える。
+
+    HyperFlowLoopDenoiser は step ごとに row_timestep_plan の (t, r, indices) 3-tuple を
+    読み、transformer 呼び出しを TwoTimeEmbedder.endpoint_context(r) で包む(公式実装)。
+    transformer_name は元ブロックの値(ref2va なら "transformer_ref")を引き継ぐ。
+    """
+    if not H3_HYPERFLOW:
+        return step
+    from hyperflow_h3 import HyperFlowLoopDenoiser
+    from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3LoopDenoiser
+    for key, block in list(step.sub_blocks.items()):
+        if isinstance(block, MiniMaxH3LoopDenoiser) and not isinstance(block, HyperFlowLoopDenoiser):
+            step.sub_blocks[key] = HyperFlowLoopDenoiser(transformer_name=block.transformer_name)
+    return step
+
+
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
-MIN_SECONDS = 5.0
+# H3_MIN_SECONDS: 既定 5.0(従来どおり)。r-n-v の会話初回チャンク短縮 probe 用に
+# 下限を下げられるようにした(2026-10-06)。73f=3.04s 等の短尺はモデルの学習分布外の
+# 可能性があるため、品質確認なしで本番の既定を下げないこと。
+MIN_SECONDS = float(os.environ.get("H3_MIN_SECONDS", "5.0"))
 MAX_SECONDS = 15.0
+if MIN_SECONDS < 5.0:
+    # diffusers 側にも min_duration=5.0 のバリデーションがある(before_encoder の
+    # Ref2VASetupStep と before_denoise の PrepareLayoutStep)。H3_MIN_SECONDS で
+    # 下限を下げた場合はプロセス全体でプロパティを合わせる(_relaxed_min_duration()
+    # と同じクラスプロパティ差し替え。既定 5.0 のときは一切触らない)。
+    from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+        MiniMaxH3ModularPipeline as _MMP,
+    )
+    _MMP.min_duration = property(lambda self, _v=MIN_SECONDS: _v)
 FPS = 24
 
 # 静止画モード (`generate(still=True)`) のフレーム数の選択肢。値は align_num_frames の
@@ -969,6 +1848,25 @@ FPS = 24
 # `torch.cat([])` で落ちる)。
 STILL_FRAME_CHOICES = (22, 5)
 
+# Opt-in ("0" default = 完全に無効、既存の ref2va 経路と無変更)。"1" で
+# `generate_ref2va()` の Vocal Lock を有効化する: 生成対象の音声行 (packed layout の
+# `[text | 参照ブロック | 生成音声行 | 生成映像行]` のうち「生成音声行」) を、
+# `references` に含まれる最初の `MiniMaxH3AudioReference` の波形から encode した
+# latent で置き換え、denoise 中ずっとクリーン (t=1.0 固定・無変更) に固定する。
+# 詳細は `generate_ref2va()` 内の該当コメント、および `_build_vocal_lock_latents()` /
+# `_apply_vocal_lock_condition_rows()` の docstring 参照。
+#
+# 旧名 `H3_AUDIO_DRIVE` の後方互換: `H3_VOCAL_LOCK` が未設定で `H3_AUDIO_DRIVE` が
+# 設定されている場合のみその値を使う(新名を優先)。2026-08 の改名(audio_drive ->
+# vocal_lock、出所の ComfyUI-H3-NativeAudioLock は "audio lock" と呼んでおり、本実装は
+# 駆動源が分離ボーカルである点が固有なので vocal_lock とした。「Audio Drive」は本
+# プロジェクトの造語で、機構の実体(駆動ではなく凍結)を誤って示唆していた)。
+if "H3_VOCAL_LOCK" not in os.environ and "H3_AUDIO_DRIVE" in os.environ:
+    logger.warning("環境変数 H3_AUDIO_DRIVE は旧名です。H3_VOCAL_LOCK へ移行してください。")
+    H3_VOCAL_LOCK = os.environ.get("H3_AUDIO_DRIVE", "0").strip() == "1"
+else:
+    H3_VOCAL_LOCK = os.environ.get("H3_VOCAL_LOCK", "0").strip() == "1"
+
 # Opt-out ("1" default). "1" = `AutoencoderKLMiniMaxH3._decode()` に「潜在フレームが
 # 1チャンク未満 (num_chunks==0、潜在1-2フレーム)なら全トークンを単一の `_decode_clip()`
 # で復号する」分岐を monkeypatch で追加する(下の `_patch_vae_smallclip_decode()`)。
@@ -976,6 +1874,92 @@ STILL_FRAME_CHOICES = (22, 5)
 # byte-for-byte 影響なし。"0" は静止画モードの frames=5 が上流バグそのままで落ちる
 # 状態に戻すためのトグル(例外時クリーンアップの実機検証にも使った)。
 H3_VAE_SMALLCLIP_FIX = os.environ.get("H3_VAE_SMALLCLIP_FIX", "1").strip() == "1"
+
+# EXPERIMENTAL, opt-in ("0" default = completely inert, zero behaviour change --
+# `core/adaln_precompute.py` is never imported/called unless this is "1"). Ported from
+# NVIDIA Sol-Engine's `sana-sol-engine` repo (`models/minimax_h3/GB200/adaln.py`,
+# Apache-2.0) -- see that module's own docstring for the full mechanism/rationale.
+# In short: precomputes the whole trajectory's AdaLN modulation table (~1.5GB) once, up
+# front, from the request's fixed sampling schedule, and drops the ~26GB of
+# `adaln_proj` weights that would otherwise sit GPU-resident recomputing the exact same
+# values on every one of the transformer's 50 blocks x every denoising step. Bitwise
+# identical to the uncached path (one GEMM per (block, step) at the reference's own
+# shape -- no batching, no approximation), so this needs no quality gate, only an
+# `ffmpeg framemd5` exact-match check (see docs/h3-adaln-precompute-20260826.md).
+# Expected saving: bf16 transformer ~66.3GB -> roughly ~42GB resident.
+#
+# v2 (coexistence, see core/adaln_precompute.py's module docstring for the full
+# verification): bf16 transformer only, still rejected at import time (this block)
+# against H3_TRANSFORMER_QUANT=int8 and any H3_LOWVRAM mode -- both remain real
+# structural conflicts, unrelated to turbo, unchanged from v1:
+#
+#   - int8: torchao's Int8Tensor-backed `adaln_proj.linear` was not verified against
+#     `precompute()`'s own GEMM-per-step + `del`-the-weights shape (the whole point of
+#     H3_TRANSFORMER_QUANT=int8 is to shrink `adaln_proj` along with everything else
+#     via quantization, not to also precompute-and-drop it -- the two techniques target
+#     the exact same weights for the exact same reason, combining them is redundant at
+#     best and unverified at worst).
+#   - H3_LOWVRAM/H3_LOWVRAM_GROUP: both require H3_TRANSFORMER_QUANT=int8 already (see
+#     that block's own guard above), so this is really the same restriction stated
+#     twice for a clearer error message at whichever flag combination an operator
+#     actually sets.
+#
+# turbo is NO LONGER blanket-rejected here (v1's H3_TURBO_LORA check is gone): checked
+# key-by-key against every non-comfyui-mirror checkpoint file the default
+# H3_TURBO_LORA_REPO (lightx2v/Minimax-h3-Turbo, diffusers-native/DMD format) ships,
+# none of them touch `adaln_proj`/`norm_out` at all (0 of 312 wrapped Linears each, see
+# core/adaln_precompute.py's module docstring for the full per-file verification) -- so
+# there is no structural conflict for that format, and this project's actual
+# production config (`H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.
+# safetensors`, one of the checked files) can run turbo and AdaLN precompute together.
+# Only the comfy-format LoRA (`_TURBO_COMFY_REPOS`, e.g. larryvrh/MiniMax-H3-Turbo-Lora)
+# genuinely conflicts -- its checkpoint DOES carry an `adaln_proj`/`norm_out` delta (51
+# of 259 wrapped Linears, verified against all 3 cached snapshots) -- so THAT specific
+# repo is still rejected here, using the same lightweight repo-name heuristic
+# `turbo_lora_expected_format()` uses elsewhere in this file (that function is defined
+# later in this module and cannot be called yet at this point in module-body
+# execution, hence the inline check rather than a call to it). This is a heuristic on
+# the *configured* repo, checked again for real by `core/adaln_precompute.py`'s
+# `_reject_turbo_wrapped_adaln()` once the actual checkpoint's keys are known (an
+# operator could point H3_TURBO_LORA_REPO/H3_TURBO_LORA_FILE at some other,
+# not-yet-known comfy-format checkpoint under a different repo name, which this
+# heuristic would miss but that later, key-level check would still catch).
+H3_ADALN_PRECOMP = os.environ.get("H3_ADALN_PRECOMP", "0").strip() == "1"
+if H3_ADALN_PRECOMP:
+    if H3_TRANSFORMER_QUANT != "none":
+        raise RuntimeError(
+            "H3_ADALN_PRECOMP=1 と H3_TRANSFORMER_QUANT=int8 は併用できません "
+            "(int8 は adaln_proj も含め全 Linear を torchao Int8Tensor へ量子化するため、"
+            "precompute() の GEMM-per-step + 重み del という前提が torchao の量子化テンソル "
+            "に対して未検証です。両者は同じ重み集合を同じ理由で削減対象にしており、"
+            "組み合わせる意味自体が薄いため明示的に拒否します)。"
+            "H3_TRANSFORMER_QUANT=none (既定) で使ってください。"
+        )
+    if H3_LOWVRAM_ANY:
+        raise RuntimeError(
+            f"H3_ADALN_PRECOMP=1 と H3_LOWVRAM={H3_LOWVRAM_RAW!r} は併用できません "
+            "(H3_LOWVRAM/H3_LOWVRAM_GROUP はどちらも H3_TRANSFORMER_QUANT=int8 を要求 "
+            "しており、上の int8 拒否と同じ理由で未検証です)。H3_LOWVRAM=0 (既定) で "
+            "使ってください。"
+        )
+    if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS:
+        raise RuntimeError(
+            f"H3_ADALN_PRECOMP=1 と H3_TURBO_LORA_REPO={H3_TURBO_LORA_REPO!r} (comfy形式) "
+            "は併用できません (このチェックポイントは adaln_proj.linear/norm_out.linear "
+            "にも LoRA デルタを持つため、precompute() が一度だけ焼くテーブルではこの "
+            "デルタを表現できません。詳細は core/adaln_precompute.py のモジュール "
+            "docstring 参照)。既定の diffusers ネイティブ形式 "
+            "(H3_TURBO_LORA_REPO=lightx2v/Minimax-h3-Turbo、または "
+            "H3_TURBO_LORA_REPO/H3_TURBO_LORA_FILE を未設定のまま) は adaln_proj に "
+            "触れないため AdaLN precompute と併用できます。"
+        )
+    logger.info(
+        "H3_ADALN_PRECOMP=1: AdaLN modulation will be precomputed and adaln_proj "
+        "weights freed on every fresh transformer/transformer_ref load (bf16 only, "
+        "~66.3GB -> ~42GB expected resident). turbo=%s (repo=%s) -- coexistence "
+        "verified for the diffusers-native LoRA format, see core/adaln_precompute.py.",
+        H3_TURBO_LORA, H3_TURBO_LORA_REPO,
+    )
 
 
 def _patch_vae_smallclip_decode() -> None:
@@ -1056,6 +2040,118 @@ if H3_VAE_SMALLCLIP_FIX:
 # - つまりバッチ出力は従来経路とビット一致しない (sage/FBC と同種の epsilon 級ドリフト)。
 #   ビット再現が要る対照実験では H3_REF_PREFIX_CACHE=0 を使うこと
 H3_REF_PREFIX_CACHE = os.environ.get("H3_REF_PREFIX_CACHE", "1").strip() == "1"
+
+
+# 既定 OFF: 上の共有プレフィックスを **単発 `/api/ref2va` のリクエスト間** でも持ち越す。
+# バッチ (`H3_REF_PREFIX_CACHE`) は1回の呼び出しの中で完結するので安全側の既定が ON だが、
+# こちらはプロセス寿命の KV キャッシュ (実測 ~1.0GiB VRAM) をリクエストをまたいで持つため、
+# 「既存挙動を変えない」を優先して既定 OFF にしてある (効果と安全性が実測で固まってから
+# 既定を変えること)。
+#
+# 何が節約されるか: 同じ参照 (画像) で音声/プロンプトだけ違うリクエストを連投するとき、
+# 参照ラベル+ビジョンの Qwen3-VL 前方計算 (768x448/8s の実測で ~55s) が2回目以降まるごと
+# 消える。単発リクエストごとに参照の再エンコードが起きていたのはドキュメント既知の穴
+# (README「単発リクエストの繰り返しでは共有されない」)。
+#
+# 成立条件 (実測で確認、`_single_ref_prefix_cache_key` がこの条件を機械的に判定する):
+# - **画像参照のみ** (+ 音声参照はいくつでも可)。音声は `_build_presentation` が
+#   `"<Audio j>: "` のラベルしか出さず波形は conditioner に届かないので、音声ファイルの
+#   中身も長さも変わってプレフィックスのトークン列は**ビット単位で不変** (プローブ実測:
+#   別内容・別長さの wav 4本で prefix_ids_sha / pixel_values_sha が完全一致)。
+# - **動画参照が1つでもあると使えない** (動画はピクセルがプレフィックスに入るため、
+#   中身が違えばプレフィックスも違う -- プローブ実測 max_abs_diff=102.0)。この場合は
+#   従来のフル計算経路へ黙って落ちる (キャッシュは破棄する)。
+#
+# 精度: プレフィックス部分はフル計算と**ビット一致**、プロンプト末尾は相対RMS ~1.5% の
+# 丸め差 (`H3_REF_PREFIX_CACHE` のコメントと同じ理由・同じ水準)。ビット再現が要る対照
+# 実験では 0 のままにすること。
+#
+# **TE を解放しない構成では自動的に無効化する** (2026-08-24 レビュー指摘):
+# キャッシュ (KV 約1.04GiB) は `_free_text_encoder()` に相乗りして捨てている。しかし
+#   - `H3_TE_DEVICE` 指定時 (48gb-dual): `_free_text_encoder` が early return するため
+#     TE が解放されず、キャッシュが **TE 側 GPU に恒久常駐**する。48gb-dual の TE 側は
+#     「ref2va に約24GB 必要 (24GBカードは境界)」とプリセット自身が書いている GPU で、
+#     そこへ 1.04GiB を返さないまま載せるのは危険。
+#   - `H3_TE_PROJ` 指定時 (16gb-proj): 同じく TE 恒久常駐。16GB カード (peak ~11.4GB) に
+#     +1.04GiB。しかも投影TE × 参照経路は元々 UNVERIFIED。
+# どちらも実測していないので、明示的に無効化して理由をログに出す。
+# 必要になったら「TE を解放しない構成でもキャッシュを個別に解放する」実装を足すこと。
+_H3_REF_PREFIX_CACHE_SINGLE_REQUESTED = (
+    os.environ.get("H3_REF_PREFIX_CACHE_SINGLE", "0").strip() == "1"
+)
+if _H3_REF_PREFIX_CACHE_SINGLE_REQUESTED and (H3_TE_DEVICE or H3_TE_PROJ):
+    logger.warning(
+        "H3_REF_PREFIX_CACHE_SINGLE=1 is ignored: the cache is freed together with the "
+        "text_encoder, but H3_TE_DEVICE=%r / H3_TE_PROJ=%r keep the TE resident, so the "
+        "~1.04GiB KV cache would never be released on that GPU (untested). "
+        "Drop H3_TE_DEVICE / H3_TE_PROJ to use the single-request prefix cache.",
+        H3_TE_DEVICE, H3_TE_PROJ,
+    )
+H3_REF_PREFIX_CACHE_SINGLE = _H3_REF_PREFIX_CACHE_SINGLE_REQUESTED and not (
+    H3_TE_DEVICE or H3_TE_PROJ
+)
+
+
+# EXPERIMENTAL, opt-in (2026-10-05). `H3_REF_LATENT_CACHE=1`: ref2va の**参照画像 VAE エンコード
+# 結果 (condition latent)** を、プロセス内に1エントリだけキャッシュする。
+#
+# 動機: 単機リアルタイム連続生成 (同じ衣装の参照画像 + 台詞=音声/プロンプトだけが毎回変わる)
+# では、参照画像の VAE エンコード (実測 ~1.0s) を毎回同じ入力で計算し直している。
+# `H3_REF_PREFIX_CACHE_SINGLE` が Qwen 画像特徴 (prefix KV) を使い回すのと同じ思想で、
+# こちらは VAE 側の latent を使い回す。音声参照の audio_vae エンコードは毎回違うので
+# キャッシュしない (hit 時も実行する)。
+#
+# キー: 正規化後 (setup step 通過後=短辺リサイズ済み) の画像参照すべての
+#   (md5(ピクセル), shape) の列 + keyframe_encode_seed + pixel_mean/std + VAE dtype +
+#   短辺設定。エンコード結果に影響しうる値をすべて含めるので、衣装切替・解像度変更・
+#   短辺変更はどれも自然に別キー (= miss で再計算して置き換え) になる。
+# 対象: 参照が「画像 (1枚以上) + 音声のみ」の場合。動画参照を含む場合はキャッシュせず
+#   従来経路 (`ref_latent_cache="bypass"`)。キャッシュされるのは CPU 上の小さな float32
+#   テンソル (数 MB 級) で、VRAM は消費しない。
+# 出力は非キャッシュ時と bit 一致する (エンコードは `keyframe_encode_seed` 固定の決定論的
+#   サンプリングで、hit 時はその結果をそのまま返すだけ。検証手順は README/報告参照)。
+# 既定 OFF: OFF のとき生成経路は従来と完全に同一 (関数の先頭でフラグを見て元のステップを
+#   そのまま呼ぶだけ)。
+H3_REF_LATENT_CACHE = os.environ.get("H3_REF_LATENT_CACHE", "0").strip() == "1"
+
+# EXPERIMENTAL, opt-in (2026-10-05). decode の分離 (単機リアルタイム連続生成の cadence 短縮):
+#
+#   `H3_DECODE_STREAM=1`  denoise 完了時点で app の生成ロックを解放し、video/audio VAE decode
+#                         + uint8 変換 + mux を**そのリクエストのスレッド上で** (デフォルト
+#                         ストリームのまま) 行う。次のリクエスト (エンコード/denoise) が decode と
+#                         重なって走れる。`=2` は専用 CUDA ストリーム版 (下記の注意参照)。
+#   `H3_DECODE_DEVICE=cuda:1`  video VAE (と audio VAE) の**デコード専用コピー**を別 GPU に常駐
+#                         させ、denoise 後の latent (数 MB) をそのGPUへ送って decode する。
+#                         transformer/TE/参照エンコード用 VAE は従来どおり cuda:0 (DEVICE) のまま。
+#
+# どちらも既定なし (現行どおり)。安全性 (なぜ重ねて良いか) は `_decode_ref2va_isolated()` と
+# `generate_ref2va()` の `on_denoise_done` 周辺のコメント参照。成立条件は
+# 「VAE 常駐 (H3_KEEP_REF2VA=1 + H3_KEEP_REF2VA_VAE=1 + H3_LOWVRAM=1)」。満たさない場合は
+# 警告を出して従来のインライン decode にフォールバックする (黙って壊れた重なり方をしない)。
+_H3_DECODE_STREAM_RAW = os.environ.get("H3_DECODE_STREAM", "0").strip()
+H3_DECODE_STREAM = _H3_DECODE_STREAM_RAW in ("1", "2")
+# "2" = 専用 CUDA ストリーム (decode 専用 VAE コピーを native attention で使う)。"1" はデフォルト
+# ストリームのまま別スレッドで decode する。**専用ストリームで共有 VAE を使ってはいけない**:
+# `H3_ATTN_BACKEND=sage` (既定) は diffusers の attention backend をプロセス全体で解決するため
+# video VAE の attention も sage になり、sage のカーネルは current stream を尊重せず legacy
+# default stream に投げる → side stream 上の前後の演算と順序が壊れ、decode 結果が全面 NaN
+# (真っ黒な映像) になる。2026-10-05 に実機で再現 (H3_ATTN_BACKEND=default なら NaN にならない
+# ことで原因を特定)。そのため "2" は native attention に固定した別コピーの VAE を使う。
+H3_DECODE_STREAM_SIDE = _H3_DECODE_STREAM_RAW == "2"
+H3_DECODE_DEVICE = os.environ.get("H3_DECODE_DEVICE", "").strip()
+# 別 GPU の decode 専用 VAE コピーを native attention に固定するか (既定 0 = 本体と同じ backend)。
+H3_DECODE_NATIVE_ATTN = os.environ.get("H3_DECODE_NATIVE_ATTN", "0").strip() == "1"
+# H3_DECODE_VAE=light (2026-10-05, probe, 既定なし=標準 VAE): decode 専用コピーの video VAE を
+# LynnReal の蒸留版 light VAE (`stdstu123/LynnReal-Onmi-light-vae`: encoder は H3 公式と同一、
+# decoder だけ 36→26 層。latent の channel/mean/std/圧縮率は公式と同一) に差し替える。
+# **encode 側・標準の `pipe.vae` は触らない**。`H3_DECODE_STREAM`/`H3_DECODE_DEVICE` の decode
+# 分離経路 (`_decode_ref2va_deferred`) だけが対象で、インライン decode には効かない。
+# 値は "light" (既定 repo) か、HF repo id / ローカルディレクトリ。再現 (同一 latent でも RGB は
+# 標準 VAE と一致しない: LICENSE は minimax-h3-community = H3 本体と同じ地域制限あり)。
+H3_DECODE_VAE = os.environ.get("H3_DECODE_VAE", "").strip()
+H3_DECODE_VAE_REPO = (
+    "stdstu123/LynnReal-Onmi-light-vae" if H3_DECODE_VAE.lower() == "light" else H3_DECODE_VAE
+)
 
 
 # H3_TE_PROJ 有効時、H3 トークナイザ固有の特殊トークン (`<d>`=151669 / `</d>`=151670)
@@ -1348,6 +2444,414 @@ def _encode_ref_prompts_shared_prefix(
     return results
 
 
+@dataclass
+class _SingleRefPrefixEntry:
+    """`H3_REF_PREFIX_CACHE_SINGLE` の1エントリ (同時に1つだけ保持する)。
+
+    `cache`/`prefix_hidden` は GPU 常駐 (実測 ~1.0GiB + ~40MiB)。`rope_deltas` を
+    一緒に持つのが要点 -- 下の `_encode_ref2va_prompt_prefix_cached` の docstring 参照。
+    """
+
+    key: str
+    cache: object            # transformers DynamicCache (プレフィックス長に crop 済み)
+    prefix_hidden: torch.Tensor
+    prefix_tags: list[int]
+    prefix_len: int
+    rope_deltas: torch.Tensor | None
+    te_ref: object           # weakref.ref(text_encoder) -- 解放/再ロードの検出用
+    device: torch.device
+    dtype: torch.dtype
+    te_layer: int
+    te_proj_id: int | None
+    nbytes: int
+    # `H3_REF_PREFIX_PARK=1` のとき、KV (cache.layers[*].keys/values) が今 CPU にあるか。
+    parked: bool = False
+
+
+def _park_prefix_entry(entry: "_SingleRefPrefixEntry") -> None:
+    """KV を CPU (pinned) へ退避する (`H3_REF_PREFIX_PARK`)。値は不変、置き場所だけ変える。
+    小さいテンソル (~100 個 x ~10MiB) の移動で、モジュール丸ごとのスワップではない。"""
+    if entry.parked:
+        return
+    t0 = time.time()
+    for layer in entry.cache.layers:
+        for name in ("keys", "values"):
+            t = getattr(layer, name, None)
+            if t is not None and t.is_cuda:
+                setattr(layer, name, t.detach().to("cpu").pin_memory())
+    entry.parked = True
+    # decode を別ストリーム/別 GPU で重ねている間 (H3_DECODE_STREAM / H3_DECODE_DEVICE) は
+    # empty_cache を呼ばない: 全デバイスのキャッシュを解放するため、前リクエストの decode と
+    # 衝突して "illegal memory access" になる (2026-10-05 probe で再現: REF_PREFIX_PARK + DECODE_DEVICE)。
+    # 解放した 0.2GiB はアロケータのキャッシュに残り、次の denoise で再利用される。
+    if not (H3_DECODE_STREAM or H3_DECODE_DEVICE):
+        gc.collect()
+        torch.cuda.empty_cache()
+    logger.info("single ref-prefix cache parked on CPU (%.2fGiB) in %.2fs. gpu=%s",
+                entry.nbytes / 1024**3, time.time() - t0, gpu_mem_gb())
+
+
+def _unpark_prefix_entry(entry: "_SingleRefPrefixEntry") -> None:
+    """`_park_prefix_entry` の逆。継続 forward の直前に呼ぶ。"""
+    if not entry.parked:
+        return
+    t0 = time.time()
+    for layer in entry.cache.layers:
+        for name in ("keys", "values"):
+            t = getattr(layer, name, None)
+            if t is not None and not t.is_cuda:
+                setattr(layer, name, t.to(entry.device, non_blocking=True))
+    torch.cuda.synchronize()
+    entry.parked = False
+    logger.info("single ref-prefix cache unparked to %s in %.2fs", entry.device, time.time() - t0)
+
+
+# プロセス内に高々1エントリ。`generate_ref2va()` は app.py の generation_lock で直列化
+# されているので追加のロックは要らない (キャッシュを触るのは生成経路だけ)。
+_single_ref_prefix_entry: "_SingleRefPrefixEntry | None" = None
+
+
+def _clear_single_ref_prefix_cache(reason: str) -> None:
+    """単発プレフィックスキャッシュを捨てる (VRAM も返す)。
+
+    呼ばれる場所は3つ: (1) キー不一致・条件外 (動画参照など) で作り直すとき、
+    (2) `_free_text_encoder()` が実際に TE を落とすとき (KV は TE と同じ計算グラフの
+    産物なので、TE が入れ替わったら必ず捨てる)、(3) `unload()`。
+    """
+    global _single_ref_prefix_entry
+    if _single_ref_prefix_entry is None:
+        return
+    freed = _single_ref_prefix_entry.nbytes / 1024**3
+    _single_ref_prefix_entry = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("single ref-prefix cache cleared (%.2fGiB): %s", freed, reason)
+
+
+# H3_REF_LATENT_CACHE の1エントリ: (key, [condition_latent(CPU float32), ...])。
+# 生成経路 (generate_ref2va) からしか触らない。連続生成で次リクエストの参照エンコードが
+# 走るのは前リクエストの denoise 完了後 (H3_DECODE_STREAM でもエンコード同士は重ならない:
+# 生成ロックは1件ずつ取られる) なので追加のロックは要らない。
+_ref_latent_cache_entry: "tuple[str, list[torch.Tensor]] | None" = None
+_ref_latent_cache_stats = {"hit": 0, "miss": 0, "bypass": 0}
+
+
+def _clear_ref_latent_cache(reason: str) -> None:
+    global _ref_latent_cache_entry
+    if _ref_latent_cache_entry is None:
+        return
+    _ref_latent_cache_entry = None
+    logger.info("ref latent cache cleared: %s", reason)
+
+
+def _ref_latent_cache_key(pipe, image_refs: list, short_edge) -> str:
+    """画像参照 (正規化後) の実ピクセルとエンコード条件から、キャッシュキーを作る。"""
+    h = hashlib.md5()
+    for ref in image_refs:
+        arr = np.ascontiguousarray(np.array(ref.image))
+        h.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+        h.update(hashlib.md5(arr.tobytes()).digest())
+    vae = pipe.vae
+    h.update(repr((
+        int(getattr(pipe, "keyframe_encode_seed", -1)),
+        tuple(pipe.pixel_mean), tuple(pipe.pixel_std),
+        str(next(vae.parameters()).dtype), short_edge, len(image_refs),
+    )).encode())
+    return h.hexdigest()
+
+
+def _ref2va_encode_references(pipe, state):
+    """`MiniMaxH3Ref2VAReferenceEncoderStep` の呼び出しラッパー (`H3_REF_LATENT_CACHE` 対応)。
+
+    戻り値: `(state, status)`。status は None (フラグ OFF) / "hit" / "miss" / "bypass"。
+    フラグ OFF なら元のステップを呼ぶだけで従来と完全に同一。
+
+    ON のとき:
+      * hit : 画像参照のエンコードをスキップし、保存済み latent の clone を
+        `condition_latents` に入れる。音声参照 (毎回違う) は元のステップを「音声参照のみ」の
+        参照リストで走らせて `audio_condition_latents` を得る (画像のエンコードは走らない)。
+      * miss: 元のステップをそのまま走らせ、出来た `condition_latents` を保存する。
+    ステップの出力リストは「画像/動画参照 (パック順)」と「音声持ち参照 (パック順)」で
+    別々なので、画像と音声だけの構成なら両者を独立に差し替えられる (順序の取り違えが無い)。
+    """
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VAReferenceEncoderStep
+
+    global _ref_latent_cache_entry
+    step = MiniMaxH3Ref2VAReferenceEncoderStep()
+    if not H3_REF_LATENT_CACHE:
+        _, state = step(pipe, state)
+        return state, None
+
+    refs = state.get("normalized_references")
+    images = [r for r in refs if r.kind == "image"]
+    others = [r for r in refs if r.kind != "image"]
+    if not images or any(r.kind != "audio" for r in others):
+        _ref_latent_cache_stats["bypass"] += 1
+        _, state = step(pipe, state)
+        return state, "bypass"
+
+    key = _ref_latent_cache_key(pipe, images, pipe.config.reference_image_short_edge)
+    entry = _ref_latent_cache_entry
+    if entry is not None and entry[0] == key:
+        if others:
+            state.set("normalized_references", others)
+            try:
+                _, state = step(pipe, state)
+            finally:
+                state.set("normalized_references", refs)
+        else:
+            state.set("audio_condition_latents", [])
+        # clone: 後段が in-place で触っても保存分が汚れないようにする (数 MB なので安い)。
+        state.set("condition_latents", [t.clone() for t in entry[1]])
+        _ref_latent_cache_stats["hit"] += 1
+        return state, "hit"
+
+    _, state = step(pipe, state)
+    _ref_latent_cache_entry = (key, [t.clone() for t in state.get("condition_latents")])
+    _ref_latent_cache_stats["miss"] += 1
+    return state, "miss"
+
+
+def _single_ref_prefix_cache_key(
+    prefix_ids: list[int],
+    vision_inputs: dict,
+) -> str | None:
+    """プレフィックスの実体からキーを作る。使えない構成なら `None`。
+
+    キーはファイル名やリクエストIDではなく **実際にプレフィックス forward へ入る値**
+    (トークン列 + 画像テンソルのバイト列 + grid) から作る。これで参照の枚数・順序
+    (ラベル番号が変わる)・解像度・ピクセルの中身、どれが変わっても必ず別キーになる。
+    音声は `_build_presentation` がラベルしか出さないので `prefix_ids` に自然に
+    含まれ、波形そのものはキーに入らない (= 音声だけ差し替えた連投でヒットする、
+    これがこの機能の狙い)。
+
+    `None` を返す条件:
+      - 動画参照がある (`pixel_values_videos`)。動画はピクセルがプレフィックスに
+        入るのでリクエスト間で同一とみなせない (プローブ実測 max_abs_diff=102.0)。
+      - 画像参照が1枚も無い (キャッシュする価値が無く、`pixel_values` も無い)。
+    """
+    if vision_inputs.get("pixel_values_videos") is not None:
+        return None
+    pixel_values = vision_inputs.get("pixel_values")
+    if pixel_values is None:
+        return None
+    h = hashlib.sha256()
+    h.update(np.asarray(prefix_ids, dtype=np.int64).tobytes())
+    grid = vision_inputs.get("image_grid_thw")
+    if grid is not None:
+        h.update(grid.detach().to("cpu").contiguous().numpy().tobytes())
+    pv = pixel_values.detach().to("cpu").contiguous()
+    h.update(str(pv.dtype).encode())
+    h.update(np.asarray(pv.shape, dtype=np.int64).tobytes())
+    try:
+        raw = pv.numpy()
+    except TypeError:
+        # bf16 等 numpy に無い dtype はバイト列として見る。
+        raw = pv.view(torch.uint8).numpy()
+    h.update(raw.tobytes())
+    return h.hexdigest()
+
+
+def _encode_ref2va_prompt_prefix_cached(
+    components,
+    prompt: str,
+    normalized_references,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    r"""単発 `/api/ref2va` 用: 参照プレフィックスの KV キャッシュを**リクエスト間で**
+    使い回す (`H3_REF_PREFIX_CACHE_SINGLE=1` のときだけ呼ばれる)。使えない構成なら
+    `None` を返し、呼び出し側は従来の `_encode_ref2va_prompt()` へ落ちる。
+
+    仕組みは `_encode_ref_prompts_shared_prefix` (バッチ版) と同一で、違いは
+    「プレフィックスを1回の呼び出しの中で使い切らず、モジュール変数に残す」ことだけ。
+    そのぶんバッチ版には無い3つの安全装置が要る:
+
+    1. **`model.rope_deltas` の保存/復元**。これは `Qwen3VLModel` の *インスタンス状態*
+       で、プレフィックス forward が書き、継続 forward が読む
+       (`compute_3d_position_ids`: `past_key_values_length > 0` の枝で
+       `position_ids = arange(past_len, past_len+seq) + self.rope_deltas`)。バッチ版は
+       「プレフィックス→全継続」を1呼び出しで閉じるので放置できたが、リクエストを
+       またぐと間に t2va のプロンプトエンコードや `/api/prompt/enhance` が挟まって
+       `rope_deltas` が上書きされうる。そこでプレフィックス時の値を clone して持ち、
+       **継続の直前に必ず書き戻す**。これで間に何が挟まっても継続は同じ位置IDで走る。
+    2. **text_encoder の同一性チェック**。KV は特定の TE インスタンスの重みで作った
+       ものなので、TE が解放/再ロード/量子化変更されたら無効。`weakref` で保持して
+       「今の `components.text_encoder` と同一オブジェクトか」を毎回見る
+       (`_free_text_encoder()` 側でも能動的に捨てている -- 二重の安全側)。
+    3. **キーは参照の実体から**。`_single_ref_prefix_cache_key()` 参照。
+
+    VRAM: プレフィックス 4109 トークンの `DynamicCache` は実測 ~1.0GiB
+    (64層 x kv_heads 8 x head_dim 128 x K/V 2 x bf16) + `prefix_hidden` ~40MiB。
+    """
+    global _single_ref_prefix_entry
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VATextEncoderStep
+    from transformers.cache_utils import DynamicCache
+
+    step = MiniMaxH3Ref2VATextEncoderStep()
+    te_proj = _te_projection_for(components)
+    te_layer = _te_encoder_layer_for(components)
+    num_layers = components.text_encoder.config.text_config.num_hidden_layers
+    if num_layers <= te_layer:
+        raise ValueError(
+            f"MiniMax-H3 conditions on `hidden_states[{te_layer}]` of its Qwen3-VL "
+            f"conditioner, which needs more than {te_layer} decoder layers, but "
+            f"`text_encoder` has {num_layers}."
+        )
+
+    t_key = time.time()
+    vision_inputs, image_token_counts, video_token_counts, video_timestamps = step._gather_vision_features(
+        components.processor, normalized_references, components.fps
+    )
+    prefix_ids, prefix_tags = step._build_presentation(
+        components.tokenizer,
+        "",
+        normalized_references,
+        image_token_counts,
+        video_token_counts,
+        video_timestamps,
+        text_tag=components.text_tag,
+        video_tag=components.video_tag,
+    )
+    key = _single_ref_prefix_cache_key(prefix_ids, vision_inputs)
+    if key is None:
+        # 動画参照あり / 画像参照なし -- この構成では持ち越せない。持っていた分は
+        # VRAM を無駄に占めるだけなので捨てて、従来経路へ落とす。
+        _clear_single_ref_prefix_cache("unsupported references (video or no image)")
+        return None
+    if te_proj is not None:
+        _reject_unsupported_proj_tokens(prefix_ids)
+
+    model = components.text_encoder.model
+    hook = getattr(components.text_encoder, "_hf_hook", None)
+    if hook is not None and hasattr(hook, "pre_forward"):
+        hook.pre_forward(components.text_encoder)
+
+    entry = _single_ref_prefix_entry
+    hit = (
+        entry is not None
+        and entry.key == key
+        and entry.te_ref() is components.text_encoder
+        and entry.device == device
+        and entry.dtype == dtype
+        and entry.te_layer == te_layer
+        and entry.te_proj_id == (id(te_proj) if te_proj is not None else None)
+    )
+    if not hit:
+        if entry is not None:
+            # ローカル参照を先に落としてから捨てる -- 残したままだと refcount が
+            # 下がらず、新しいプレフィックスを確保する前に VRAM が返らない。
+            entry = None
+            _clear_single_ref_prefix_cache("reference/text-encoder changed")
+        t_prefix = time.time()
+        prefix_input = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+        mm_token_type_ids = torch.tensor(
+            components.processor.create_mm_token_type_ids([prefix_ids]), dtype=torch.long, device=device
+        )
+        pixel_values = vision_inputs.get("pixel_values")
+        image_grid_thw = vision_inputs.get("image_grid_thw")
+        cache = DynamicCache(config=model.config)
+        with torch.no_grad():
+            prefix_out = model(
+                input_ids=prefix_input,
+                attention_mask=torch.ones_like(prefix_input),
+                mm_token_type_ids=mm_token_type_ids,
+                pixel_values=(
+                    None if pixel_values is None else pixel_values.to(device, components.text_encoder.dtype)
+                ),
+                image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(device),
+                pixel_values_videos=None,
+                video_grid_thw=None,
+                past_key_values=cache,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+        prefix_hidden = prefix_out.hidden_states[te_layer].to(device=device, dtype=dtype)
+        if te_proj is not None:
+            prefix_hidden = te_proj.project(prefix_hidden, dtype=dtype)
+        prefix_len = cache.get_seq_length()
+        rope_deltas = getattr(model, "rope_deltas", None)
+        nbytes = sum(
+            t.numel() * t.element_size()
+            for layer in cache.layers
+            for t in (layer.keys, layer.values)
+            if t is not None
+        ) + prefix_hidden.numel() * prefix_hidden.element_size()
+        entry = _SingleRefPrefixEntry(
+            key=key,
+            cache=cache,
+            prefix_hidden=prefix_hidden,
+            prefix_tags=list(prefix_tags),
+            prefix_len=prefix_len,
+            rope_deltas=None if rope_deltas is None else rope_deltas.clone(),
+            te_ref=weakref.ref(components.text_encoder),
+            device=device,
+            dtype=dtype,
+            te_layer=te_layer,
+            te_proj_id=id(te_proj) if te_proj is not None else None,
+            nbytes=nbytes,
+        )
+        _single_ref_prefix_entry = entry
+        logger.info(
+            "single ref-prefix cache MISS: encoded %d prefix tokens in %.1fs (key prep %.2fs), "
+            "kept %.2fGiB resident (key=%s)",
+            prefix_len, time.time() - t_prefix, t_prefix - t_key, nbytes / 1024**3, key[:12],
+        )
+    else:
+        logger.info(
+            "single ref-prefix cache HIT: reusing %d prefix tokens (%.2fGiB, key prep %.2fs, key=%s)",
+            entry.prefix_len, entry.nbytes / 1024**3, time.time() - t_key, key[:12],
+        )
+
+    # --- 継続 (プロンプト末尾のみ) ---
+    # H3_REF_PREFIX_PARK: CPU に退避していた KV をここで GPU へ戻す (MISS 直後は元々 GPU)。
+    _unpark_prefix_entry(entry)
+    # rope_deltas は毎回書き戻す (MISS 直後でも安いので無条件に -- 上の docstring 1.)。
+    if entry.rope_deltas is not None:
+        model.rope_deltas = entry.rope_deltas.clone()
+    # 直前の継続で伸びたままになっていないことを保証する (正常系では継続の直後に
+    # crop 済みだが、例外で抜けた場合の保険)。
+    if entry.cache.get_seq_length() != entry.prefix_len:
+        entry.cache.crop(entry.prefix_len)
+
+    suffix_ids = components.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if te_proj is not None:
+        _reject_unsupported_proj_tokens(suffix_ids)
+    suffix_input = torch.tensor([suffix_ids], dtype=torch.long, device=device)
+    try:
+        with torch.no_grad():
+            suffix_out = model(
+                input_ids=suffix_input,
+                attention_mask=None,
+                mm_token_type_ids=None,
+                pixel_values=None,
+                image_grid_thw=None,
+                pixel_values_videos=None,
+                video_grid_thw=None,
+                past_key_values=entry.cache,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+        if te_proj is not None:
+            # 継続断片の位置0はシーケンス先頭ではないので sink_out 置換をしない
+            # (`_TeProjection.project_continuation` の docstring 参照)。
+            suffix_hidden = te_proj.project_continuation(suffix_out.hidden_states[te_layer], dtype=dtype)
+        else:
+            suffix_hidden = suffix_out.hidden_states[te_layer].to(device=device, dtype=dtype)
+    finally:
+        entry.cache.crop(entry.prefix_len)
+
+    if H3_REF_PREFIX_PARK:
+        # 次のリクエストまで KV は要らない (denoise/decode の VRAM を返す)。
+        _park_prefix_entry(entry)
+    prompt_embeds = torch.cat([entry.prefix_hidden, suffix_hidden], dim=1)
+    text_token_tags = torch.tensor(
+        entry.prefix_tags + [components.text_tag] * len(suffix_ids), dtype=torch.long
+    )
+    return prompt_embeds, text_token_tags
+
+
 @contextmanager
 def _relaxed_min_duration():
     """静止画モードの間だけ diffusers 側の最小尺バリデーション (5.0s) を緩和する。
@@ -1577,6 +3081,16 @@ def _encode_ref2va_prompt(
         get_qwen3vl_prompt_embeds,
     )
 
+    # H3_PHASE_TIMING (2026-08-27 encode-phase profiling task): this is the
+    # `H3_REF_PREFIX_CACHE_SINGLE=0` / no-prefix-cache path -- the one
+    # `_encode_ref2va_prompt_prefix_cached()` falls back to, and the one this task's own
+    # measurement config uses. That sibling function already logs a `t_key`/`t_prefix`
+    # split (see its "single ref-prefix cache MISS" log line); this mirrors the same
+    # split here so the no-cache path gets equivalent visibility. No-op tuple/dict when
+    # the flag is off -- `_PhaseTimer.mark()` is the only thing touched below, and it is
+    # a single early-return in that case.
+    _pt = _PhaseTimer("encode_ref2va_prompt")
+
     step = MiniMaxH3Ref2VATextEncoderStep()
     te_proj = _te_projection_for(components)
     if te_proj is not None:
@@ -1589,6 +3103,7 @@ def _encode_ref2va_prompt(
     vision_inputs, image_token_counts, video_token_counts, video_timestamps = step._gather_vision_features(
         components.processor, normalized_references, components.fps
     )
+    _pt.mark("gather_vision_features")  # processor: PIL/np image -> patchified pixel_values (CPU)
     token_ids, token_tags = step._build_presentation(
         components.tokenizer,
         prompt,
@@ -1599,6 +3114,7 @@ def _encode_ref2va_prompt(
         text_tag=components.text_tag,
         video_tag=components.video_tag,
     )
+    _pt.mark("build_presentation")  # tokenize (CPU, expected tiny)
     if te_proj is not None:
         # H3 固有の特殊トークン (`<d>`/`</d>`) は 4B の語彙に無い -- トークナイザ自体は
         # H3 のものを使い続ける (`components.tokenizer`、通常語彙は 4B とID完全一致)。
@@ -1612,11 +3128,13 @@ def _encode_ref2va_prompt(
         device=device,
         dtype=dtype,
     )
+    _pt.mark("conditioner_forward")  # the 32B/4B forward itself (vision tower + text decoder, GPU)
     if te_proj is not None:
         # 常に1つの自己完結したシーケンス (KVキャッシュ継続なし) なので位置0は本当に
         # シーケンス先頭 -- sink_out 置換込みの `project()` が正しい
         # (`_encode_h3_prompt` の同箇所コメント参照)。
         prompt_embeds = te_proj.project(prompt_embeds, dtype=dtype or prompt_embeds.dtype)
+    _pt.report()
     return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
 
@@ -1990,7 +3508,8 @@ def resolve_turbo_lora_scale(lora_format: str, lora_path: str | None = None) -> 
 
             with safe_open(lora_path, framework="pt") as f:
                 metadata = f.metadata() or {}
-                alpha_raw = metadata.get("alpha")
+                # `lora_alpha` は PDMD 版 (pdmd2026/*) の metadata キー名
+                alpha_raw = metadata.get("alpha") or metadata.get("lora_alpha")
                 if alpha_raw is not None:
                     lora_a_keys = sorted(k for k in f.keys() if ".lora_A." in k)
                     rank = f.get_slice(lora_a_keys[0]).get_shape()[0]
@@ -2045,6 +3564,17 @@ def apply_diffusers_turbo_lora(transformer, lora_path: str, scale: float) -> int
 
     t_load = time.time()
     lora_sd = load_file(lora_path)
+    # キー形式の正規化: lightx2v 版は `<path>.lora_A.default.weight`、PDMD 版
+    # (pdmd2026/pdmd_{2,4}NFE_lora) は `transformer.<path>.lora_A.weight`。どちらも
+    # `<path>.lora_A.default.weight` へ揃える (既存の lightx2v ファイルは無変更で通る)。
+    _norm: dict[str, torch.Tensor] = {}
+    for k, v in lora_sd.items():
+        nk = k[len("transformer."):] if k.startswith("transformer.") else k
+        nk = nk.replace(".lora_A.weight", ".lora_A.default.weight").replace(
+            ".lora_B.weight", ".lora_B.default.weight"
+        )
+        _norm[nk] = v
+    lora_sd = _norm
     paths = sorted({k.rsplit(".lora_", 1)[0] for k in lora_sd if ".lora_" in k})
     device = next(transformer.parameters()).device
     n_wrapped = 0
@@ -2239,6 +3769,154 @@ def _num_frames_from_audio_reference(references: list, fps: int) -> int:
     return align_num_frames(round(num_samples / sample_rate * fps))
 
 
+def _build_vocal_lock_latents(pipe, references: list, actual_num_frames: int) -> torch.Tensor | None:
+    r"""Vocal Lock (`H3_VOCAL_LOCK=1`) 用: 駆動音声を encode して `(2, audio_latent_channels,
+    N)` の audio_latents テンソルにして返す。`references` に `MiniMaxH3AudioReference` が
+    1つも無ければ `None` を返す (呼び出し側はこれを「発動しない」合図として扱うこと)。
+
+    最初に見つかった `MiniMaxH3AudioReference` の波形を流用する (専用の API 引数は
+    追加しない -- 参照としての音声はそのまま `references` に残り、ref2va の通常の
+    参照エンコード経路 (`MiniMaxH3Ref2VAReferenceEncoderStep`) が別途エンコードする)。
+
+    正規化・エンコード手順は `MiniMaxH3Ref2VAReferenceEncoderStep.__call__`
+    (diffusers `modular_pipelines/minimax_h3/encoders.py:740-760` 付近) と完全に同一
+    にする (独自の正規化を発明しない): `audio_vae.encode(...)` -> `posterior.mode()`
+    -> `transpose` -> `(x - latents_mean) / latents_std`。ここでは行化
+    (`.reshape(-1, C)`) はせず、`MiniMaxH3PrepareLatentsStep` がそのまま受け付ける
+    `(2, C, N)` 形状で返す (行化はそのステップ自身が
+    `.permute(0, 2, 1).reshape(-1, C)` で行う -- 参照エンコーダ出力とビット一致する
+    ことは `probe_layout.py`/`check_layout.py`/`pack_roundtrip.py` で検証済み)。
+
+    `N = audio_latent_num_frames(actual_num_frames)` に厳密に合わせる: 波形を
+    `N * 800` サンプル (audio_vae は 32000Hz・800 samples/latent) へ trim/pad してから
+    encode し、encode 結果が N と1行ずれる場合に備えて encode 後にも latent 側で
+    trim/pad し、`assert` で N 一致を確認する。
+    """
+    from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+    from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+        MINIMAX_H3_AUDIO_LATENTS_PER_SECOND,
+        audio_latent_num_frames,
+    )
+
+    audio_ref = next((entry for entry in references if isinstance(entry, MiniMaxH3AudioReference)), None)
+    if audio_ref is None:
+        logger.warning(
+            "H3_VOCAL_LOCK=1 ですが references に MiniMaxH3AudioReference がありません -- "
+            "Vocal Lock は発動せず、通常の ref2va 経路にフォールバックします。"
+        )
+        return None
+
+    device = pipe._execution_device
+    audio_channels = pipe.audio_channels
+    audio_latent_channels = pipe.audio_latent_channels
+    target_sample_rate = pipe.audio_sampling_rate
+    N = audio_latent_num_frames(actual_num_frames)
+    samples_per_latent = target_sample_rate // MINIMAX_H3_AUDIO_LATENTS_PER_SECOND
+    target_num_samples = N * samples_per_latent
+
+    sample_rate = audio_ref.sample_rate
+    if sample_rate is None:
+        sample_rate = target_sample_rate
+    orig_num_samples = int(audio_ref.audio.shape[-1])
+
+    # `_normalize_audio_condition` は truncate のみ (max_duration 経由) で pad はしない。
+    # そのため先に truncate+resample+mono->stereo をこのステップに任せ、その後 pad/trim を
+    # このヘルパー側で厳密に行う (target_sample_rate に揃った後のサンプル数基準で行う
+    # 必要があるため -- max_duration は resample 前の sample_rate 基準の秒数)。
+    waveform = MiniMaxH3Ref2VASetupStep._normalize_audio_condition(
+        audio_ref.audio,
+        sample_rate,
+        target_sample_rate,
+        max_duration=max(orig_num_samples / sample_rate, target_num_samples / target_sample_rate),
+    )
+    resampled_num_samples = int(waveform.shape[-1])
+    if resampled_num_samples < target_num_samples:
+        waveform = torch.nn.functional.pad(waveform, (0, target_num_samples - resampled_num_samples))
+    elif resampled_num_samples > target_num_samples:
+        waveform = waveform[:, :target_num_samples]
+    trimmed_num_samples = int(waveform.shape[-1])
+
+    logger.info(
+        "Vocal Lock: driving audio orig_samples=%d (sr=%s) -> trimmed/padded=%d samples "
+        "(target N=%d, samples/latent=%d)",
+        orig_num_samples, sample_rate, trimmed_num_samples, N, samples_per_latent,
+    )
+
+    audio_latents_mean = torch.tensor(pipe.audio_vae.config.latents_mean).view(1, 1, -1)
+    audio_latents_std = torch.tensor(pipe.audio_vae.config.latents_std).view(1, 1, -1)
+
+    with torch.no_grad():
+        posterior = pipe.audio_vae.encode(waveform.to(device)[:, None], return_dict=False)[0]
+        latents = posterior.mode().float().cpu().transpose(1, 2)  # (2, T, C)
+        normalized = (latents - audio_latents_mean) / audio_latents_std  # (2, T, C)
+
+    encoded_num_frames = normalized.shape[1]
+    if encoded_num_frames != N:
+        # audio_vae のチャンク境界の丸めで N と1行ずれることがある -- latent 側でも
+        # 厳密に N へ trim/pad する (task の指示どおり)。
+        if encoded_num_frames < N:
+            pad = N - encoded_num_frames
+            normalized = torch.nn.functional.pad(normalized, (0, 0, 0, pad))
+        else:
+            normalized = normalized[:, :N, :]
+
+    audio_latents = normalized.transpose(1, 2).contiguous()  # (2, C, N) -- what PrepareLatentsStep expects
+    assert audio_latents.shape == (audio_channels, audio_latent_channels, N), (
+        f"Vocal Lock: injected audio_latents shape {tuple(audio_latents.shape)} != "
+        f"expected {(audio_channels, audio_latent_channels, N)}"
+    )
+    logger.info(
+        "Vocal Lock: encoded latent shape=%s (posterior.mode) -> injected shape=%s",
+        tuple(latents.shape), tuple(audio_latents.shape),
+    )
+    return audio_latents
+
+
+def _inflate_vocal_lock_condition_rows(state, num_generated_audio_latents: int, audio_channels: int) -> int:
+    r"""Vocal Lock (`H3_VOCAL_LOCK=1`) 用: `state["num_condition_audio_rows"]` を
+    「生成音声行も含めてすべて条件行」に見せかけ、denoise 中はクリーン (t=1.0固定・
+    無変更) に凍結する。書き換え前の (参照行数のみの) 元の値を返す -- 呼び出し側は
+    これを保持しておき、`_restore_vocal_lock_condition_rows()` に渡して必ず復元する
+    こと。
+
+    **重要**: `MiniMaxH3Ref2VADenoiseStep.__call__`
+    (`MiniMaxH3DenoiseLoopWrapper.__call__`, diffusers `denoise.py:260-266`) は
+    `state` から `block_state` を**ループの前に1回だけ** `get_block_state()` で
+    読み出し、以後 denoise ループの全ステップはその `block_state` (ローカルな
+    スナップショット) を使い回す (`state` への書き戻しはループ終了後の
+    `set_block_state()` のみ)。そのため、この関数で膨らませた
+    `num_condition_audio_rows` は **`denoise_step(pipe, state)` の呼び出しが
+    終わるまで `state` 上で膨らんだままにしておく必要がある** (`timesteps_step` の
+    呼び出しが終わった直後に戻してしまうと、後で呼ばれる denoise ループが
+    元の値でスナップショットを取ってしまい、生成音声行が凍結されない)。
+
+    呼び出し側 (`generate_ref2va()` の4分岐、将来的には `generate_ref_batch()` も) は
+    「`ref2va_latents_step` の後・`timesteps_step` の前」でこれを呼び (`ref2va_latents_step`
+    自身が参照行数との一致を検証するため、それより前に書き換えてはいけない)、
+    「`MiniMaxH3AfterDenoiseStep` の直前」(denoise ループの後) で
+    `_restore_vocal_lock_condition_rows()` を呼んで元へ戻すこと。
+    """
+    original = state.get("num_condition_audio_rows")
+    inflated = original + num_generated_audio_latents * audio_channels
+    state.set("num_condition_audio_rows", inflated)
+    logger.info(
+        "Vocal Lock: num_condition_audio_rows %s -> %s (freezing generated audio rows)",
+        original, inflated,
+    )
+    return original
+
+
+def _restore_vocal_lock_condition_rows(state, original: int) -> None:
+    r"""`_inflate_vocal_lock_condition_rows()` が返した元の値へ `state`
+    (`num_condition_audio_rows`) を戻す。`MiniMaxH3AfterDenoiseStep` の呼び出し直前に
+    必ず呼ぶこと -- 戻し忘れると、生成行だけを切り出す `decoders.py` の
+    `audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, ...)`
+    が 0 要素の reshape になり確実に落ちる。
+    """
+    state.set("num_condition_audio_rows", original)
+    logger.info("Vocal Lock: num_condition_audio_rows restored -> %s", original)
+
+
 def gpu_mem_gb() -> dict:
     if not torch.cuda.is_available():
         return {}
@@ -2264,6 +3942,49 @@ def ram_gb() -> dict:
         "total_gb": round(total, 1),
         "swap_used_gb": round(swap_total - swap_free, 2),
         "swap_total_gb": round(swap_total, 1),
+    }
+
+
+def _adaln_precompute_status(self: "MiniMaxH3Runner") -> dict:
+    """`status()` helper: whether each currently-resident transformer instance actually
+    has its AdaLN precompute table built yet (see H3_ADALN_PRECOMP's own module comment
+    and `core/adaln_precompute.py`'s `enable_adaln_precompute()` docstring for why this
+    can lag the `H3_ADALN_PRECOMP` flag itself -- precompute is armed at load time but
+    only fires on the first denoise step of the next request against that instance).
+    `False` (not `None`) when H3_ADALN_PRECOMP is off or the transformer is not loaded,
+    so callers never need a three-way None/True/False check.
+    """
+    if not H3_ADALN_PRECOMP:
+        return {"transformer": False, "transformer_ref": False}
+    from core.adaln_precompute import is_precomputed
+
+    return {
+        "transformer": bool(self._transformer_loaded and is_precomputed(self._pipe.transformer)),
+        "transformer_ref": bool(
+            self._transformer_ref_loaded and is_precomputed(self._pipe_ref.transformer_ref)
+        ),
+    }
+
+
+def _adaln_precompute_built_with_turbo(self: "MiniMaxH3Runner") -> dict:
+    """`status()` helper (v2 coexistence): which turbo state each currently-installed
+    precompute table was built while observing -- `None` per transformer that has no
+    table installed yet (mirrors `_adaln_precompute_status()`'s own shape/gating, see
+    that function's docstring). Purely informational (`core/adaln_precompute.py`'s
+    `built_with_turbo()` docstring: both turbo states are served correctly off the same
+    table for the default LoRA format), exposed so an operator watching `/api/status`
+    can confirm which state the table was actually built against without needing to
+    correlate it against request logs by hand.
+    """
+    if not H3_ADALN_PRECOMP:
+        return {"transformer": None, "transformer_ref": None}
+    from core.adaln_precompute import built_with_turbo
+
+    return {
+        "transformer": built_with_turbo(self._pipe.transformer) if self._transformer_loaded else None,
+        "transformer_ref": (
+            built_with_turbo(self._pipe_ref.transformer_ref) if self._transformer_ref_loaded else None
+        ),
     }
 
 
@@ -2306,6 +4027,79 @@ class _NullContext:
 
     def __exit__(self, *exc_info):
         return False
+
+
+class GenerationInterrupted(Exception):
+    """生成中断API(`POST /api/interrupt`)による中断を示す例外。
+
+    denoise ループのステップ境界(`timed_loop_step` 系ラッパー、および hires-fix の
+    `run_steps()`)でのみチェックされるため、反応は最大1ステップぶん遅れる
+    (H3の1ステップは実測6〜9秒 -- 中断要求からその1ステップが終わるまで待つ形になる。
+    現状の「シーン完走(約145秒)まで止まらない」よりは大幅に改善するが、即座には
+    止まらない仕様として受け入れる)。
+
+    ステップ途中のCUDA演算そのものを中断するものではない(そんな機構は無い) --
+    直前のステップが正常に完了した直後、次のステップに入る前に例外を送出するだけ。
+    そのため呼び出し元(`generate()` 等)の既存の `finally`/`except` によるVRAM解放・
+    状態復元パスをそのまま通り、CUDA的に不整合な状態でVRAMが残ることはない
+    (decode失敗時の `except BaseException: ... _restore_decode_steady_state()` と
+    同じく、denoiseループの外側は無傷)。
+    """
+
+
+class _InterruptController:
+    """プロセス内1件だけの生成を前提とした、シンプルな中断フラグ。
+
+    どのバックエンドも同時1生成(app.py の `_generation_lock` が保証)なので、
+    フラグは1個で足りる。複数スレッド(HTTPハンドラ用スレッドと、生成を実行している
+    スレッド)から読み書きされるため `threading.Lock` で保護する。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requested = False
+        self._job_id: str | None = None
+
+    def begin(self, job_id: str | None) -> None:
+        """生成開始時に必ず呼ぶこと。前回の要求が残っていて次の生成が即死するのを防ぐ。"""
+        with self._lock:
+            self._requested = False
+            self._job_id = job_id
+
+    def request(self, job_id: str | None) -> bool:
+        """中断を要求する。
+
+        `job_id` が指定されていて現在実行中のジョブと一致しない場合は何もせず False を
+        返す(直後に始まった別のジョブを巻き添えにしないため)。現在ジョブ不明
+        (アイドル中)の場合も False。実際に中断フラグを立てたら True。
+        """
+        with self._lock:
+            if self._job_id is None:
+                return False
+            if job_id is not None and job_id != self._job_id:
+                return False
+            self._requested = True
+            return True
+
+    def check(self) -> None:
+        """denoise ループのステップ境界から呼ぶ。要求が立っていれば例外を送出する。"""
+        with self._lock:
+            requested = self._requested
+        if requested:
+            raise GenerationInterrupted("生成が中断要求により停止しました")
+
+    def current_job_id(self) -> str | None:
+        with self._lock:
+            return self._job_id
+
+    def end(self) -> None:
+        """生成終了時(成功・失敗・中断いずれでも)に呼ぶ。次の生成に影響しないようにする。"""
+        with self._lock:
+            self._job_id = None
+            self._requested = False
+
+
+interrupt_controller = _InterruptController()
 
 
 @dataclass
@@ -2362,6 +4156,26 @@ class MiniMaxH3Runner:
         # bnb-4bit mode only: whether the (permanently-loaded-in-RAM-terms, but
         # phase-cycled-on-GPU) VAEs are currently placed on GPU or parked on CPU.
         self._vae_on_gpu = False
+        # H3_VAE_SPLIT: VAE のうち今 GPU にいる部分 ("encode"/"decode" の部分集合)。
+        # `_vae_on_gpu` は「どれかが GPU にいる」の意味 (全部とは限らない)。
+        self._vae_gpu_parts: set[str] = set()
+        # H3_VAE_PINNED: param/buffer -> pinned CPU マスター。初回の退避時に遅延構築。
+        self._vae_pin_map: dict = {}
+        self._vae_pin_disabled = False
+        # H3_BASE_PINNED / H3_REF_PINNED: transformer をモジュールごと保持し、重み実体
+        # だけ pinned CPU マスター <-> GPU で付け替える (初回の park で遅延構築)。
+        # slot = {"module", "pairs" [(tensor, pinned_master)], "wrapped" (park 時点の
+        # turbo LoRA 適用状態)}。slot が存在する間、ラップ等の構造はモジュールに
+        # そのまま生きている。キーは "base" / "ref"。
+        self._pin_slots: dict[str, dict] = {}
+        self._pin_disabled: set[str] = set()
+        # H3_DECODE_DEVICE: decode 専用 VAE コピー (別 GPU 常駐) と、decode の直列化ロック・
+        # 専用ストリーム。フラグ OFF の既定では一切使われない (None のまま)。
+        self._decode_vae = None
+        self._decode_audio_vae = None
+        self._decode_lock = threading.Lock()
+        self._decode_stream = None
+        self._decode_warned = False
         self._load_lock = threading.Lock()
 
         # --- ref2va (omni-reference) additions ---
@@ -2400,6 +4214,8 @@ class MiniMaxH3Runner:
         # H3_TURBO_LORA only: cached local path of the downloaded turbo LoRA safetensors,
         # resolved once per process by `_download_turbo_lora_if_needed()`.
         self._turbo_lora_path: str | None = None
+        # H3_TURBO_LORA_FILE_BASE (base transformer 専用) を別指定したときだけ使う。
+        self._turbo_lora_path_base: str | None = None
         # H3_TE_PROJ only: cached local path of the resolved projection safetensors,
         # resolved once per process by `_resolve_te_proj_path()`. The projection
         # instance itself is cached on `self._pipe._te_projection` (not here), since
@@ -2431,6 +4247,20 @@ class MiniMaxH3Runner:
         self._pipe = ModularPipeline.from_pretrained(MODEL_ID)
         logger.info("pipe shell built: blocks=%s components=%s",
                      self._pipe._blocks.__class__.__name__, self._pipe.component_names)
+
+        # H3_REF_IMAGE_SHORT_EDGE override (see its definition above for the "why").
+        # Only touch the config when it actually differs from diffusers' own default, so
+        # the default path calls `register_to_config` exactly as often as before this
+        # change (zero times) and stays byte-for-byte identical.
+        if H3_REF_IMAGE_SHORT_EDGE != H3_REF_IMAGE_SHORT_EDGE_DEFAULT:
+            self._pipe.register_to_config(reference_image_short_edge=H3_REF_IMAGE_SHORT_EDGE)
+            logger.info(
+                "reference_image_short_edge overridden: %d -> %d (H3_REF_IMAGE_SHORT_EDGE). "
+                "Affects ref2va's reference-prefix encode step: shorter edge -> fewer "
+                "prefix tokens -> faster Qwen3-VL-32B prefix encode, but less reference "
+                "detail reaches the prefix (character-consistency impact not A/B'd).",
+                H3_REF_IMAGE_SHORT_EDGE_DEFAULT, H3_REF_IMAGE_SHORT_EDGE,
+            )
 
     def _ensure_pipe_ref_shell(self):
         """PR #14355 (f37ab93): no second shell to build any more (see the `_pipe_ref`
@@ -2519,6 +4349,7 @@ class MiniMaxH3Runner:
             self._pipe.vae.to(CPU)
             self._pipe.audio_vae.to(CPU)
             self._vae_on_gpu = False
+            self._vae_gpu_parts = set()
         else:
             self._pipe.vae.to(DEVICE)
             self._pipe.audio_vae.to(DEVICE)
@@ -2540,6 +4371,10 @@ class MiniMaxH3Runner:
         self._vae_loaded = True
         logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
                      "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
+        # フェーズ境界での中断チェック(loading_vae): 固定費区間でも中断に反応できるように
+        # する追加。denoise ループのステップ境界チェック(`interrupt_controller`
+        # docstring 参照)と同じ「直前の重い処理が完全に終わった直後」の位置。
+        interrupt_controller.check()
 
         from diffusers.video_processor import VideoProcessor
 
@@ -2566,18 +4401,153 @@ class MiniMaxH3Runner:
 
         if getattr(self._pipe, "image_processor", None) is None:
             self._pipe.image_processor = VaeImageProcessor(vae_scale_factor=16)
+        # H3_DECODE_DEVICE: 別 GPU 上の decode 専用コピーをここで一緒に作る (フラグ OFF なら no-op)。
+        self._ensure_decode_vaes()
 
-    def _vae_to_gpu(self):
+    # H3_VAE_SPLIT 用: VAE の子モジュールを encode 側 / decode 側に分ける。video VAE は
+    # decoder が 4.5GiB (fp16)、encoder は 0.34GiB しかない (safetensors ヘッダの実測)。
+    # audio VAE は encoder+pre_block+mean/logs_proj (encode) と dec_in_proj+decoder (decode)。
+    # 各 VAE の encode()/decode() が触る子モジュールは autoencoder_kl_minimax_h3(.._audio).py
+    # のソースで確認済み。
+    _VAE_PARTS = {
+        "vae": {
+            "encode": ("encoder", "quant_conv"),
+            "decode": ("post_quant_conv", "decoder"),
+        },
+        "audio_vae": {
+            "encode": ("encoder", "pre_block", "mean_proj", "logs_proj"),
+            "decode": ("dec_in_proj", "decoder"),
+        },
+    }
+
+    def _vae_split_active(self) -> bool:
+        """H3_VAE_SPLIT が効く条件。TE が常駐する KEEP_REF2VA 限定: VAE を部分配置すると
+        `vae.device` (=最初のパラメータの置き場所) が CPU になる窓ができるが、KEEP 中は
+        `_execution_device` が先頭コンポーネントの text_encoder (GPU) で決まるので影響しない。"""
+        return H3_VAE_SPLIT and _keep_ref2va_active()
+
+    def _move_vae_part(self, part: str, device) -> bool:
+        """`part` ("encode"/"decode") の子モジュールだけを `device` へ移す。未知の子モジュール
+        が見つかったら (将来の diffusers 更新対策) False を返し、呼び出し側が全体移動へ退避する。"""
+        for attr, table in (("vae", self._VAE_PARTS["vae"]), ("audio_vae", self._VAE_PARTS["audio_vae"])):
+            module = getattr(self._pipe, attr)
+            known = set(table["encode"]) | set(table["decode"])
+            if any(name not in known for name, _ in module.named_children()) or \
+                    any(True for _ in module.named_parameters(recurse=False)) or \
+                    any(True for _ in module.named_buffers(recurse=False)):
+                return False
+        for attr in ("vae", "audio_vae"):
+            module = getattr(self._pipe, attr)
+            for name in self._VAE_PARTS[attr][part]:
+                getattr(module, name).to(device)
+        return True
+
+    # ---- H3_VAE_PINNED (pinned CPU マスター方式の VAE 退避) ----------------------
+
+    def _vae_pin_masters(self) -> dict | None:
+        """pinned CPU マスターを遅延構築して返す。失敗したら以後無効化して None
+        (呼び出し側は従来の `.to()` 経路へ退避する)。重みが変化しない前提のため、
+        もし将来 VAE を finetune/再キャストする経路を足すならマスターを破棄すること。"""
+        if self._vae_pin_disabled:
+            return None
+        if self._vae_pin_map:
+            return self._vae_pin_map
+        try:
+            t0 = time.time()
+            m: dict = {}
+            for attr in ("vae", "audio_vae"):
+                module = getattr(self._pipe, attr)
+                for t in itertools.chain(module.parameters(), module.buffers()):
+                    m[t] = t.data.detach().to(CPU, copy=True).pin_memory()
+                    t.data = m[t]  # 以後 CPU 側の実体は常にこのマスター
+            gib = sum(x.numel() * x.element_size() for x in m.values()) / 2**30
+            logger.info("H3_VAE_PINNED: pinned CPU masters built (%.2fGiB, %d tensors, %.2fs)",
+                        gib, len(m), time.time() - t0)
+            self._vae_pin_map = m
+            return m
+        except Exception:
+            logger.exception("H3_VAE_PINNED: pinned マスター作成に失敗、従来の .to() 経路へ退避")
+            self._vae_pin_map = {}
+            self._vae_pin_disabled = True
+            return None
+
+    def _vae_pin_tensor_list(self, parts: set[str] | None):
+        """移動対象の param/buffer を列挙する。`parts` None = vae/audio_vae 全体。
+        parts 指定時は `_move_vae_part` と同じ「未知の子モジュールがあれば None」
+        (呼び出し側が全体移動へ退避する) の保守則に従う。"""
+        out = []
+        for attr, table in (("vae", self._VAE_PARTS["vae"]), ("audio_vae", self._VAE_PARTS["audio_vae"])):
+            module = getattr(self._pipe, attr)
+            if parts is None:
+                out.extend(module.parameters())
+                out.extend(module.buffers())
+                continue
+            known = set(table["encode"]) | set(table["decode"])
+            if any(name not in known for name, _ in module.named_children()) or \
+                    any(True for _ in module.named_parameters(recurse=False)) or \
+                    any(True for _ in module.named_buffers(recurse=False)):
+                return None
+            for part in sorted(parts):
+                for name in table[part]:
+                    child = getattr(module, name)
+                    out.extend(child.parameters())
+                    out.extend(child.buffers())
+        return out
+
+    def _vae_pinned_move(self, tensors, device) -> None:
+        """pinned マスター方式の移動。->CPU は data の付け替えのみ (D2H 無し)、
+        ->GPU は pinned からの non_blocking H2D (同一ストリーム順序なので後続カーネルと
+        の整合は保たれるが、所要時間ログの正確さのため最後に同期する)。"""
+        pin = self._vae_pin_map
+        to_cpu = torch.device(device).type == "cpu"
+        for t in tensors:
+            master = pin.get(t)
+            if to_cpu:
+                t.data = master if master is not None else t.data.to(CPU)
+            else:
+                src = master if master is not None else t.data
+                t.data = src.to(device, non_blocking=master is not None)
+        if not to_cpu:
+            torch.cuda.synchronize()
+
+    def _vae_to_gpu(self, part: str = "all"):
         """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
         phase. A single short one-way trip, not a standing swap -- see module docstring.
+
+        `part` ("encode"/"decode") は `H3_VAE_SPLIT=1` かつ KEEP_REF2VA のときだけ効き、その
+        窓で使う子モジュールだけを GPU へ送る (参照エンコード窓ではデコーダ 4.5GiB を、
+        デコード窓ではエンコーダを置き去りにする)。それ以外は従来どおり全体を移す。
+        配置換えだけなので出力はビット一致。
         """
-        if TE_QUANT != "bnb-4bit" or self._vae_on_gpu:
+        if TE_QUANT != "bnb-4bit":
+            return
+        split = part in ("encode", "decode") and self._vae_split_active()
+        want = {part} if split else {"encode", "decode"}
+        need = want - self._vae_gpu_parts
+        if not need:
             return
         t0 = time.time()
-        self._pipe.vae.to(DEVICE)
-        self._pipe.audio_vae.to(DEVICE)
+        moved = False
+        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+            tensors = self._vae_pin_tensor_list(need if split else None)
+            if tensors is None and split:
+                tensors = self._vae_pin_tensor_list(None)  # 未知の子モジュール: 全体移動へ退避
+                need = {"encode", "decode"}
+            if tensors is not None:
+                self._vae_pinned_move(tensors, DEVICE)
+                self._vae_gpu_parts |= need if split else {"encode", "decode"}
+                moved = True
+        if not moved:
+            if split and all(self._move_vae_part(p, DEVICE) for p in sorted(need)):
+                self._vae_gpu_parts |= need
+            else:
+                # 従来経路 (または未知の子モジュールがあるときの退避): 全体を移す。
+                self._pipe.vae.to(DEVICE)
+                self._pipe.audio_vae.to(DEVICE)
+                self._vae_gpu_parts = {"encode", "decode"}
         self._vae_on_gpu = True
-        logger.info("vae/audio_vae -> GPU in %.2fs. gpu=%s", time.time() - t0, gpu_mem_gb())
+        logger.info("vae/audio_vae -> GPU (%s) in %.2fs. gpu=%s",
+                    "+".join(sorted(self._vae_gpu_parts)), time.time() - t0, gpu_mem_gb())
 
     def _vae_to_cpu(self):
         """bnb-4bit mode only: move the VAEs back off GPU once their phase is done, to make
@@ -2586,9 +4556,13 @@ class MiniMaxH3Runner:
         if TE_QUANT != "bnb-4bit" or not self._vae_on_gpu:
             return
         t0 = time.time()
-        self._pipe.vae.to(CPU)
-        self._pipe.audio_vae.to(CPU)
+        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+            self._vae_pinned_move(self._vae_pin_tensor_list(None), CPU)
+        else:
+            self._pipe.vae.to(CPU)
+            self._pipe.audio_vae.to(CPU)
         self._vae_on_gpu = False
+        self._vae_gpu_parts = set()
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("vae/audio_vae -> CPU in %.2fs. gpu=%s", time.time() - t0, gpu_mem_gb())
@@ -2636,21 +4610,61 @@ class MiniMaxH3Runner:
             self._free_text_encoder()
         if progress:
             progress.update(phase="loading_transformer", message="transformer をロード中...")
+        if "base" in self._pin_slots:
+            # H3_BASE_PINNED: 退避中のモジュールを pinned H2D で復帰させる。構造
+            # (turbo LoRA ラップ・attention backend) はモジュールに保持済みのため、
+            # 下の新規ロード経路の再適用は一切通らない。
+            module, wrapped = self._pinned_restore("base")
+            self._pipe.transformer = module
+            self._transformer_loaded = True
+            self._turbo_lora_wrapped = wrapped
+            self._active_variant = "t2va"
+            return
         t0 = time.time()
+        loaded_from_prequant = False
         if H3_TRANSFORMER_QUANT == "int8":
-            from diffusers import TorchAoConfig
-            from torchao.quantization import Int8WeightOnlyConfig
+            # 量子化済みキャッシュがあればそこから読む (H3_TRANSFORMER_PREQUANT の
+            # module docstring 参照)。読めた場合は bf16ロード+量子化を丸ごと省略する。
+            if H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=False), is_ref=False, progress=progress
+            ):
+                loaded_from_prequant = True
+            else:
+                from diffusers import TorchAoConfig
+                from torchao.quantization import Int8WeightOnlyConfig
 
-            quant_config = TorchAoConfig(
-                Int8WeightOnlyConfig(version=2),
-                modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+                quant_config = TorchAoConfig(
+                    Int8WeightOnlyConfig(version=2, set_inductor_config=False),
+                    modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+                )
+                self._pipe.load_components(
+                    names=["transformer"],
+                    dtype=torch.bfloat16,
+                    quantization_config={"transformer": quant_config},
+                    device_map={"transformer": "cuda"},
+                )
+        elif H3_TRANSFORMER_QUANT == "ck-w4a8":
+            # base = Kijai の AdaLN-pruned W4A8(fl2va_pruned_w4a8_mixed)を
+            # scripts/convert_kijai_w4a8.py で変換したキャッシュからロードする。
+            # アーキは pruned ref と同一(remote code クラス)なので pruned の
+            # ロード機構をそのまま使う。fresh 量子化経路は存在しない(ソースが
+            # Kijai の量子化済み配布物のため。フル 33B の直 W4 化は adaln_proj の
+            # K=2688 が回転カーネル 256 固定に非対応で不成立 — commit c56ed36 参照)。
+            from core import pruned as pruned_mod
+
+            cache_dir = H3_TRANSFORMER_PREQUANT_DIR / "transformer_base_pruned_ck_w4a8"
+            if not (cache_dir / "pruned_ck_w4a8_state.pt").exists():
+                raise RuntimeError(
+                    f"ck-w4a8 base のキャッシュがありません: {cache_dir}。"
+                    "scripts/convert_kijai_w4a8.py で "
+                    "Kijai/MiniMax-H3-experimental の minimax_h3_fl2va_pruned_w4a8_mixed."
+                    "safetensors を変換してください。"
+                )
+            snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO, weights=False)
+            self._pipe.transformer = pruned_mod.load_pruned_ref_from_cache(
+                cache_dir, snapshot, DEVICE, H3_PRUNED_CONVROT_GROUP, quant="ck-w4a8"
             )
-            self._pipe.load_components(
-                names=["transformer"],
-                dtype=torch.bfloat16,
-                quantization_config={"transformer": quant_config},
-                device_map={"transformer": "cuda"},
-            )
+            loaded_from_prequant = True
         else:
             self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
             self._pipe.transformer.to(DEVICE)
@@ -2673,6 +4687,15 @@ class MiniMaxH3Runner:
                 "transformer' warning above for the underlying error, often CUDA OOM) -- "
                 "self._pipe.transformer is still None after load_components()."
             )
+        # 初回のみ (量子化を実際にその場で行ったときだけ): 量子化済みの重みを保存して
+        # おき、次回以降のロードを短縮する。turbo LoRA の構造的 wrap や attention
+        # backend/FBC/AdaLN precompute の設定 (いずれも下記) より**前**、量子化直後の
+        # まっさらな状態で保存する (H3_TRANSFORMER_PREQUANT の module docstring 参照)。
+        if H3_TRANSFORMER_QUANT == "int8" and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
+            self._save_transformer_prequant(
+                self._transformer_prequant_dir(is_ref=False), self._pipe.transformer, is_ref=False
+            )
+
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_TURBO_LORA:
@@ -2684,7 +4707,7 @@ class MiniMaxH3Runner:
             # three. `H3_CACHE == "fbc"` is force-skipped below (not just "left at its
             # default") regardless of the env var's own value -- see `H3_TURBO_LORA`'s
             # module comment for why a handful of turbo steps leaves FBC no safe window.
-            n = self._apply_turbo_lora_checkpoint(self._pipe.transformer)
+            n = self._apply_turbo_lora_checkpoint(self._pipe.transformer, is_ref=False)
             self._turbo_lora_wrapped = True
             logger.info("H3_TURBO_LORA=1: applied turbo LoRA (%d layers wrapped), FBC force-disabled", n)
         if H3_ATTN_BACKEND:
@@ -2692,12 +4715,33 @@ class MiniMaxH3Runner:
             logger.info("transformer attention backend set to %r", H3_ATTN_BACKEND)
         if H3_CACHE == "fbc" and not H3_TURBO_LORA:
             self._enable_fbc()
-        logger.info(
-            "transformer loaded to GPU in %.1fs (quant=%s, turbo_lora=%s). gpu=%s ram=%s",
-            time.time() - t0, H3_TRANSFORMER_QUANT, H3_TURBO_LORA, gpu_mem_gb(), ram_gb(),
-        )
+        if H3_ADALN_PRECOMP:
+            # Arms this fresh transformer instance for AdaLN precompute -- the actual
+            # table build happens lazily, on the first denoise step of whichever request
+            # drives this instance next (see core/adaln_precompute.py's
+            # `enable_adaln_precompute()` docstring). Must re-arm on every fresh load,
+            # not just once at process start: this project's default H3_TE_QUANT=
+            # bnb-4bit steady state fully frees and reloads `transformer` around every
+            # request's decode window (`_free_transformer()`/`_restore_decode_steady_
+            # state()` below), which drops `_h3opt_adaln_cursor` along with the rest of
+            # the module -- the freshly-reloaded instance has no precompute state yet.
+            # Ordering against FBC (`_enable_fbc()`, just above) and turbo (already
+            # rejected at import time when this flag is on, see H3_ADALN_PRECOMP's own
+            # guard block) does not matter here: FBC wraps `block.forward` itself via a
+            # HookRegistry hook, precompute only ever replaces the `block.adaln_proj`
+            # submodule attribute that `block.forward` looks up dynamically on every
+            # call -- the two never touch the same callable.
+            from core.adaln_precompute import enable_adaln_precompute
 
-    def _apply_turbo_lora_checkpoint(self, transformer) -> int:
+            enable_adaln_precompute(self._pipe.transformer)
+        logger.info(
+            "transformer loaded to GPU in %.1fs (quant=%s, turbo_lora=%s, adaln_precomp=%s). gpu=%s ram=%s",
+            time.time() - t0, H3_TRANSFORMER_QUANT, H3_TURBO_LORA, H3_ADALN_PRECOMP, gpu_mem_gb(), ram_gb(),
+        )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
+
+    def _apply_turbo_lora_checkpoint(self, transformer, is_ref: bool = False) -> int:
         """設定済みの turbo LoRA をダウンロード → キー形式を判定 → 形式に応じた適用
         関数へディスパッチする (`_ensure_transformer` の起動時適用と
         `_apply_turbo_setting` の遅延適用、両呼び出し元の共通化)。
@@ -2705,8 +4749,8 @@ class MiniMaxH3Runner:
         comfy 形式 (Ostris 版) × int8 はここで明確に拒否する -- import 時のガードは
         リポジトリ名の予備判定 (`_TURBO_COMFY_REPOS`) しかできないため、未知リポジトリの
         comfy 形式チェックポイントはこの実ファイル判定が最後の砦。"""
-        self._download_turbo_lora_if_needed()
-        lora_format = detect_turbo_lora_format(self._turbo_lora_path)
+        lora_path = self._download_turbo_lora_if_needed(is_ref=is_ref)
+        lora_format = detect_turbo_lora_format(lora_path)
         if lora_format == "comfy":
             if H3_TRANSFORMER_QUANT == "int8":
                 raise ValueError(
@@ -2715,27 +4759,78 @@ class MiniMaxH3Runner:
                     "diffusers ネイティブ形式 (lightx2v/Minimax-h3-Turbo) を使うか、"
                     "int8/低VRAM を無効にしてください。"
                 )
-            return apply_turbo_lora(transformer, self._turbo_lora_path)
+            return apply_turbo_lora(transformer, lora_path)
         return apply_diffusers_turbo_lora(
-            transformer, self._turbo_lora_path,
-            resolve_turbo_lora_scale(lora_format, self._turbo_lora_path),
+            transformer, lora_path,
+            resolve_turbo_lora_scale(lora_format, lora_path),
         )
 
-    def _download_turbo_lora_if_needed(self):
+    def _download_turbo_lora_if_needed(self, is_ref: bool = True) -> str:
         """Resolve (downloading if necessary, via the normal HF cache) the turbo LoRA
         safetensors path once per process, caching it on `self._turbo_lora_path`. Split
         out from `_ensure_transformer` only so the download (network I/O, ~780MB) is not
         interleaved with that method's own docstring-documented load-order reasoning.
         """
-        if getattr(self, "_turbo_lora_path", None) is not None:
-            return
+        # is_ref=False (base transformer) は H3_TURBO_LORA_{REPO,FILE}_BASE を使う
+        # (未指定なら共通値 = 従来挙動)。is_ref=True (既定) は従来の共通 REPO/FILE。
+        # 結果は is_ref ごとに別キャッシュする。BASE が共通と同一なら同じパスを共有する。
+        if is_ref:
+            repo, fname, attr = H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE, "_turbo_lora_path"
+        else:
+            repo, fname, attr = H3_TURBO_LORA_REPO_BASE, H3_TURBO_LORA_FILE_BASE, "_turbo_lora_path_base"
+            if (repo, fname) == (H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE):
+                attr = "_turbo_lora_path"
+        cached = getattr(self, attr, None)
+        if cached is not None:
+            return cached
+        # H3_TE_PROJ と同じ流儀: H3_TURBO_LORA_FILE が実在する絶対パスならローカル
+        # ファイルとして直接使う (HF に無い自作/フィルタ済み LoRA の A/B 用。
+        # 2026-09-10、FastH3 dense LoRA の adaln 除外版検証で追加)。
+        if os.path.isabs(fname) and os.path.isfile(fname):
+            setattr(self, attr, fname)
+            logger.info("turbo LoRA checkpoint resolved (%s): %s (local file)", "ref" if is_ref else "base", fname)
+            return fname
         from huggingface_hub import hf_hub_download
 
         t0 = time.time()
-        self._turbo_lora_path = hf_hub_download(H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE)
+        path = hf_hub_download(repo, fname)
+        setattr(self, attr, path)
         logger.info(
-            "turbo LoRA checkpoint resolved: %s (%.1fs, repo=%s file=%s)",
-            self._turbo_lora_path, time.time() - t0, H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE,
+            "turbo LoRA checkpoint resolved (%s): %s (%.1fs, repo=%s file=%s)",
+            "ref" if is_ref else "base", path, time.time() - t0, repo, fname,
+        )
+        return path
+
+    def _ensure_hyperflow_ref(self, progress: ProgressState | None = None) -> None:
+        """H3_HYPERFLOW 時、transformer_ref に HyperFlow LoRA + TwoTimeEmbedder を適用する。
+
+        冪等: 適用済みかは transformer_ref インスタンスの time_embedder が
+        TwoTimeEmbedder かどうかで判定する(bool フラグではなくインスタンス基準 --
+        lowvram のパーティション切替等で transformer_ref が作り直された場合にも
+        自動で再適用される)。呼び出し点は apply_instant_settings(is_ref=True) の直前
+        (ref2va 本体と ref バッチの両経路が通る単一チョークポイント。denoise より
+        前であれば set_timesteps との順序は問わない -- モジュールコメント参照)。
+        """
+        if not H3_HYPERFLOW:
+            return
+        tr = getattr(self._pipe_ref, "transformer_ref", None)
+        if tr is None:
+            raise RuntimeError("H3_HYPERFLOW: transformer_ref が未ロードのまま適用点に到達しました")
+        from hyperflow_h3.embedder import TwoTimeEmbedder
+
+        if isinstance(tr.time_embedder, TwoTimeEmbedder):
+            return
+        if progress:
+            progress.update(phase="loading_transformer", message="HyperFlow LoRA を適用中...")
+        import types as _types
+
+        from hyperflow_h3 import load_hyperflow_lora
+
+        t0 = time.time()
+        load_hyperflow_lora(_types.SimpleNamespace(transformer_ref=tr), H3_HYPERFLOW_LORA)
+        logger.info(
+            "HyperFlow LoRA applied to transformer_ref in %.1fs (source=%s). gpu=%s",
+            time.time() - t0, H3_HYPERFLOW_LORA, gpu_mem_gb(),
         )
 
     def _check_group_offload_ram_guard(self):
@@ -2836,7 +4931,7 @@ class MiniMaxH3Runner:
         from torchao.quantization import Int8WeightOnlyConfig
 
         quant_config = TorchAoConfig(
-            Int8WeightOnlyConfig(version=2),
+            Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
         self._pipe.load_components(
@@ -2877,6 +4972,8 @@ class MiniMaxH3Runner:
             "transformer group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
             time.time() - t1, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
 
     def _fbc_last_step_was_skip(self) -> int:
         """Best-effort introspection of whether the just-finished transformer forward skipped
@@ -2913,9 +5010,74 @@ class MiniMaxH3Runner:
         self._pipe.transformer.enable_cache(FirstBlockCacheConfig(threshold=H3_CACHE_THRESHOLD))
         logger.info("FirstBlockCache enabled on transformer (threshold=%s)", H3_CACHE_THRESHOLD)
 
+    def _pinned_park(self, name: str, module, wrapped: bool) -> None:
+        """H3_BASE_PINNED / H3_REF_PINNED: transformer をモジュールごと保持したまま、
+        GPU 上の重み実体だけを pinned CPU マスターへ付け替えて VRAM を解放する。
+        初回のみマスター構築 (D2H コピー)、2回目以降は `p.data = master` のポインタ
+        付け替えのみ (コピー無し・一時二重化無し)。復帰は `_pinned_restore`。
+        turbo LoRA の lora_a/b は buffer 登録 (persistent=False) のため
+        `module.buffers()` で漏れなく対象になる。`wrapped` = park 時点で turbo LoRA
+        が構造適用済みか (restore 時にフラグへ戻す)。"""
+        slot = self._pin_slots.get(name)
+        if slot is None:
+            t0 = time.time()
+            seen: set[int] = set()
+            pairs: list = []
+            for t in itertools.chain(module.parameters(), module.buffers()):
+                if id(t) in seen or t.device.type != "cuda":
+                    continue
+                seen.add(id(t))
+                master = t.data.detach().to(CPU, copy=True).pin_memory()
+                pairs.append((t, master))
+                t.data = master
+            self._pin_slots[name] = {"module": module, "pairs": pairs, "wrapped": wrapped}
+            torch.cuda.empty_cache()
+            gib = sum(m.numel() * m.element_size() for _, m in pairs) / 2**30
+            logger.info(
+                "H3_%s_PINNED: pinned masters built + transformer parked "
+                "(%.2fGiB, %d tensors, %.2fs). gpu=%s ram=%s",
+                name.upper(), gib, len(pairs), time.time() - t0, gpu_mem_gb(), ram_gb(),
+            )
+        else:
+            t0 = time.time()
+            for t, master in slot["pairs"]:
+                t.data = master
+            slot["wrapped"] = wrapped
+            torch.cuda.empty_cache()
+            logger.info(
+                "H3_%s_PINNED: transformer parked (pointer swap, %.3fs). gpu=%s",
+                name.upper(), time.time() - t0, gpu_mem_gb(),
+            )
+
+    def _pinned_restore(self, name: str):
+        """pinned マスターから GPU へ復帰させ、(module, wrapped) を返す。
+        構造 (turbo LoRA ラップ・attention backend 設定) はモジュールに保持済み。"""
+        slot = self._pin_slots[name]
+        t0 = time.time()
+        for t, master in slot["pairs"]:
+            t.data = master.to(DEVICE, non_blocking=True)
+        torch.cuda.synchronize()
+        logger.info(
+            "H3_%s_PINNED: transformer restored from pinned masters in %.2fs. gpu=%s",
+            name.upper(), time.time() - t0, gpu_mem_gb(),
+        )
+        return slot["module"], slot["wrapped"]
+
     def _free_transformer(self):
         if not self._transformer_loaded:
             return
+        if H3_BASE_PINNED and "base" not in self._pin_disabled and not H3_LOWVRAM_GROUP:
+            try:
+                self._pinned_park("base", self._pipe.transformer, self._turbo_lora_wrapped)
+                self._pipe.transformer = None
+                self._transformer_loaded = False
+                self._turbo_lora_wrapped = False
+                return
+            except Exception:
+                logger.exception(
+                    "H3_BASE_PINNED: pinned 退避に失敗、従来の解放経路へ退避 (以後無効化)")
+                self._pin_disabled.add("base")
+                self._pin_slots.pop("base", None)
         # Drop in place, no CPU staging (same reasoning as _free_text_encoder). In
         # H3_LOWVRAM_GROUP mode the module's parameters mostly live on CPU already (only
         # ~1-2 group-offloaded blocks are ever GPU-resident at a time), so this call
@@ -2989,23 +5151,67 @@ class MiniMaxH3Runner:
             # mode's `_switch_to_variant` early-return check.
             self._active_variant = "ref2va"
             return
+        if "ref" in self._pin_slots:
+            # H3_REF_PINNED: 退避中のモジュールを pinned H2D で復帰 (base 側と同型)。
+            # turbo LoRA ラップ・attention backend・FBC はモジュールに保持済み。
+            module, wrapped = self._pinned_restore("ref")
+            self._pipe_ref.transformer_ref = module
+            self._transformer_ref_loaded = True
+            self._turbo_lora_wrapped_ref = wrapped
+            self._active_variant = "ref2va"
+            interrupt_controller.check()
+            return
         if progress:
             progress.update(phase="loading_transformer", message="transformer_ref (ref2va) をロード中...")
         t0 = time.time()
-        if H3_TRANSFORMER_QUANT == "int8":
-            from diffusers import TorchAoConfig
-            from torchao.quantization import Int8WeightOnlyConfig
+        loaded_from_prequant = False
+        if H3_PRUNED:
+            # AdaLN-pruned 経路(core/pruned.py)。方式は H3_PRUNED_QUANT(既定 int8wo)。キャッシュ優先、無ければ bf16(CPU)-> 量子化 ->
+            # GPU 常駐で作って保存する(bf16 はキャッシュ対象外)。
+            spec = H3_PRUNED_QUANT_SPEC
+            logger.info(
+                "pruned transformer_ref: H3_PRUNED_QUANT=%s -> %s",
+                spec.name, spec.describe(H3_PRUNED_CONVROT_GROUP),
+            )
+            if spec.cacheable and H3_TRANSFORMER_PREQUANT and self._load_pruned_ref_from_prequant(
+                self._transformer_prequant_dir(is_ref=True), progress=progress
+            ):
+                loaded_from_prequant = True
+            else:
+                from core import pruned as pruned_mod
 
-            quant_config = TorchAoConfig(
-                Int8WeightOnlyConfig(version=2),
-                modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
-            )
-            self._pipe_ref.load_components(
-                names=["transformer_ref"],
-                dtype=torch.bfloat16,
-                quantization_config={"transformer_ref": quant_config},
-                device_map={"transformer_ref": "cuda"},
-            )
+                avail_ram = ram_gb()["avail_gb"]
+                if avail_ram < 45.0:
+                    raise RuntimeError(
+                        f"H3_PRUNED の初回ロードには bf16 重み ~40GB を CPU に置く必要が"
+                        f"ありますが、空きホストRAMが {avail_ram:.1f}GB しかありません "
+                        "(量子化方式ならキャッシュ作成後は不要になります)。"
+                    )
+                snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO)
+                self._pipe_ref.transformer_ref = pruned_mod.load_pruned_ref_fresh(
+                    snapshot, DEVICE, H3_PRUNED_CONVROT_GROUP, quant=spec.name
+                )
+        elif H3_TRANSFORMER_QUANT == "int8":
+            # 量子化済みキャッシュがあればそこから読む (`_ensure_transformer` と同じ、
+            # H3_TRANSFORMER_PREQUANT の module docstring 参照)。
+            if H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=True), is_ref=True, progress=progress
+            ):
+                loaded_from_prequant = True
+            else:
+                from diffusers import TorchAoConfig
+                from torchao.quantization import Int8WeightOnlyConfig
+
+                quant_config = TorchAoConfig(
+                    Int8WeightOnlyConfig(version=2, set_inductor_config=False),
+                    modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+                )
+                self._pipe_ref.load_components(
+                    names=["transformer_ref"],
+                    dtype=torch.bfloat16,
+                    quantization_config={"transformer_ref": quant_config},
+                    device_map={"transformer_ref": "cuda"},
+                )
         else:
             self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16)
             self._pipe_ref.transformer_ref.to(DEVICE)
@@ -3020,17 +5226,62 @@ class MiniMaxH3Runner:
                 "often CUDA OOM) -- self._pipe_ref.transformer_ref is still None after "
                 "load_components()."
             )
+        # See `_ensure_transformer`'s matching save call: only on a fresh in-place
+        # quantize, and before turbo LoRA/attn backend/FBC/AdaLN precompute setup below.
+        # pruned は方式がキャッシュ対象のときだけ(bf16 はスナップショットがそのまま
+        # キャッシュなので保存しない)。
+        if H3_PRUNED:
+            cache_this_ref = H3_PRUNED_QUANT_SPEC.cacheable
+        else:
+            cache_this_ref = H3_TRANSFORMER_QUANT == "int8"
+        if cache_this_ref and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
+            self._save_transformer_prequant(
+                self._transformer_prequant_dir(is_ref=True), self._pipe_ref.transformer_ref, is_ref=True
+            )
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
+        if H3_PRUNED_COMPILE:
+            # キャッシュ保存より後・turbo LoRA wrap(遅延、初回 turbo リクエスト)より前。
+            import sys as _sys
+
+            from core import pruned as pruned_mod
+
+            pruned_mod.compile_convrot_layers(
+                self._pipe_ref.transformer_ref, _sys.modules["modeling_minimax_h3_pruned"]
+            )
         if H3_ATTN_BACKEND:
             self._pipe_ref.transformer_ref.set_attention_backend(H3_ATTN_BACKEND)
             logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
         if H3_CACHE == "fbc":
             self._enable_fbc_ref()
+        if H3_ADALN_PRECOMP and H3_PRUNED:
+            logger.info(
+                "H3_ADALN_PRECOMP は H3_PRUNED=1 ではスキップします"
+                "(pruned は AdaLN 構造自体が別物で、精計算の対象が存在しない)"
+            )
+        if H3_ADALN_PRECOMP and not H3_PRUNED:
+            # Mirrors `_ensure_transformer`'s own arming call -- see that method's
+            # comment for the full rationale (re-arm on every fresh load, ordering vs
+            # FBC does not matter). `enable_adaln_precompute()`'s class-level monkeypatch
+            # of `MiniMaxH3LoopDenoiser.__call__` covers `MiniMaxH3Ref2VALoopDenoiser`
+            # too (same bound method by inheritance, neither subclass overrides
+            # `__call__` -- verified against this project's pinned diffusers commit), so
+            # calling `enable_adaln_precompute()` a second time here (already called once
+            # from `_ensure_transformer`, or will be from a future call) is safe: the
+            # class-patch half is a no-op on the second call (`_h3opt_patched` guard),
+            # only the per-instance `_h3opt_adaln_wanted = True` arming actually happens
+            # against this transformer_ref instance.
+            from core.adaln_precompute import enable_adaln_precompute
+
+            enable_adaln_precompute(self._pipe_ref.transformer_ref)
         logger.info(
-            "transformer_ref loaded to GPU in %.1fs (quant=%s). gpu=%s ram=%s",
-            time.time() - t0, H3_TRANSFORMER_QUANT, gpu_mem_gb(), ram_gb(),
+            "transformer_ref loaded to GPU in %.1fs (quant=%s, adaln_precomp=%s). gpu=%s ram=%s",
+            time.time() - t0,
+            f"pruned/{H3_PRUNED_QUANT}" if H3_PRUNED else H3_TRANSFORMER_QUANT,
+            H3_ADALN_PRECOMP, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
 
     def _enable_fbc_ref(self):
         """Attach FirstBlockCache hooks to the (freshly loaded) transformer_ref.
@@ -3077,7 +5328,7 @@ class MiniMaxH3Runner:
         from torchao.quantization import Int8WeightOnlyConfig
 
         quant_config = TorchAoConfig(
-            Int8WeightOnlyConfig(version=2),
+            Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
         self._pipe_ref.load_components(
@@ -3118,10 +5369,24 @@ class MiniMaxH3Runner:
             "transformer_ref group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
             time.time() - t1, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
 
     def _free_transformer_ref(self):
         if not self._transformer_ref_loaded:
             return
+        if H3_REF_PINNED and "ref" not in self._pin_disabled:
+            try:
+                self._pinned_park("ref", self._pipe_ref.transformer_ref, self._turbo_lora_wrapped_ref)
+                self._pipe_ref.transformer_ref = None
+                self._transformer_ref_loaded = False
+                self._turbo_lora_wrapped_ref = False
+                return
+            except Exception:
+                logger.exception(
+                    "H3_REF_PINNED: pinned 退避に失敗、従来の解放経路へ退避 (以後無効化)")
+                self._pin_disabled.add("ref")
+                self._pin_slots.pop("ref", None)
         # Drop in place, no CPU staging -- same reasoning as _free_transformer /
         # _free_text_encoder (CLAUDE.md #33: no whole-module CPU-staging trips for
         # 60GB+ modules on this box). In H3_LOWVRAM_GROUP mode this reclaims host RAM
@@ -3142,6 +5407,70 @@ class MiniMaxH3Runner:
             else:
                 logger.warning("torch._C._host_emptyCache missing -- pinned host cache not released")
         logger.info("transformer_ref freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
+
+    def _drain_deferred_decode(self, caller: str, timeout_s: float = 30.0) -> None:
+        """base transformer のロード/解放を始める前に、実行中の deferred decode を待ち切る。
+
+        この機では「cuda:0 への大量 H2D(base 34GB のシャードロード)と cuda:1 の
+        decode(cuBLASLt)を同時に走らせる」と CUBLAS_STATUS_INTERNAL_ERROR ->
+        illegal memory access でプロセスの CUDA コンテキストごと壊れる(2026-10-06
+        実運用+ストレスで再現。P2P 全ゼロ・クロスデバイス empty_cache と並ぶ
+        このマシン固有のクロスデバイス罠)。decode は ~4s で終わるので待つのが最小対処。
+        生成ロックは呼び出し側が保持しており、待っている間に新しい decode が
+        生まれることはない(新 decode は ref2va の denoise 完了からしか始まらない)。
+        """
+        if not (self._decode_overlap_configured() if hasattr(self, "_decode_overlap_configured")
+                else (H3_DECODE_STREAM or H3_DECODE_DEVICE)):
+            return
+        if not self._decode_lock.locked():
+            return
+        t0 = time.time()
+        logger.info("%s: deferred decode の完了を待ってから base をロードします", caller)
+        while self._decode_lock.locked() and time.time() - t0 < timeout_s:
+            time.sleep(0.05)
+        logger.info("%s: deferred decode 完了 (%.2fs 待ち)", caller, time.time() - t0)
+
+    def _keep_ref2va_coexist(self, caller: str) -> bool:
+        """`H3_KEEP_REF2VA=1` で常駐している ref2va スタック (transformer_ref [+ TE]) を、base
+        transformer を使うリクエスト (t2va/fl2va/t2i) の間も残してよいか (= 両常駐が成立するか)。
+
+        True なら呼び出し側は `_free_transformer_ref()` と encode 後の `_free_text_encoder(force=True)`
+        をスキップする。False なら従来どおり解放する。判定は実行時の空きVRAMで行う:
+        空き >= `H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB` (+ TE 未ロードなら 17.5GB)。
+        `H3_VRAM_LIMIT_GB` が設定されていれば (上限 - このプロセスの reserved) との小さい方を空きとする。
+        判定結果と根拠は INFO ログ 1 行。KEEP_REF2VA でない / transformer_ref が未ロード (守るものが
+        無い) ときは無言で False (従来挙動)。呼び出しは `_load_lock` の中で行うこと。
+        """
+        if not (_keep_ref2va_active() and H3_KEEP_REF2VA_COEXIST):
+            return False
+        if not self._transformer_ref_loaded:
+            return False
+        if H3_TE_STREAM or H3_REF_PREFIX_PARK or H3_VAE_SPLIT:
+            # 32GB/48GB 級向けの低VRAM構成 (TE を CPU から流す・prefix を退避・VAE を分割配置)。
+            # 常駐の意味が通常構成と異なり、base 同居は未検証かつそもそも収支が合わないので常に解放。
+            return False
+        # ここで empty_cache() を呼んではいけない: H3_DECODE_STREAM/H3_DECODE_DEVICE の
+        # 重ね実行中は前リクエストの decode が cuda:1 で走っており、empty_cache は全デバイス
+        # 対象のため "illegal memory access" で CUDA コンテキストごと壊す (2026-10-06 実運用で
+        # 発生。547f7e1 の park 側と同じ罠を本判定自身が踏んでいた)。代わりに、この
+        # プロセスのアロケータが抱える「reserved だが未割当」のキャッシュ分を空きに足し込む
+        # (empty_cache が返すのはこの分なので、測定精度は同等)。
+        free_gb = (torch.cuda.mem_get_info(DEVICE)[0]
+                   + torch.cuda.memory_reserved(DEVICE) - torch.cuda.memory_allocated(DEVICE)
+                   ) / 1024**3
+        if H3_VRAM_LIMIT_GB:
+            free_gb = min(free_gb, float(H3_VRAM_LIMIT_GB) * 1e9 / 1024**3 - torch.cuda.memory_reserved(DEVICE) / 1024**3)
+        te_resident = self._text_encoder_loaded or self._te_external
+        need_gb = H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB + (0.0 if te_resident else 17.5)
+        ok = free_gb >= need_gb
+        logger.info(
+            "%s: H3_KEEP_REF2VA 両常駐判定 -> %s (空きVRAM %.1fGB %s 必要 %.1fGB = base 34.3 + 活性化 6.4 "
+            "+ 余裕 2.0%s)。%s",
+            caller, "ref2va スタック (transformer_ref + TE) を常駐のまま base を同居ロード" if ok else "解放して従来どおり",
+            free_gb, ">=" if ok else "<", need_gb, "" if te_resident else " + TE再ロード 17.5",
+            "" if ok else "VRAM不足 (低VRAM構成) のため transformer_ref を解放する",
+        )
+        return ok
 
     # ------------------------------------------------------------------
     # Instant-apply per-request settings (cache/attn/turbo) -- see core/settings.py's
@@ -3238,8 +5567,16 @@ class MiniMaxH3Runner:
         if turbo and not getattr(self, wrapped_attr):
             if progress:
                 progress.update(message=f"turbo LoRA を {label} へ適用中...")
-            n = self._apply_turbo_lora_checkpoint(transformer)
+            n = self._apply_turbo_lora_checkpoint(transformer, is_ref=is_ref)
             setattr(self, wrapped_attr, True)
+            if is_ref and H3_PRUNED_COMPILE_LEVEL >= 2:
+                from core import pruned as pruned_mod
+
+                pruned_mod.compile_turbo_wrappers(transformer, _TurboLoRALinear)
+            if is_ref and H3_PRUNED_COMPILE_LEVEL >= 3:
+                from core import pruned as pruned_mod
+
+                pruned_mod.compile_transformer_blocks(transformer)
             logger.info("turbo LoRA lazily applied to %s (%d layers wrapped)", label, n)
         elif getattr(self, wrapped_attr):
             n = set_turbo_lora_enabled(transformer, turbo)
@@ -3247,7 +5584,7 @@ class MiniMaxH3Runner:
         # else: turbo requested False and it was never wrapped in the first place --
         # nothing to do, the transformer's Linears are still the plain unwrapped ones.
 
-    def _apply_turbo_video_shift(self, turbo_effective: bool) -> None:
+    def _apply_turbo_video_shift(self, turbo_effective: bool, is_ref: bool = True) -> None:
         """Switch the (process-wide, shared) video scheduler's shift for this request,
         based on the request's *resolved* turbo state (`instant["turbo"]`) -- turbo is a
         per-request instant-apply setting (like `cache`/`attn`), so the shift a
@@ -3256,9 +5593,10 @@ class MiniMaxH3Runner:
 
         No-op entirely when `H3_TURBO_VIDEO_SHIFT` (module-level, resolved from either
         the env var or the configured turbo LoRA file's name -- see its own module
-        comment) is `None`: this happens for every non-`_768p` turbo LoRA file (v0.1,
-        8step v1.0), which were both distilled at the same shift the base model already
-        defaults to, so there is nothing to switch between turbo=1 and turbo=0 for.
+        comment) is `None`: this happens for every LoRA file that is not an fl2v
+        `_768p` variant (fl2v non-768p, and all ref2v files including the `_768p`-named
+        ref2v 8step v1.0), which were all distilled at the same shift the base model
+        already defaults to, so there is nothing to switch between turbo=1 and turbo=0.
         Also effectively unreachable when `H3_TURBO_LORA=0` (LoRA disabled for this
         process): callers only invoke this after `settings.resolve_instant_settings()`,
         and `turbo_effective` can only be True if `H3_TURBO_LORA=1` unless a request
@@ -3278,9 +5616,18 @@ class MiniMaxH3Runner:
         12.0/audio 3.0 is the shared baseline, and the 768p checkpoint's own upstream
         spec table only lists a different *video* training shift).
         """
-        if H3_TURBO_VIDEO_SHIFT is None:
+        # is_ref=False (generate/generate_still_batch = base transformer) は
+        # H3_TURBO_LORA_FILE_BASE 由来の shift (未指定なら ref と同一 = 従来挙動)。
+        turbo_shift = H3_TURBO_VIDEO_SHIFT if is_ref else H3_TURBO_VIDEO_SHIFT_BASE
+        if turbo_shift is None:
+            # このバリアントの LoRA は shift 切替なし。ただし scheduler は base/ref 共有なので、
+            # 直前の別バリアントのリクエストが shift を切り替えたままなら元に戻す。
+            if (H3_TURBO_VIDEO_SHIFT is not None or H3_TURBO_VIDEO_SHIFT_BASE is not None) \
+                    and self._pipe.scheduler.shift != self._base_video_shift:
+                self._pipe.scheduler.set_shift(self._base_video_shift)
+                logger.info("turbo video scheduler shift restored: %.3f (variant has no turbo shift)", self._base_video_shift)
             return
-        desired = H3_TURBO_VIDEO_SHIFT if turbo_effective else self._base_video_shift
+        desired = turbo_shift if turbo_effective else self._base_video_shift
         scheduler = self._pipe.scheduler
         if scheduler.shift == desired:
             return
@@ -3288,7 +5635,7 @@ class MiniMaxH3Runner:
         logger.info(
             "turbo video scheduler shift %s: %.3f (turbo=%s, H3_TURBO_VIDEO_SHIFT=%.3f, base=%.3f)",
             "applied" if turbo_effective else "restored", desired, turbo_effective,
-            H3_TURBO_VIDEO_SHIFT, self._base_video_shift,
+            turbo_shift, self._base_video_shift,
         )
 
     def apply_instant_settings(
@@ -3653,7 +6000,21 @@ class MiniMaxH3Runner:
             "text_encoder loaded from prequantized cache in %.1fs (%s). gpu=%s",
             time.time() - t0, cache_dir, gpu_mem_gb(),
         )
+        _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
+        _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+        if H3_TE_DIET and not self._te_external:
+            _apply_te_diet(self._pipe.text_encoder)  # no-op unless H3_TE_DIET=1 (bnb-4bit TE only)
+            logger.info("text_encoder after H3_TE_DIET. gpu=%s", gpu_mem_gb())
+        if H3_TE_STREAM and not self._te_external:
+            t_stream = time.time()
+            pinned = _apply_te_stream(self._pipe.text_encoder)  # after diet (same order as LTX2.5)
+            logger.info(
+                "text_encoder after H3_TE_STREAM (window=%d, pinned %.2fGiB, %.1fs). gpu=%s ram=%s",
+                H3_TE_STREAM_WINDOW, pinned, time.time() - t_stream, gpu_mem_gb(), ram_gb(),
+            )
         self._detach_te_if_external()
+        # フェーズ境界での中断チェック(loading_text_encoder)。
+        interrupt_controller.check()
         return True
 
     def _save_te_prequant(self, cache_dir: Path):
@@ -3696,6 +6057,273 @@ class MiniMaxH3Runner:
             )
         except Exception:
             logger.exception("量子化済み TE の保存に失敗(生成は続行): %s", cache_dir)
+            try:
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # transformer/transformer_ref 量子化済みキャッシュ (H3_TRANSFORMER_PREQUANT)
+    # ------------------------------------------------------------------
+    def _transformer_prequant_dir(self, is_ref: bool) -> Path:
+        """量子化済み transformer(_ref) のキャッシュ先。TE と同じく**設定ごとに別
+        ディレクトリ**にする (`transformer_int8` / `transformer_ref_int8` -- 2つの
+        インスタンスは同一モデルクラス/config だが個別にロード・保存されるため、
+        混同しないよう名前でも分ける)。H3_TRANSFORMER_QUANT が int8 以外のときは
+        呼び出し側がそもそもこのキャッシュに触れないので、ディレクトリ名に量子化方式は
+        含めていない (現状 int8 のみが対象)。"""
+        if H3_PRUNED and is_ref:
+            # pruned は重み・構造とも別物なので専用ディレクトリ(非 pruned の
+            # transformer_ref_int8 と取り違えない)。さらに方式ごとに分ける(ConvRot の
+            # 有無はキャッシュファイルから判別できないため、名前で分けるしかない)。
+            # int8dyn-convrot は従来名 transformer_ref_pruned_int8convrot のまま。
+            name = H3_PRUNED_QUANT_SPEC.cache_name
+            if name is None:
+                raise RuntimeError(
+                    f"H3_PRUNED_QUANT={H3_PRUNED_QUANT!r} はキャッシュ対象外です(呼び出し側のバグ)"
+                )
+        else:
+            name = "transformer_ref_int8" if is_ref else "transformer_int8"
+        return H3_TRANSFORMER_PREQUANT_DIR / name
+
+    def _transformer_prequant_metadata(self, pruned: bool = False) -> dict:
+        """キャッシュ無効化用のメタデータ。保存時に `meta.json` として書き込み、
+        ロード時にこれと一致するかを確認する。一致しなければキャッシュは無効
+        (作り直す) 扱い -- ソースチェックポイントが更新された、torchao がバージョン
+        アップされた、量子化レシピ (modules_to_not_convert) が変わった、のいずれかで
+        古い重みを黙って読んでしまう事故を防ぐ。
+
+        ソースチェックポイントの識別には HF ローカルキャッシュのスナップショットパス
+        (コミットハッシュを含む、`try_to_load_from_cache` で安価に取得できる) を使う --
+        ファイル自体のハッシュ化は 66GB を読み直すことになり本末転倒なので行わない。
+        """
+        import importlib.metadata
+
+        from huggingface_hub import try_to_load_from_cache
+
+        try:
+            cached = try_to_load_from_cache(MODEL_ID, "transformer/config.json")
+            source_snapshot = str(cached) if cached else None
+        except Exception:
+            source_snapshot = None
+        meta = {
+            "model_id": MODEL_ID,
+            "source_snapshot": source_snapshot,
+            "torchao_version": importlib.metadata.version("torchao"),
+            "torch_version": torch.__version__,
+            "quant_config": "Int8WeightOnlyConfig(version=2)",
+            # プロセス内で mutate されうる H3_INT8_MODULES_TO_NOT_CONVERT ではなく、
+            # 定義時点の pristine スナップショットを使う(定義箇所のコメント参照)。
+            "modules_to_not_convert": sorted(_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE),
+        }
+        if pruned:
+            # 【2026-10-07 修正】pruned キーを足すのは「pruned キャッシュの検証/保存」の
+            # ときだけ(引数 pruned)。旧実装は H3_PRUNED(プロセス全体のフラグ)で分岐して
+            # いたため、H3_PRUNED=1 運用では base 用 transformer_int8 の meta にまで
+            # pruned の quant_config が混入し、H3_PRUNED_QUANT を切り替えただけで無関係な
+            # base キャッシュが無効化 -> 削除済み bf16 シャード 62GB の再DLが走った(実機)。
+            try:
+                from huggingface_hub import try_to_load_from_cache as _ttlfc
+
+                cached = _ttlfc(H3_PRUNED_REPO, "transformer_ref/config.json")
+                pruned_snapshot = str(cached) if cached else None
+            except Exception:
+                pruned_snapshot = None
+            # quant_config は方式ごとの文字列(既定は従来の
+            # "Int8DynamicActivationInt8WeightConfig+convrot" のまま)。group size は
+            # ConvRot を掛ける方式でだけレシピの一部になる(回転なしの方式では値を
+            # 変えてもキャッシュが無効にならないよう含めない)。
+            meta.update({
+                "pruned_repo": H3_PRUNED_REPO,
+                "pruned_snapshot": pruned_snapshot,
+                "quant_config": H3_PRUNED_QUANT_SPEC.meta_quant_config,
+            })
+            if H3_PRUNED_QUANT_SPEC.convrot:
+                meta["convrot_group_size"] = H3_PRUNED_CONVROT_GROUP
+        return meta
+
+    def _load_transformer_from_prequant(
+        self, cache_dir: Path, is_ref: bool, progress: ProgressState | None = None
+    ) -> bool:
+        """量子化済みキャッシュから transformer(_ref) を読む。成功したら True。
+
+        `_load_te_from_prequant` と同じ fail-open 方針: 読めなかった場合 (キャッシュが
+        存在しない、壊れている、メタデータが現在の設定と食い違う) は**例外を投げず
+        False を返す** -- 呼び出し側は黙って通常の bf16ロード+量子化経路へ落ちる。
+        """
+        meta_path = cache_dir / "meta.json"
+        config_path = cache_dir / "config.json"
+        if not (meta_path.exists() and config_path.exists()):
+            return False
+        try:
+            saved_meta = json.loads(meta_path.read_text())
+        except Exception:
+            logger.warning("transformer 量子化済みキャッシュの meta.json が壊れています、"
+                            "通常経路へフォールバック: %s", cache_dir)
+            return False
+        current_meta = self._transformer_prequant_metadata(pruned=False)
+        if saved_meta != current_meta:
+            logger.info(
+                "transformer 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
+                "扱いにします (通常経路で作り直します): %s\n保存済み=%s\n現在=%s",
+                cache_dir, saved_meta, current_meta,
+            )
+            return False
+        label = "transformer_ref" if is_ref else "transformer"
+        if progress:
+            progress.update(
+                phase="loading_transformer",
+                message=f"{label} (量子化済みキャッシュ) をロード中...",
+            )
+        t0 = time.time()
+        try:
+            from diffusers import MiniMaxH3Transformer3DModel
+
+            tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
+            tr = tr.to(DEVICE)
+        except Exception:
+            logger.exception(
+                "%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",
+                label, cache_dir,
+            )
+            return False
+        if is_ref:
+            self._pipe_ref.transformer_ref = tr
+        else:
+            self._pipe.transformer = tr
+        logger.info(
+            "%s loaded from prequantized cache in %.1fs (%s). gpu=%s",
+            label, time.time() - t0, cache_dir, gpu_mem_gb(),
+        )
+        return True
+
+    def _load_pruned_ref_from_prequant(
+        self, cache_dir: Path, progress: ProgressState | None = None
+    ) -> bool:
+        """pruned(H3_PRUNED_QUANT の方式)の量子化済みキャッシュから transformer_ref を読む。
+
+        `_load_transformer_from_prequant` と同じ fail-open 方針(読めなければ False を
+        返し、呼び出し側が通常の bf16 ロード+量子化経路で作り直す)。違いは
+        ①モデルクラスが remote code の MiniMaxH3PrunedTransformer3DModel であること
+        ②ConvRot 系の方式ではオンライン入力回転がクラス差し替えで実現されており直列化
+        されないため、ロード後に `mark_convrot()` でクラスを付け直すこと(ConvRot 無しの
+        方式では呼ばない。どちらを呼ぶかは core/pruned.py が方式から機械的に決める)。
+        """
+        meta_path = cache_dir / "meta.json"
+        config_path = cache_dir / "config.json"
+        if not (meta_path.exists() and config_path.exists()):
+            return False
+        try:
+            saved_meta = json.loads(meta_path.read_text())
+        except Exception:
+            logger.warning("pruned 量子化済みキャッシュの meta.json が壊れています、"
+                           "通常経路へフォールバック: %s", cache_dir)
+            return False
+        current_meta = self._transformer_prequant_metadata(pruned=True)
+        if saved_meta != current_meta:
+            logger.info(
+                "pruned 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
+                "扱いにします: %s\n保存済み=%s\n現在=%s",
+                cache_dir, saved_meta, current_meta,
+            )
+            return False
+        if progress:
+            progress.update(
+                phase="loading_transformer",
+                message="transformer_ref (pruned 量子化済みキャッシュ) をロード中...",
+            )
+        try:
+            from core import pruned as pruned_mod
+
+            # weights=False: キャッシュロードに bf16 シャードは不要(remote code と
+            # config だけ解決する。シャード削除運用で 38GB の再DLを誘発しないため)。
+            snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO, weights=False)
+            tr = pruned_mod.load_pruned_ref_from_cache(
+                cache_dir, snapshot, DEVICE, H3_PRUNED_CONVROT_GROUP, quant=H3_PRUNED_QUANT
+            )
+        except Exception:
+            logger.exception(
+                "pruned 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",
+                cache_dir,
+            )
+            return False
+        self._pipe_ref.transformer_ref = tr
+        return True
+
+    def _save_transformer_prequant(self, cache_dir: Path, transformer, is_ref: bool):
+        """ロード済み (量子化直後、turbo LoRA 等でまだ手を加えていない) transformer(_ref)
+        を量子化済みのまま保存する。失敗しても生成は続行する (`_save_te_prequant` と
+        同じ fail-open 方針)。
+
+        呼び出し側 (`_ensure_transformer`/`_ensure_transformer_ref`) は、turbo LoRA の
+        構造的な Linear wrap や attention backend 設定より**前**、量子化直後にこれを
+        呼ぶこと -- 保存点の妥当性は本タスクの Phase 1/2 で確認済み (H3_TRANSFORMER_
+        PREQUANT の module docstring 参照)。
+        """
+        import shutil
+
+        label = "transformer_ref" if is_ref else "transformer"
+        try:
+            free_gb = shutil.disk_usage(
+                H3_TRANSFORMER_PREQUANT_DIR.parent if H3_TRANSFORMER_PREQUANT_DIR.exists()
+                else Path.cwd()
+            ).free / 1e9
+        except Exception:
+            free_gb = float("inf")
+        if free_gb < H3_TRANSFORMER_PREQUANT_MIN_FREE_GB:
+            logger.warning(
+                "%s 量子化済みキャッシュの保存をスキップ: 空きディスクが %.1fGB で下限 %.1fGB"
+                "を下回る (H3_TRANSFORMER_PREQUANT_MIN_FREE_GB で調整可、"
+                "H3_TRANSFORMER_PREQUANT=0 で無効化可)",
+                label, free_gb, H3_TRANSFORMER_PREQUANT_MIN_FREE_GB,
+            )
+            return
+        avail_ram = ram_gb()["avail_gb"]
+        if avail_ram < H3_TRANSFORMER_PREQUANT_MIN_RAM_GB:
+            logger.warning(
+                "%s 量子化済みキャッシュの保存をスキップ: 空きホストRAMが %.1fGBで下限 %.1fGB"
+                "を下回る (CLAUDE.md #33 と同じ理由でホストRAM枯渇を避けるため。"
+                "H3_TRANSFORMER_PREQUANT_MIN_RAM_GB で調整可)",
+                label, avail_ram, H3_TRANSFORMER_PREQUANT_MIN_RAM_GB,
+            )
+            return
+        tmp_dir = cache_dir.with_name(cache_dir.name + ".tmp")
+        try:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            tmp_dir.parent.mkdir(parents=True, exist_ok=True)
+            t0 = time.time()
+            # `save_pretrained` の既定 (`safe_serialization=True`, `max_shard_size="10GB"`)
+            # はシャード単位で `safetensors.torch.save_file()` を呼ぶ (GPU上のテンソルの
+            # ままの `state_dict()` をシャードに分けて直列化するため、34GB 全体を一度に
+            # CPU へ複製することはない -- モジュール冒頭の H3_TRANSFORMER_PREQUANT_MIN_RAM_GB
+            # のコメント参照)。
+            if H3_PRUNED and is_ref:
+                # pruned は hf_quantizer を介さない生 torchao 量子化のため safetensors
+                # 保存が不可(core/pruned.py の save_pruned_ref_cache 参照)。
+                from core import pruned as pruned_mod
+
+                pruned_mod.save_pruned_ref_cache(transformer, tmp_dir, quant=H3_PRUNED_QUANT)
+            else:
+                transformer.save_pretrained(str(tmp_dir))
+            (tmp_dir / "meta.json").write_text(
+                json.dumps(self._transformer_prequant_metadata(pruned=H3_PRUNED and is_ref),
+                           indent=2, ensure_ascii=False)
+            )
+            # 一時ディレクトリへ書いてから rename する: 保存中にプロセスが落ちても
+            # 中途半端なキャッシュが「有効」に見えてしまうのを防ぐ (config.json/meta.json
+            # の存在でキャッシュ有無を判定しているため)。
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            tmp_dir.rename(cache_dir)
+            size_gb = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file()) / 1e9
+            logger.info(
+                "%s 量子化済みキャッシュを保存: %s (%.2fGB, %.1fs)。次回以降のロードが高速になる",
+                label, cache_dir, size_gb, time.time() - t0,
+            )
+        except Exception:
+            logger.exception("%s 量子化済みキャッシュの保存に失敗(生成は続行): %s", label, cache_dir)
             try:
                 if tmp_dir.exists():
                     shutil.rmtree(tmp_dir)
@@ -3790,6 +6418,8 @@ class MiniMaxH3Runner:
             H3_TE_PROJ_MODEL, f" ({H3_TE_DEVICE})" if self._te_external else "",
             time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
+        _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
         self._detach_te_if_external()
 
         # 投影行列は一度だけロードしてキャッシュする (`self._pipe._te_projection`,
@@ -3799,6 +6429,8 @@ class MiniMaxH3Runner:
         if getattr(self._pipe, "_te_projection", None) is None:
             proj_path = self._resolve_te_proj_path()
             self._pipe._te_projection = _TeProjection(proj_path, device=self._encode_device)
+        # フェーズ境界での中断チェック(loading_text_encoder)。
+        interrupt_controller.check()
 
     def _load_text_encoder(self, progress: ProgressState | None = None):
         """Load the text_encoder to GPU.
@@ -3872,10 +6504,28 @@ class MiniMaxH3Runner:
                 prune_suffix, f" ({H3_TE_DEVICE})" if self._te_external else "",
                 time.time() - t0, gpu_mem_gb(), ram_gb(),
             )
-            self._detach_te_if_external()
             # 初回のみ: 量子化済みの重みを保存しておき、次回以降のロードを短縮する。
+            # **必ず `_detach_te_if_external()` より前に呼ぶこと**: detach は
+            # `self._pipe.text_encoder = None` にするため、後に回すと TE 外部常駐
+            # (H3_TE_DEVICE) 構成で保存が毎回 AttributeError になり、prequant
+            # キャッシュが永遠に作られない (2026-08-20 実機で発症・修正)。
             if H3_TE_PREQUANT:
                 self._save_te_prequant(cache_dir)
+            _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
+            _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+            if H3_TE_DIET and not self._te_external:
+                # prequant 保存(上)は完全な重みで済ませた後に適用する (保存物を痩せさせない)。
+                _apply_te_diet(self._pipe.text_encoder)
+            if H3_TE_STREAM and not self._te_external:
+                t_stream = time.time()
+                pinned = _apply_te_stream(self._pipe.text_encoder)  # after diet (same order as LTX2.5)
+                logger.info(
+                    "text_encoder after H3_TE_STREAM (window=%d, pinned %.2fGiB, %.1fs). gpu=%s ram=%s",
+                    H3_TE_STREAM_WINDOW, pinned, time.time() - t_stream, gpu_mem_gb(), ram_gb(),
+                )
+            self._detach_te_if_external()
+            # フェーズ境界での中断チェック(loading_text_encoder)。
+            interrupt_controller.check()
             return
         # TE (66GB, or ~53GB pruned) + transformer (66GB) cannot coexist in 96GB VRAM:
         # measured 66.73GB for the unpruned TE alone (the checkpoint shards are
@@ -3894,6 +6544,10 @@ class MiniMaxH3Runner:
             "text_encoder%s loaded to GPU in %.1fs. gpu=%s ram=%s",
             prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
+        _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+        # フェーズ境界での中断チェック(loading_text_encoder)。
+        interrupt_controller.check()
 
     def _free_text_encoder(self, force: bool = False):
         """Free the resident text_encoder.
@@ -3951,6 +6605,15 @@ class MiniMaxH3Runner:
         # above, since they are the same object) rather than a fix for a live bug. Left
         # in rather than deleted: harmless, and it stays correct if this alias
         # relationship were ever to change again.
+        # 単発プレフィックス KV キャッシュ (`H3_REF_PREFIX_CACHE_SINGLE`) は、これから
+        # 落とす TE インスタンスの重みで作ったもの。TE を落とす以上は必ず一緒に捨てる
+        # (捨てないと ~1.0GiB の VRAM が「もう二度と使えない KV」として残る。
+        # `_encode_ref2va_prompt_prefix_cached` 側の weakref チェックでも救えるが、
+        # VRAM を即座に返すためここで能動的に捨てる)。既定 OFF のときは常に no-op。
+        _clear_single_ref_prefix_cache("text_encoder freed")
+        # H3_TE_STREAM: LM 層の pinned host 実体 (~14GiB) は PyTorch の host キャッシュに残って
+        # しまう (del + gc + empty_cache では OS へ返らない) ので、TE を落とすときに明示的に返す。
+        _te_was_streamed = bool(getattr(self._pipe.text_encoder, "_te_stream_applied", False))
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
         if self._pipe_ref is not None and getattr(self._pipe_ref, "text_encoder", None) is not None:
@@ -3970,6 +6633,8 @@ class MiniMaxH3Runner:
         self._text_encoder_loaded = False
         gc.collect()
         torch.cuda.empty_cache()
+        if _te_was_streamed and hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
         logger.info("text_encoder freed (force=%s). gpu=%s ram=%s", force, gpu_mem_gb(), ram_gb())
 
     def _free_vaes(self):
@@ -3994,8 +6659,13 @@ class MiniMaxH3Runner:
         if getattr(self._pipe, "audio_vae", None) is not None:
             del self._pipe.audio_vae
             self._pipe.audio_vae = None
+        # H3_VAE_PINNED: モジュールを捨てるのでマスターも破棄 (pinned ホスト RAM を返す)。
+        self._vae_pin_map = {}
         self._vae_loaded = False
         self._vae_on_gpu = False
+        self._vae_gpu_parts = set()
+        self._free_decode_vaes()
+        _clear_ref_latent_cache("vae freed")
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("vae/audio_vae freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
@@ -4018,7 +6688,21 @@ class MiniMaxH3Runner:
         t0 = time.time()
         self._free_transformer()
         self._free_transformer_ref()
+        if self._pin_slots:
+            # H3_BASE_PINNED/H3_REF_PINNED: 上の free は park (モジュール保持) になる
+            # が、unload_all は設定変更リロードの前段 = 完全破棄が必要 (park したまま
+            # だと新しい turbo/attn 設定が restore 経路で再適用されない)。スロットごと
+            # 捨てて pinned ホスト RAM も返す。
+            self._pin_slots.clear()
+            gc.collect()
+            _host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+            if _host_empty_cache is not None:
+                _host_empty_cache()
+            logger.info("unload_all: pinned park slots purged")
         self._free_text_encoder(force=True)
+        # `_free_text_encoder` は TE 外部常駐 (`H3_TE_DEVICE`) では早期 return するので、
+        # そちらの構成でも確実に捨てるためここでも呼ぶ (既定 OFF なら no-op)。
+        _clear_single_ref_prefix_cache("unload_all")
         self._free_vaes()
         self._active_variant = None
         logger.info("unload_all: done in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
@@ -4046,6 +6730,31 @@ class MiniMaxH3Runner:
         keep the steady-state VRAM footprint minimal between requests.
         """
         with self._load_lock:
+            if H3_PRUNED:
+                # import 時の logger.info は uvicorn のロギング設定前で消えるので、起動時の
+                # 構成はここで出す(H3_LOWVRAM=1 では transformer_ref は初回リクエストまで
+                # ロードされず、`_ensure_transformer_ref` のログだけだと起動直後に分からない)。
+                logger.info(
+                    "H3_PRUNED=1: transformer_ref は pruned、H3_PRUNED_QUANT=%s -> %s",
+                    H3_PRUNED_QUANT, H3_PRUNED_QUANT_SPEC.describe(H3_PRUNED_CONVROT_GROUP),
+                )
+            if _keep_ref2va_active():
+                # import 時のログは uvicorn のロギング設定前で消えるので、起動時の構成表明はここで出す。
+                logger.info(
+                    "H3_KEEP_REF2VA=1: ref2va は text_encoder + transformer_ref(%s) をリクエスト間で "
+                    "GPU 常駐させる (初回 ref2va でロード、以降スキップ)。vae_resident=%s",
+                    "pruned" if H3_PRUNED else "int8", H3_KEEP_REF2VA_VAE,
+                )
+                logger.info(
+                    "H3_KEEP_REF2VA low-VRAM options: te_diet=%s ref_prefix_park=%s vae_split=%s "
+                    "te_stream=%s (window=%d)",
+                    H3_TE_DIET, H3_REF_PREFIX_PARK and H3_REF_PREFIX_CACHE_SINGLE, H3_VAE_SPLIT,
+                    H3_TE_STREAM, H3_TE_STREAM_WINDOW,
+                )
+                if H3_REF_PREFIX_PARK and not H3_REF_PREFIX_CACHE_SINGLE:
+                    logger.warning("H3_REF_PREFIX_PARK=1 has no effect without H3_REF_PREFIX_CACHE_SINGLE=1")
+            elif H3_VAE_SPLIT:
+                logger.warning("H3_VAE_SPLIT=1 is ignored without H3_KEEP_REF2VA=1 (+H3_LOWVRAM=1)")
             self._ensure_vaes()
             if H3_LOWVRAM_GROUP:
                 self._ensure_transformer()
@@ -4062,6 +6771,234 @@ class MiniMaxH3Runner:
                     self._load_text_encoder()
                 elif TE_QUANT == "bnb-4bit":
                     self._load_text_encoder()
+
+    # ------------------------------------------------------------------
+    # H3_DECODE_STREAM / H3_DECODE_DEVICE (2026-10-05, 既定 OFF)
+    # ------------------------------------------------------------------
+    def _decode_target_device(self) -> torch.device:
+        return torch.device(H3_DECODE_DEVICE) if H3_DECODE_DEVICE else DEVICE
+
+    def decode_deferred_active(self) -> bool:
+        """decode を denoise から分離する経路 (`_decode_ref2va_deferred`) が今のリクエストで
+        使えるか。フラグ OFF なら常に False (= 従来のインライン decode)。
+
+        成立条件は「VAE が GPU に常駐していて、リクエストの出入りで動かされない」こと
+        (`H3_KEEP_REF2VA=1` + `H3_KEEP_REF2VA_VAE=1` + `H3_LOWVRAM=1`)。そうでない構成では
+        次リクエストのエンコードが `_vae_to_cpu()` 等で VAE を動かし、decode と衝突しうる
+        ので、警告を1回出して従来経路にフォールバックする。
+        """
+        if not (H3_DECODE_STREAM or H3_DECODE_DEVICE):
+            return False
+        reason = None
+        if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
+            reason = "H3_KEEP_REF2VA=1 + H3_KEEP_REF2VA_VAE=1 + H3_LOWVRAM=1 (VAE 常駐) が必要"
+        elif H3_DECODE_DEVICE:
+            try:
+                d = torch.device(H3_DECODE_DEVICE)
+                if d.type != "cuda" or (d.index or 0) >= torch.cuda.device_count():
+                    reason = f"H3_DECODE_DEVICE={H3_DECODE_DEVICE!r} は存在する CUDA デバイスではない"
+            except Exception as e:  # noqa: BLE001
+                reason = f"H3_DECODE_DEVICE={H3_DECODE_DEVICE!r} を解釈できない ({e})"
+        if reason:
+            if not self._decode_warned:
+                self._decode_warned = True
+                logger.warning("H3_DECODE_STREAM/H3_DECODE_DEVICE は無効化されインライン decode を使う: %s", reason)
+            return False
+        return True
+
+    def decode_overlap_active(self) -> bool:
+        """denoise 完了時点で生成ロックを手放す (= 次リクエストと decode が重なる) か。"""
+        return H3_DECODE_STREAM and self.decode_deferred_active()
+
+    def _ensure_decode_vaes(self) -> None:
+        """`H3_DECODE_DEVICE` が cuda:0 以外のとき、video/audio VAE の decode 専用コピーを
+        そのデバイスへ作る (冪等)。transformer/TE/参照エンコード用の VAE (cuda:0) には触らない。
+        """
+        if self._decode_vae is not None:
+            return
+        if not self.decode_deferred_active():
+            return
+        separate = self._decode_target_device() != DEVICE
+        if not (separate or H3_DECODE_STREAM_SIDE or H3_DECODE_VAE):
+            return
+        import copy
+
+        dev = self._decode_target_device()
+        t0 = time.time()
+        if H3_DECODE_VAE:
+            # light VAE (probe)。標準 VAE と同じ手順 (fp32 ロード→fp16 キャスト) で作る。
+            from diffusers import AutoencoderKLMiniMaxH3
+
+            vae = AutoencoderKLMiniMaxH3.from_pretrained(H3_DECODE_VAE_REPO, torch_dtype=torch.float32)
+            vae = vae.to(torch.float16)
+            vae.eval()
+            vae.set_attention_backend("native")
+            logger.info("decode-only video VAE = %s (H3_DECODE_VAE, decoder_num_layers=%s) loaded in %.2fs",
+                        H3_DECODE_VAE_REPO, vae.config.decoder_num_layers, time.time() - t0)
+        else:
+            vae = copy.deepcopy(self._pipe.vae)
+            # `_fp16_autocast_encode` (encode のパッチ) は元の VAE にひも付くクロージャ。decode 専用
+            # コピーでは使わないので外して、取り違えようがないようにする。
+            vae.__dict__.pop("encode", None)
+            if H3_DECODE_NATIVE_ATTN or not separate:
+                # 専用ストリーム版: sage は side stream で壊れる (H3_DECODE_STREAM のコメント) ので native 固定。
+                vae.set_attention_backend("native")
+        self._decode_vae = vae.to(dev)
+        # audio VAE は deepcopy できない (legacy weight_norm が計算済みの非リーフ `weight` を属性に持つ:
+        # "Only Tensors created explicitly by the user support the deepcopy protocol")。config から
+        # 組み立て直して state_dict を流し込む。
+        from diffusers import AutoencoderKLMiniMaxH3Audio
+
+        src_audio = self._pipe.audio_vae
+        audio_copy = AutoencoderKLMiniMaxH3Audio.from_config(src_audio.config)
+        audio_copy.load_state_dict({k: v.detach().cpu() for k, v in src_audio.state_dict().items()})
+        audio_copy.eval()
+        audio_copy.set_attention_backend("native")  # 本体の audio_vae と同じ (fp32 固定なので sage 不可)
+        self._decode_audio_vae = audio_copy.to(dev)
+        torch.cuda.synchronize(dev)
+        logger.info("decode-only vae/audio_vae copies placed on %s in %.2fs (H3_DECODE_DEVICE)", dev, time.time() - t0)
+
+    def _free_decode_vaes(self) -> None:
+        if self._decode_vae is None and self._decode_audio_vae is None:
+            return
+        dev = self._decode_target_device()
+        self._decode_vae = None
+        self._decode_audio_vae = None
+        gc.collect()
+        with torch.cuda.device(dev):
+            torch.cuda.empty_cache()
+        logger.info("decode-only vae copies freed (%s)", dev)
+
+    def _decode_ref2va_deferred(self, pipe, holder: list, progress, on_denoise_done):
+        r"""ref2va の decode (video VAE + audio VAE) + uint8 変換を、denoise から分離して実行する。
+
+        `holder` は `[video_latents, audio_latents]` (呼び出し側がローカル参照を残さないための
+        受け渡し用リスト。ここで pop して、decode 完了時に解放する)。
+
+        **なぜ生成ロック解放後に decode して安全か** (`H3_DECODE_STREAM=1` のとき):
+          1. この時点で transformer の仕事は終わっており、残りの入力は latent 2本だけ。
+             以降 decode が触るのは VAE の重みと自分の中間テンソルだけで、`state` /
+             scheduler / transformer / TE / KV キャッシュには一切触れない。
+          2. VAE モジュールはステートレス (`autoencoder_kl_minimax_h3.py` に feature cache 等の
+             インスタンス状態なし。tiling フラグは常に True のまま誰も書き換えない)。次の
+             リクエストの参照エンコード (同じ video VAE の encode) と同じ重みを読むだけ。
+             VAE の GPU⇔CPU 往復 (`_vae_to_cpu`) は KEEP_REF2VA_VAE=1 では起きない
+             (`decode_deferred_active` がこの構成を成立条件にしている)。
+          3. torch の current stream / autocast / no_grad はスレッドローカル。`=1` では
+             デフォルト (legacy) ストリームに両スレッドの演算が投入され、GPU 上では投入順に
+             処理される (カーネルの真の同時実行は無いが、飢餓も起きない)。`=2` は専用ストリーム
+             (PyTorch の side stream は non-blocking) で真に重なるが、sage attention 等
+             「current stream を尊重しないカーネル」が共有 VAE に混ざると壊れるため、native
+             attention に固定した decode 専用コピーを使う (`_ensure_decode_vaes`)。
+          4. 入力 latent は denoise と同じスレッドで `synchronize` 済み、decode 完了
+             (`.cpu()` で同期) まで本スレッドが保持するので、use-after-free は起きない。
+          5. decode 同士は `_decode_lock` で直列化 (次々リクエストの decode が重なって VRAM を
+             二重に積まない)。mux はロック外 (CPU のみ)。
+          6. 注意: 重なっている間は (a) `torch.cuda.reset_peak_memory_stats()` を次リクエストが
+             呼ぶので同一 GPU 上のピーク統計は信頼できない、(b) 同一 GPU の SM を取り合うので
+             denoise/decode とも単体より遅くなる、(c) VRAM は両者の和が要る (96GB 機の
+             resident 構成では余裕があるが、48GB 以下では `H3_DECODE_DEVICE` で別 GPU に逃がす)。
+        `H3_DECODE_DEVICE` のみ (STREAM なし) の場合はロックを手放さない: 純粋に decode を
+        別 GPU へオフロードするだけ (VRAM を cuda:0 から外す効果。レイテンシは同等)。
+        """
+        from contextlib import nullcontext
+
+        dev = self._decode_target_device()
+        separate = dev != DEVICE
+        lat, alat = holder.pop(0), holder.pop(0)
+        _tl("pre_sync")
+        torch.cuda.synchronize(DEVICE)  # denoise + unpatchify の GPU 作業が完了していること
+        _tl("post_sync")
+        _dump_dir = os.environ.get("H3_DEBUG_DUMP_LATENT", "").strip()  # probe 用 (既定 OFF): 標準/light の同一 latent 比較
+        if _dump_dir:
+            os.makedirs(_dump_dir, exist_ok=True)
+            torch.save({"video": lat.detach().cpu(), "audio": alat.detach().cpu()},
+                       os.path.join(_dump_dir, f"lat_{int(time.time() * 1000)}_{lat.shape[2]}f.pt"))
+        peak_at_release = torch.cuda.max_memory_allocated() / 1e9
+        released = False
+        if H3_DECODE_STREAM and on_denoise_done is not None:
+            on_denoise_done()
+            released = True
+            _tl("lock_released")
+        t_wait0 = time.time()
+        if progress:
+            progress.update(phase="decoding", message="動画/音声をデコード中...")
+        info: dict = {
+            "device": str(dev), "separate_gpu": separate, "stream": bool(H3_DECODE_STREAM),
+            "side_stream": bool(H3_DECODE_STREAM_SIDE),
+            "lock_released_before_decode": released,
+            "decode_vae": H3_DECODE_VAE_REPO or "standard",
+        }
+        with self._decode_lock:
+            info["decode_lock_wait_s"] = round(time.time() - t_wait0, 3)
+            if separate or H3_DECODE_STREAM_SIDE or H3_DECODE_VAE:
+                self._ensure_decode_vaes()
+                vae, audio_vae = self._decode_vae, self._decode_audio_vae
+            else:
+                vae, audio_vae = pipe.vae, pipe.audio_vae
+            if separate:
+                torch.cuda.reset_peak_memory_stats(dev)
+            if H3_DECODE_STREAM_SIDE and self._decode_stream is None:
+                with torch.cuda.device(dev):
+                    self._decode_stream = torch.cuda.Stream(device=dev)
+            stream = self._decode_stream if H3_DECODE_STREAM_SIDE else None
+            t_dec = time.time()
+            with torch.cuda.device(dev), (torch.cuda.stream(stream) if stream is not None else nullcontext()), \
+                    torch.no_grad():
+                t_x = time.time()
+                if separate:
+                    # **GPU 間の直接コピー (P2P) は使わない**: この機 (RTX PRO 6000 + RTX PRO 5000,
+                    # PCIe NODE 接続) では `tensor.to("cuda:1")` が can_device_access_peer=True
+                    # にもかかわらず**無警告で全要素 0 を書き込む** (2026-10-05 実機、float 100M 要素
+                    # まで全サイズで再現)。最初の A/B で GPU1 decode が「ゼロ latent の decode」に
+                    # なり PSNR 11dB の別物映像になって発覚した。latent は数 MB なので必ず
+                    # ホスト経由でステージングする (実測 ~2ms)。
+                    lat_d = lat.detach().cpu().to(dev)
+                    alat_d = alat.detach().cpu().to(dev)
+                    torch.cuda.synchronize(dev)
+                else:
+                    lat_d, alat_d = lat, alat
+                info["latent_transfer_s"] = round(time.time() - t_x, 4)
+                info["latent_transfer_mb"] = round((lat.numel() * lat.element_size()
+                                                    + alat.numel() * alat.element_size()) / 1e6, 2)
+                mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1)
+                std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
+                x = lat_d * std + mean
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    video = vae.decode(x, return_dict=False)[0]
+                video = video.cpu()  # 同期。fp16 のまま CPU へ降ろして CPU 側で逆正規化 (既定経路と同じ)
+                a_mean = torch.tensor(audio_vae.config.latents_mean, device=dev).view(1, -1, 1)
+                a_std = torch.tensor(audio_vae.config.latents_std, device=dev).view(1, -1, 1)
+                audio = audio_vae.decode(alat_d * a_std + a_mean, return_dict=False)[0]
+                audio = audio.float().permute(1, 0, 2)
+                audio_np = audio[0].float().cpu().numpy()
+                sampling_rate = pipe.audio_sampling_rate
+                if separate:
+                    info["decode_peak_vram_gb"] = round(torch.cuda.max_memory_allocated(dev) / 1e9, 2)
+            pixel_mean = torch.tensor(pipe.pixel_mean).view(1, -1, 1, 1, 1)
+            pixel_std = torch.tensor(pipe.pixel_std).view(1, -1, 1, 1, 1)
+            video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+            videos = pipe.video_processor.postprocess_video(video, output_type="pt")
+            decode_time = time.time() - t_dec
+            video_tensor = videos[0] if isinstance(videos, list) else videos
+            t_u8 = time.time()
+            frames_uint8 = frames_to_uint8(video_tensor)
+            info["uint8_s"] = round(time.time() - t_u8, 3)
+            rms = float(np.sqrt(np.mean(audio_np**2)))
+            peak = float(np.max(np.abs(audio_np)))
+            peak_vram = peak_at_release
+            del lat, alat, lat_d, alat_d, x, video, videos, video_tensor, audio
+            if not released:
+                # 重なりのない構成では従来どおり掃除する。生成ロックを手放して重ねている間は
+                # `torch.cuda.empty_cache()` を呼ばない: これは**全デバイス**のキャッシュを解放する
+                # (current device だけではない) ため、別 GPU 上で走行中の次リクエストの割り当て
+                # キャッシュまで cudaFree してしまう。実際に cuda:1 側で呼んだ empty_cache が
+                # cuda:0 で denoise 中の次リクエストを "illegal memory access" で落とした
+                # (2026-10-05 実機)。gc.collect() も同様にやらない。
+                gc.collect()
+                with torch.cuda.device(dev):
+                    torch.cuda.empty_cache()
+        return frames_uint8, audio_np, sampling_rate, rms, peak, peak_vram, decode_time, info
 
     def status(self) -> dict:
         return {
@@ -4091,7 +7028,35 @@ class MiniMaxH3Runner:
             ),
             "video_vae_fp16": H3_VIDEO_VAE_FP16,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            # ref2va の transformer_ref を AdaLN-pruned で読むか、その量子化方式
+            # (H3_PRUNED_QUANT、core/pruned.py)。実行中の構成を logs と突合するため。
+            "pruned": H3_PRUNED,
+            "pruned_quant": H3_PRUNED_QUANT if H3_PRUNED else None,
+            "pruned_compile": H3_PRUNED_COMPILE_LEVEL,
+            # fp32 matmul の精度設定(torch.get_float32_matmul_precision())。torchao の
+            # quantize_() は set_inductor_config=True(既定)だと "high"(TF32)へ変えて
+            # しまうので、量子化経路の副作用で変わっていないこと("highest")を観測するため。
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            # ref2va's reference-image normalization short edge (H3_REF_IMAGE_SHORT_EDGE,
+            # see its definition above). Reported here (rather than only logged once at
+            # pipe-shell build time) so a run's logs can be cross-checked against which
+            # setting was actually in effect. 2048 = diffusers' own default / unset.
+            "ref_image_short_edge": H3_REF_IMAGE_SHORT_EDGE,
             "lowvram": H3_LOWVRAM_RAW,
+            "keep_ref2va": _keep_ref2va_active(),
+            "keep_ref2va_vae": _keep_ref2va_active() and H3_KEEP_REF2VA_VAE,
+            "te_diet": H3_TE_DIET,
+            "te_stream": H3_TE_STREAM,
+            "te_stream_window": H3_TE_STREAM_WINDOW if H3_TE_STREAM else None,
+            "ref_prefix_park": H3_REF_PREFIX_PARK and H3_REF_PREFIX_CACHE_SINGLE,
+            # 単機リアルタイム連続生成用の追加機能 (2026-10-05、いずれも既定 OFF)
+            "ref_latent_cache": H3_REF_LATENT_CACHE,
+            "ref_latent_cache_stats": dict(_ref_latent_cache_stats) if H3_REF_LATENT_CACHE else None,
+            "decode_stream": _H3_DECODE_STREAM_RAW if H3_DECODE_STREAM else None,
+            "decode_device": H3_DECODE_DEVICE or None,
+            "decode_vae": H3_DECODE_VAE_REPO or None,
+            "decode_deferred_active": self.decode_deferred_active(),
+            "vae_split": H3_VAE_SPLIT and _keep_ref2va_active(),
             "lowvram_group": H3_LOWVRAM_GROUP,
             # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
             # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
@@ -4105,7 +7070,29 @@ class MiniMaxH3Runner:
             "turbo_lora": H3_TURBO_LORA,
             "turbo_lora_repo": H3_TURBO_LORA_REPO if H3_TURBO_LORA else None,
             "turbo_lora_path": self._turbo_lora_path,
-            "turbo_steps_default": H3_TURBO_STEPS_DEFAULT if H3_TURBO_LORA else None,
+            "turbo_lora_path_base": self._turbo_lora_path_base,
+            "turbo_lora_file_base": H3_TURBO_LORA_FILE_BASE if H3_TURBO_LORA else None,
+            # **`H3_TURBO_LORA` で出し分けしないこと** (2026-08-20 修正): turbo は
+            # リクエスト単位の即反映設定 (`_apply_turbo_setting`、LoRA は初回 ON 時に
+            # 遅延ロードされる) なので、起動時 `H3_TURBO_LORA=0` でも UI のチェック
+            # ボックスから有効にできる。推奨ステップ数はそのとき初めて必要になる値で、
+            # 「起動時に既定 ON だったか」とは無関係。旧実装は None を返しており、
+            # UI の `syncStepsToTurbo()` が `TURBO_STEPS_DEFAULT === null` で
+            # 黙って no-op になり、turbo を ON にしてもステップが 30 のままだった。
+            "turbo_steps_default": H3_TURBO_STEPS_DEFAULT,
+            # H3_ADALN_PRECOMP: the env flag itself, plus whether the table has actually
+            # been *built yet* on each currently-resident transformer -- precompute is
+            # armed at load time but only fires lazily on the first denoise step of the
+            # next request that uses it (see core/adaln_precompute.py's
+            # `enable_adaln_precompute()` docstring), so right after a fresh load these
+            # can be `True`/`False`/`False` (flag on, nothing precomputed yet) until a
+            # request actually runs a denoise step against that instance.
+            "adaln_precomp": H3_ADALN_PRECOMP,
+            "adaln_precomp_built": _adaln_precompute_status(self),
+            # v2 coexistence: which turbo state each installed table was built while
+            # observing (informational only -- see `_adaln_precompute_built_with_turbo()`
+            # docstring, both turbo states are served correctly off the same table).
+            "adaln_precomp_built_with_turbo": _adaln_precompute_built_with_turbo(self),
             "gpu": gpu_mem_gb(),
             "ram": ram_gb(),
         }
@@ -4404,6 +7391,11 @@ class MiniMaxH3Runner:
         still: bool = False,
         still_frames: int = 22,
     ) -> dict:
+        if H3_HYPERFLOW:
+            raise RuntimeError(
+                "H3_HYPERFLOW=1 は ref2va 専用です (t2va/fl2va/静止画への配線は未実装)。"
+                "generate_ref2va を使うか、H3_HYPERFLOW を外して起動し直してください。"
+            )
         """
         Runs T2VA (image=None, last_image=None) or FL2VA (either/both given).
 
@@ -4560,6 +7552,7 @@ class MiniMaxH3Runner:
         # request-overridden) turbo value, not the raw H3_TURBO_LORA env-var default.
         settings.validate_instant_settings_for_upscale(instant, do_upscale)
 
+        coexist_ref2va = False  # H3_KEEP_REF2VA 両常駐が成立したか (LOWVRAM=1 の分岐でだけ True になりうる)
         with self._load_lock:
             if H3_LOWVRAM:
                 # This mode's whole point is TE (21GB) and transformer (34GB) are never
@@ -4591,7 +7584,12 @@ class MiniMaxH3Runner:
                 if not H3_KEEP_TRANSFORMER:
                     self._free_transformer()
                     self._active_variant = None
-                self._free_transformer_ref()
+                # H3_KEEP_REF2VA=1 + 空きVRAM十分: ref2va スタックを解放せず base を同居させる
+                # (`_keep_ref2va_coexist` の docstring / H3_KEEP_REF2VA_COEXIST のモジュールコメント)。
+                self._drain_deferred_decode("generate")
+                coexist_ref2va = self._keep_ref2va_coexist("generate")
+                if not coexist_ref2va:
+                    self._free_transformer_ref()
                 self._ensure_vaes(progress)
                 self._load_text_encoder(progress)
             elif H3_LOWVRAM_GROUP:
@@ -4635,7 +7633,7 @@ class MiniMaxH3Runner:
         # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
         # inside the mode-specific branches below) -- see `_apply_turbo_video_shift`'s
         # own docstring for why per-request rather than process-wide.
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=False)
 
         pipe = self._pipe
 
@@ -4697,6 +7695,11 @@ class MiniMaxH3Runner:
         prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
+        # フェーズ境界での中断チェック(encoding): テキストエンコード自体が終わった直後。
+        # この先は layout/latents/timesteps の準備と transformer(_ref) のロードが続き、
+        # それぞれ個別のフェーズ境界チェック(loading_transformer 側、denoising 直前)で
+        # 別途カバーされる。
+        interrupt_controller.check()
 
         # upscale (hires-fix) requests: force-free the TE-nf4 even in bnb-4bit mode.
         # Pass 2 runs full self-attention over a ~4x longer packed sequence (2x spatial ->
@@ -4887,8 +7890,23 @@ class MiniMaxH3Runner:
                 # Only now is it safe to free TE and load the (int8) transformer: every
                 # tensor that would have needed `_execution_device` to resolve correctly
                 # already exists, materialized on the right device, on `state`.
+                # transformer ロード (prequant キャッシュでも ~4.2s、途中中断不可) に入る前に
+                # 中断を拾う。r-n-v の会話ターンが待機 (fl2va) の「VAE 退避 + base ロード」
+                # 窓 (~6.5s、2026-10-07 実測 turn@8) と衝突したときの待ちを縮めるため。
+                interrupt_controller.check()
                 with self._load_lock:
-                    self._free_text_encoder(force=True)
+                    if coexist_ref2va:
+                        # TE も ref2va スタックの一部 (次の ref2va が再ロードを払わないよう残す)。
+                        # encode は済んでおり、収支は _keep_ref2va_coexist で確認済み。
+                        logger.info("generate: text_encoder を解放せず常駐のまま base transformer をロード (H3_KEEP_REF2VA 両常駐)")
+                    elif H3_FL2VA_KEEP_TE:
+                        # 部分的 keep (H3_FL2VA_KEEP_TE のモジュールコメント参照):
+                        # coexist 不成立の低VRAM構成でも、TE (TE_STREAM 後 ~4GB) だけは
+                        # 残して次の会話ターンの TE 再ロード (~15s) と ref-prefix 再
+                        # エンコードを省く。ref/transformer_ref は従来どおり解放済み。
+                        logger.info("generate: H3_FL2VA_KEEP_TE=1 -- text_encoder を解放せず base transformer をロード")
+                    else:
+                        self._free_text_encoder(force=True)
                     self._ensure_transformer(progress)
         elif TE_QUANT == "bnb-4bit" and is_fl2va:
             # bnb-4bit + fl2va only: transformer(66.3) + TE-nf4(21.0) + vae pair(11.0)
@@ -4995,6 +8013,9 @@ class MiniMaxH3Runner:
         actual_num_frames = state.get("num_frames")
 
         # --- denoise loop, instrumented for progress polling ---
+        # denoise 開始直前にも1回チェックしておく(ループ内は timed_loop_step 側で
+        # 毎ステップ境界チェック済み -- ここは「まだ1歩も進んでいない」状態での保険)。
+        interrupt_controller.check()
         if progress:
             progress.update(phase="denoising", step=0, total_steps=num_inference_steps, message="デノイズ中...")
         t_denoise = time.time()
@@ -5069,6 +8090,9 @@ class MiniMaxH3Runner:
             orig_loop_step = denoise_step.loop_step
 
             def timed_loop_step(components, bstate, i, t):
+                # ステップ境界での中断チェック(_InterruptController の docstring 参照)。
+                # 前のステップが完全に終わった直後・次のステップの計算に入る前。
+                interrupt_controller.check()
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 step_times.append(time.time() - ts)
@@ -5175,6 +8199,10 @@ class MiniMaxH3Runner:
                 cm = fbc_cm if fbc_cm is not None else _NullContext()
                 with cm:
                     for i in range(i_start, i_end):
+                        # ステップ境界での中断チェック(_InterruptController の docstring
+                        # 参照)。hires-fix はループを自前で回す唯一の経路のため、他の
+                        # timed_loop_step 系サイトと同じ規約でここにも入れる。
+                        interrupt_controller.check()
                         t = timesteps[i]
                         ts = time.time()
                         pre_step_video_sample = bstate.latents.clone() if (capture_last and i == i_end - 1) else None
@@ -5235,6 +8263,12 @@ class MiniMaxH3Runner:
 
         if os.environ.get("H3_DEBUG_MEM_DIAG") == "1":
             _log_gpu_tensor_diag("post-denoise, pre-decode (t2va)")
+
+        # denoise 後〜mux までにチェックが無いと、中断要求が届いても decode+vocoder+mux
+        # (~4s)を完走するまで GPU ロックを握り続ける。r-n-v の会話ターンが待機クリップ
+        # (fl2va)の追い生成と衝突したとき、初回チャンクが丸ごとこの分だけ遅れることを
+        # 実測で確認した(2026-10-07: 衝突ターンは 9.6〜9.9s wall、非衝突は 5.0〜6.5s)。
+        interrupt_controller.check()
 
         # --- decode ---
         if progress:
@@ -5394,6 +8428,11 @@ class MiniMaxH3Runner:
             raise
 
         _restore_decode_steady_state()
+
+        # decode 完了直後にも中断を拾う(上の pre-decode チェックと同じ理由。
+        # decode 中に届いた中断要求はここで初めて観測できる — mux は CPU 処理だが
+        # 完走まで生成ロックを握るため、ここで打ち切れば次ジョブが即座に通る)。
+        interrupt_controller.check()
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
@@ -5585,14 +8624,17 @@ class MiniMaxH3Runner:
             if not H3_KEEP_TRANSFORMER:
                 self._free_transformer()
                 self._active_variant = None
-            self._free_transformer_ref()
+            self._drain_deferred_decode("generate_still_batch")
+            coexist_ref2va = self._keep_ref2va_coexist("generate_still_batch")
+            if not coexist_ref2va:
+                self._free_transformer_ref()
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
         torch.cuda.reset_peak_memory_stats()
         # バッチは場面ループの外・リクエスト先頭で1回 (全場面共通の turbo 状態 -- この
         # メソッドはプロンプト以外のパラメータが全場面共通という前提そのもの)。以降の
         # 場面ループ内で回る `MiniMaxH3SetTimestepsStep` より前に必ず適用しておく。
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=False)
         pipe = self._pipe
 
         # --- encode 位相: TE 常駐のまま全場面を準備 ---
@@ -5601,6 +8643,8 @@ class MiniMaxH3Runner:
         t_encode = time.time()
         scenes: list[dict] = []
         for idx, prompt in enumerate(prompts):
+            # フェーズ境界での中断チェック(encoding): 場面ごとのループ境界。
+            interrupt_controller.check()
             if progress:
                 progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
             state = PipelineState()
@@ -5648,8 +8692,12 @@ class MiniMaxH3Runner:
         encode_time = time.time() - t_encode
 
         # --- TE を解放して transformer を1回だけロード ---
+        interrupt_controller.check()  # ロード (~4.2s、途中中断不可) 前に中断を拾う (generate() と同じ理由)
         with self._load_lock:
-            self._free_text_encoder(force=True)
+            if coexist_ref2va:
+                logger.info("generate_still_batch: text_encoder を解放せず常駐のまま base transformer をロード (H3_KEEP_REF2VA 両常駐)")
+            else:
+                self._free_text_encoder(force=True)
             self._ensure_transformer(progress)
         self.apply_instant_settings(self._pipe.transformer, instant, is_ref=False, progress=progress)
 
@@ -5672,6 +8720,7 @@ class MiniMaxH3Runner:
             orig_loop_step = denoise_step.loop_step
 
             def timed_loop_step(components, bstate, i, t, _idx=idx, _step_times=step_times, _skips=cache_skips):
+                interrupt_controller.check()
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 _step_times.append(time.time() - ts)
@@ -5838,6 +8887,25 @@ class MiniMaxH3Runner:
         mute: bool = False,
         still: bool = False,
         still_frames: int = 22,
+        # Per-request override of `reference_image_short_edge` (see
+        # H3_REF_IMAGE_SHORT_EDGE's module-level comment for the "why"). `None` (default)
+        # means "use whatever this process's H3_REF_IMAGE_SHORT_EDGE env var resolved to"
+        # -- byte-for-byte identical to this parameter not existing at all. Validated and
+        # applied just before the setup step below (see that call site's comment).
+        reference_image_short_edge: int | None = None,
+        # Per-request override of the module-level `H3_VOCAL_LOCK` env-var default.
+        # `None` (default) means "use whatever this process's H3_VOCAL_LOCK env var
+        # resolved to" -- byte-for-byte identical to this parameter not existing at all.
+        # `True`/`False` take precedence over the env var for this one request. Resolved
+        # once, right below, into a local `vocal_lock_effective` that every one of the
+        # (former) `H3_VOCAL_LOCK` guard sites in this method now reads instead of the
+        # module-level constant directly (the constant itself is untouched and still
+        # backs the env-var default via this resolution).
+        vocal_lock: bool | None = None,
+        # H3_DECODE_STREAM / H3_DECODE_DEVICE 用: denoise 完了直後 (decode 開始前) に1回だけ
+        # 呼ばれるコールバック。app が生成ロックの解放に使う。`decode_deferred_active()` が
+        # False のとき (既定) は一切呼ばれない。
+        on_denoise_done=None,
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
@@ -5870,6 +8938,10 @@ class MiniMaxH3Runner:
         `generate()` (see core/settings.py), applied to `transformer_ref` instead of
         `transformer`. `upscale` is not a parameter here at all (see above), so there is
         no upscale-vs-turbo interaction to validate on this path.
+
+        `vocal_lock`: per-request override of the module-level `H3_VOCAL_LOCK` env-var
+        default (`None` = use the env var, unchanged behavior). See that constant's
+        module comment and `_build_vocal_lock_latents()`'s docstring for what it does.
 
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats, in the
         same shape `generate()` returns (plus `references_summary`).
@@ -5908,7 +8980,20 @@ class MiniMaxH3Runner:
         from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VAReferenceEncoderStep
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
+        _tl("gen_entry")
         t_start = time.time()
+        # H3_PHASE_TIMING (2026-08-27 encode-phase profiling task, see `_PhaseTimer`'s
+        # own docstring): one timer per request, marked at every named checkpoint
+        # between here and the start of denoise. No-op (single flag check per `.mark()`
+        # call) when `H3_PHASE_TIMING=0` (default).
+        _pt = _PhaseTimer("generate_ref2va")
+        ref_latent_cache_status = None  # H3_REF_LATENT_CACHE: None(OFF)/hit/miss/bypass
+        # Per-request override of `H3_VOCAL_LOCK` (see this parameter's own docstring
+        # paragraph above). `None` -> fall back to the module-level env-var default,
+        # byte-for-byte identical to today's always-env-var behavior. Every
+        # `H3_VOCAL_LOCK`-gated branch below reads this local instead of the module
+        # constant directly.
+        vocal_lock_effective = H3_VOCAL_LOCK if vocal_lock is None else vocal_lock
         if not references:
             raise ValueError("ref2va needs at least one reference; use generate() for text-only requests.")
         # TE 外部常駐 (H3_TE_DEVICE) の TE用GPUが 24GB 未満なら ref2va は動かない:
@@ -6004,7 +9089,13 @@ class MiniMaxH3Runner:
                 # pair 11.0 all at once) and OOM'd on the first VAE conv. It is reloaded
                 # fresh, later, after the reference encoder step -- same as the first-
                 # request path. No-op (cheap) when it was not resident.
-                self._free_transformer_ref()
+                if _keep_ref2va_active() and self._transformer_ref_loaded:
+                    # H3_KEEP_REF2VA=1: 常駐のため解放をスキップ (上のコメントの OOM は
+                    # 「TE + transformer_ref + VAE pair が同時に載る」収支が 96GB 超になる
+                    # bf16/int8-both-resident 構成の話で、pruned の 21.6GB 常駐では成立しない)。
+                    logger.info("ref2va: transformer_ref is resident (H3_KEEP_REF2VA=1) -- skip free/reload")
+                else:
+                    self._free_transformer_ref()
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
             # H3_LOWVRAM bug found and fixed by this task's own verification: syncing
@@ -6026,6 +9117,7 @@ class MiniMaxH3Runner:
             # cheap and always safe (plain attribute re-assignment of already-loaded
             # modules, see the field comment on `_pipe_ref` in `__init__`).
             self._sync_shared_components_to_ref()
+        _pt.mark("entry_lock(free_transformer+ensure_vaes+load_te+sync)")
 
         # Reset peak stats after loading so the reported peak reflects this generation's
         # encode+denoise+decode, not the (much larger, one-time) model loading peak.
@@ -6033,7 +9125,7 @@ class MiniMaxH3Runner:
         # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
         # inside the mode-specific branches below) -- see `generate()`'s matching call
         # site and `_apply_turbo_video_shift`'s own docstring.
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=True)
 
         pipe = self._pipe_ref
 
@@ -6044,11 +9136,39 @@ class MiniMaxH3Runner:
         state.set("width", width)
         state.set("num_frames", num_frames)
         state.set("generator", torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None)
+        if H3_HYPERFLOW and num_inference_steps != 8:
+            logger.info(
+                "H3_HYPERFLOW: num_inference_steps %s -> 8 (step数とσグリッドは重みに焼き込み)",
+                num_inference_steps,
+            )
+            num_inference_steps = 8
         state.set("num_inference_steps", num_inference_steps)
         state.set("output_type", "pt")
         state.set("attention_kwargs", None)
         state.set("latents", None)
         state.set("audio_latents", None)
+
+        # Per-request `reference_image_short_edge` override (see
+        # `_resolve_ref_image_short_edge`'s docstring). Read by the setup step called
+        # right below via `MiniMaxH3Ref2VASetupStep.__call__` ->
+        # `before_encoder.py:490`, so it must be set on the shared pipe config *before*
+        # that call, every request (not just when it differs from the current value --
+        # unlike `_ensure_pipe_shell`'s one-time env-var setup, a later request with no
+        # override must not silently keep an earlier request's explicit value, so this
+        # always re-asserts the resolved value rather than skipping when unchanged).
+        # Cache-safety note: ref2va's own prefix cache is keyed off the actual resized
+        # reference pixels/shape (see H3_REF_PREFIX_CACHE's module comment), which
+        # already differ whenever this value differs -- so there is no risk of one
+        # request's cached prefix leaking into a request that asked for a different
+        # short edge; a changed short edge is just a cache miss like any other input change.
+        resolved_short_edge = _resolve_ref_image_short_edge(reference_image_short_edge)
+        pipe.register_to_config(reference_image_short_edge=resolved_short_edge)
+        if resolved_short_edge != H3_REF_IMAGE_SHORT_EDGE_DEFAULT:
+            logger.info(
+                "ref2va reference_image_short_edge=%d (default=%d)%s",
+                resolved_short_edge, H3_REF_IMAGE_SHORT_EDGE_DEFAULT,
+                " [per-request override]" if reference_image_short_edge is not None else " [H3_REF_IMAGE_SHORT_EDGE]",
+            )
 
         # --- setup (canvas / frame count / reference prep) ---
         # Reference images/videos/audio are decoded and resized here (each at its own
@@ -6064,18 +9184,35 @@ class MiniMaxH3Runner:
         else:
             _, state = setup_step(pipe, state)
         actual_num_frames = state.get("num_frames")
+        _pt.mark("setup_step(reference_normalize/resize)")  # PIL LANCZOS resize to ref_image_short_edge (CPU)
 
         # --- text encode (references' vision blocks + prompt; still has TE on GPU) ---
         if progress:
             progress.update(phase="encoding", message="プロンプト+参照をエンコード中...")
         with self._te_attached(), torch.no_grad():
-            prompt_embeds, text_token_tags = _encode_ref2va_prompt(
-                pipe, prompt, state.get("normalized_references"),
-                device=self._encode_device, dtype=torch.bfloat16,
-            )
+            encoded = None
+            if H3_REF_PREFIX_CACHE_SINGLE:
+                # 参照が同一 (画像参照のみ、音声/プロンプトは違ってよい) ならプレフィックスの
+                # KV キャッシュを前回リクエストから使い回す。使えない構成 (動画参照あり等)
+                # なら `None` が返り、下の従来経路へそのまま落ちる。
+                encoded = _encode_ref2va_prompt_prefix_cached(
+                    pipe, prompt, state.get("normalized_references"),
+                    device=self._encode_device, dtype=torch.bfloat16,
+                )
+            if encoded is None:
+                encoded = _encode_ref2va_prompt(
+                    pipe, prompt, state.get("normalized_references"),
+                    device=self._encode_device, dtype=torch.bfloat16,
+                )
+            prompt_embeds, text_token_tags = encoded
+        _pt.mark("text_encode(prefix_cache_or_direct)")  # whichever of the two _encode_ref2va_prompt* ran, as one unit -- see its own internal H3_PHASE_TIMING breakdown (gather_vision_features/build_presentation/conditioner_forward) for the split inside this
         prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
+        _pt.mark("to_compute_device")
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
+        # フェーズ境界での中断チェック(encoding): プロンプト+参照のテキストエンコードが
+        # 終わった直後(generate() の t2va/fl2va 版と同じ位置)。
+        interrupt_controller.check()
 
         # --- reference VAE encoding (image/video refs through vae, soundtracks through
         # audio_vae) -- this is ref2va's analogue of fl2va's keyframe step, and needs the
@@ -6087,6 +9224,15 @@ class MiniMaxH3Runner:
         # `_ensure_vaes`/`_load_text_encoder`), including the "already resident from a
         # previous ref2va request's steady state" case -- see that comment for the bug
         # this closes. Nothing more to free here; just bring vae onto GPU.
+        #
+        # H3_VOCAL_LOCK (opt-in, "0" default): set inside whichever branch below runs,
+        # while `audio_vae` is still GPU-resident (see `_build_vocal_lock_latents()`'s
+        # docstring for why it cannot wait until after `_vae_to_cpu()`). Declared here,
+        # ahead of the dispatch, so every branch (and the `H3_VOCAL_LOCK and
+        # vocal_lock_latents is not None` checks around each branch's own
+        # `timesteps_step` call) can rely on it always being defined, even for the
+        # `H3_VOCAL_LOCK=0` (default, fully inert) path.
+        vocal_lock_latents = None
         if H3_LOWVRAM_GROUP:
             # UPDATE (found via this task's own 32GB-ballast verification, after the
             # original version of this branch -- which called `self._vae_to_gpu()`
@@ -6115,8 +9261,13 @@ class MiniMaxH3Runner:
             with self._load_lock:
                 self._free_text_encoder(force=True)
             self._vae_to_gpu()
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
+            if vocal_lock_effective:
+                # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
+                # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
@@ -6129,10 +9280,14 @@ class MiniMaxH3Runner:
             _, state = latents_step(pipe, state)
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
+            timesteps_step = _make_set_timesteps_step()
+            if vocal_lock_effective and vocal_lock_latents is not None:
+                vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
+                    state, state.get("num_audio_latents"), pipe.audio_channels
+                )
             _, state = timesteps_step(pipe, state)
         elif H3_LOWVRAM:
-            self._vae_to_gpu()
+            self._vae_to_gpu("encode")  # H3_VAE_SPLIT 時は encode 側だけ (それ以外は従来どおり全体)
             # Same `_execution_device` resolution trap as generate()'s own H3_LOWVRAM
             # branch (see its long comment): `vae` sits between `text_encoder` and
             # `transformer_ref` in the pipe's own component order, and stays a
@@ -6147,9 +9302,17 @@ class MiniMaxH3Runner:
             # layout_step/latents_step/timesteps_step all run first, while TE is still
             # the GPU-resident model `_execution_device` resolves to, and only then is
             # TE freed and transformer_ref loaded.
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
-            self._vae_to_cpu()
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
+            if vocal_lock_effective:
+                # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
+                # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
+            if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
+                self._vae_to_cpu()
+            else:
+                logger.info("ref2va: vae/audio_vae stay on GPU (H3_KEEP_REF2VA_VAE=1) -- skip CPU park")
 
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
             _, state = layout_step(pipe, state)
@@ -6159,19 +9322,59 @@ class MiniMaxH3Runner:
             _, state = latents_step(pipe, state)
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
+            timesteps_step = _make_set_timesteps_step()
+            if vocal_lock_effective and vocal_lock_latents is not None:
+                vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
+                    state, state.get("num_audio_latents"), pipe.audio_channels
+                )
             _, state = timesteps_step(pipe, state)
 
+            # TE 外部常駐 (`H3_TE_DEVICE`) のとき、この分岐の前提「layout 系ステップは
+            # TE が GPU 常駐のうちに走るので `_execution_device` が正しく解決される」は
+            # 成り立たない: TE は `_te_attached()` の窓の外では常にパイプから外れており
+            # (`text_encoder=None`)、直前の `_vae_to_cpu()` の後は components スキャンが
+            # CPU 常駐の vae/audio_vae に落ちて layout/latents/timesteps のテンソルが
+            # CPU に作られる → denoise の transformer_ref forward で `cuda:0 and cpu` の
+            # device 不一致になる (2026-08-20 実機で発症)。bnb-4bit/none 分岐のピン窓は
+            # transformer_ref ロード済みが前提でここでは使えない (この分岐はロードが
+            # layout の後) ため、バッチ経路 (`generate_ref_batch`) と同じ
+            # `_scene_state_to_compute` で denoise 前に運ぶ。TE 同居時は全テンソルが
+            # 既に GPU 上で no-op なので無条件に呼んでも安全だが、意図を明確にするため
+            # 外部常駐時に限定する。
+            if self._te_external:
+                self._scene_state_to_compute(state)
+
             with self._load_lock:
-                self._free_text_encoder(force=True)
+                if _keep_ref2va_active():
+                    # H3_KEEP_REF2VA=1: TE を解放せず、transformer_ref も常駐済みなら
+                    # ロードしない (`_ensure_transformer_ref` は冪等、初回だけ実ロード)。
+                    # layout 系ステップは既に走り終わっているので、TE が残っていても
+                    # `_execution_device` の罠 (上のコメント) には影響しない。
+                    logger.info(
+                        "ref2va: text_encoder resident (H3_KEEP_REF2VA=1) -- skip free/reload; "
+                        "transformer_ref %s",
+                        "resident -- skip load" if self._transformer_ref_loaded else "loading (first request)",
+                    )
+                else:
+                    self._free_text_encoder(force=True)
                 self._ensure_transformer_ref(progress)
         elif TE_QUANT == "bnb-4bit":
-            self._vae_to_gpu()
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
-            self._vae_to_cpu()
+            self._vae_to_gpu()  # already has its own unconditional timing log
+            _pt.mark("vae_to_gpu")
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
+            _pt.mark("reference_encoder_step(vae_encode_condition_latents)")
+            if vocal_lock_effective:
+                # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
+                # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
+            _pt.mark("vocal_lock_latents")  # no-op mark (0s) when H3_VOCAL_LOCK=0; else audio_vae encode of ref audio
+            self._vae_to_cpu()  # already has its own unconditional timing log
+            _pt.mark("vae_to_cpu")
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
+                _pt.mark("ensure_transformer_ref")  # no-op mark in int8 both-resident steady state (already has its own timing log when it actually (re)loads)
                 # NOTE: `transformer` (t2va's, freed at this method's entry in
                 # H3_TRANSFORMER_BOTH_RESIDENT mode) is deliberately NOT reloaded here.
                 # ref2va's denoise loop already runs a longer packed sequence than t2va's
@@ -6207,8 +9410,13 @@ class MiniMaxH3Runner:
                 _, state = latents_step(pipe, state)
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
-                timesteps_step = MiniMaxH3SetTimestepsStep()
+                timesteps_step = _make_set_timesteps_step()
+                if vocal_lock_effective and vocal_lock_latents is not None:
+                    vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
+                        state, state.get("num_audio_latents"), pipe.audio_channels
+                    )
                 _, state = timesteps_step(pipe, state)
+            _pt.mark("layout+condition_latents+latents+ref2va_latents+timesteps")
         else:
             # `none` mode: TE's job is done -- free it and bring in transformer_ref
             # (vae is already permanently resident in this mode, so `_vae_to_gpu()` is a
@@ -6220,8 +9428,16 @@ class MiniMaxH3Runner:
             with self._load_lock:
                 self._free_text_encoder()
                 self._ensure_transformer_ref(progress)
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
+            if vocal_lock_effective:
+                # `none` mode keeps `vae`/`audio_vae` permanently GPU-resident (see the
+                # branch comment above), so there is no "vae on GPU" window to miss here
+                # -- but for consistency with the other three branches (and in case that
+                # assumption ever changes) this still runs right after the reference
+                # encoder step, before anything else touches `audio_vae`.
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
 
             # --- layout / condition latents / latents / ref2va latents / timesteps ---
             # TE 外部常駐 (`H3_TE_DEVICE`) のときはピン窓の中で回す。TE を切り離すと
@@ -6244,7 +9460,11 @@ class MiniMaxH3Runner:
                 _, state = latents_step(pipe, state)
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
-                timesteps_step = MiniMaxH3SetTimestepsStep()
+                timesteps_step = _make_set_timesteps_step()
+                if vocal_lock_effective and vocal_lock_latents is not None:
+                    vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
+                        state, state.get("num_audio_latents"), pipe.audio_channels
+                    )
                 _, state = timesteps_step(pipe, state)
 
         # bnb-4bit mode (bf16 transformer_ref): force-free TE-nf4 (~21GB) before denoise,
@@ -6293,12 +9513,17 @@ class MiniMaxH3Runner:
         if force_free_te:
             with self._load_lock:
                 self._free_text_encoder(force=True)
+        _pt.mark("force_free_te")  # no-op mark (0s) in int8/H3_TRANSFORMER_BOTH_RESIDENT mode (force_free_te=False)
+        _pt.report(total_hint=time.time() - t_start)  # full encode-phase breakdown; sum should equal t_denoise - t_start below
 
         # --- denoise loop, instrumented for progress polling (mirrors generate()'s
         # non-upscale path exactly, against transformer_ref instead of transformer) ---
+        # denoise 開始直前の保険チェック(generate() と同じ位置、docstring 参照)。
+        interrupt_controller.check()
         if progress:
             progress.update(phase="denoising", step=0, total_steps=num_inference_steps, message="デノイズ中...")
         t_denoise = time.time()
+        _tl("denoise_start")
         step_times = []
         cache_skips = [0]
         out_height, out_width = state.get("height"), state.get("width")
@@ -6306,16 +9531,21 @@ class MiniMaxH3Runner:
         # Instant-apply this request's cache/attn/turbo settings -- see generate()'s
         # matching comment for the full reasoning. `transformer_ref` is confirmed
         # resident by every branch above this point.
+        self._ensure_hyperflow_ref(progress=progress)
         self.apply_instant_settings(self._pipe_ref.transformer_ref, instant, is_ref=True, progress=progress)
+        if H3_DENOISE_CUDAGRAPH and not isinstance(self._pipe_ref.transformer_ref.__dict__.get("forward"), _h3_graph.ForwardGraphRunner):
+            _h3_graph.ForwardGraphRunner(self._pipe_ref.transformer_ref).install()
+            logger.info("H3_DENOISE_CUDAGRAPH: ForwardGraphRunner installed on transformer_ref")
 
         def _fbc_reset_and_context():
             self._pipe_ref.transformer_ref._reset_stateful_cache()
             return self._pipe_ref.transformer_ref.cache_context("h3")
 
-        denoise_step = MiniMaxH3Ref2VADenoiseStep()
+        denoise_step = _maybe_hyperflowify_denoise_step(MiniMaxH3Ref2VADenoiseStep())
         orig_loop_step = denoise_step.loop_step
 
         def timed_loop_step(components, bstate, i, t):
+            interrupt_controller.check()
             ts = time.time()
             result = orig_loop_step(components, bstate, i=i, t=t)
             step_times.append(time.time() - ts)
@@ -6336,6 +9566,7 @@ class MiniMaxH3Runner:
         else:
             _, state = denoise_step(pipe, state)
         denoise_time = time.time() - t_denoise
+        _tl("denoise_end(cpu)")
 
         # PR #14355 note: unpatchify is a separate step now (`MiniMaxH3AfterDenoiseStep`,
         # decoders.py) -- see `generate()`'s matching comment for the full contract. Has to
@@ -6346,140 +9577,186 @@ class MiniMaxH3Runner:
         # layout step above) are NOT zero here -- a reference always adds condition rows,
         # which is exactly what this step drops before reshaping the generated rows back
         # into a 5D video tensor / channel-major audio tensor.
+        #
+        # H3_VOCAL_LOCK: `num_condition_audio_rows` was inflated (by whichever branch
+        # ran above, via `_inflate_vocal_lock_condition_rows()`) to freeze the
+        # generated audio rows through the just-finished denoise loop -- see that
+        # function's docstring for why it has to stay inflated in `state` all the way
+        # through the `denoise_step(pipe, state)` call above. It MUST be restored here,
+        # before `MiniMaxH3AfterDenoiseStep` runs: that step slices the generated rows
+        # as `audio_latents[num_condition_audio_rows:]` and reshapes them assuming the
+        # *un*-inflated (reference-rows-only) count -- left inflated, the slice would be
+        # empty and the reshape would fail (`decoders.py`'s
+        # `audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, ...)`).
+        if vocal_lock_effective and vocal_lock_latents is not None:
+            _restore_vocal_lock_condition_rows(state, vocal_lock_original_num_condition_audio_rows)
         after_denoise_step = MiniMaxH3AfterDenoiseStep()
         _, state = after_denoise_step(pipe, state)
+        _tl("after_denoise_step")
 
         # --- decode (shared MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep -- no
         # ref2va-specific decode step exists; `MiniMaxH3AfterDenoiseStep` just above
         # already dropped the reference condition rows, so these two only ever see the
         # generated rows) ---
-        if progress:
-            progress.update(phase="decoding", message="動画/音声をデコード中...")
-        # bf16 mode: transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) would exceed
-        # this card's ~95.6GB (same three-way conflict as everywhere else in this
-        # file), so transformer_ref is dropped for this short decode window and
-        # reloaded right after (see below).
-        # int8 both-resident mode: `transformer` (t2va's) was already freed at this
-        # method's entry and never reloaded before now (see the entry-section and
-        # force_free_te comments above) -- resident set going into decode is just
-        # transformer_ref(34) + TE-nf4(21) = 55GB, and adding the vae pair(11) is only
-        # 66GB, comfortably under budget. So transformer_ref does NOT need to be
-        # dropped here in this mode; it is left alone (stays resident straight through
-        # decode and into the next request, which is the whole point of int8 mode for
-        # ref2va<->ref2va requests specifically).
-        # H3_LOWVRAM_GROUP: `transformer_ref` is left alone here -- same reasoning as
-        # generate()'s own decode section (a group-offloaded transformer_ref's actual
-        # GPU footprint never conflicted with the vae pair's headroom in the first
-        # place). TE-nf4 DOES need force-freeing here though, for the same reason found
-        # by this task's own 32GB-ballast diagnostic against generate()'s t2va path (see
-        # that decode section's own comment for the full `_log_gpu_tensor_diag()`
-        # investigation): TE-nf4's own ~21GB is real, live, referenced memory, not
-        # reclaimable via `empty_cache()` alone, and it is not needed by either decode
-        # step (MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep only touch
-        # vae/audio_vae/video_processor). `force_free_te` was already True and did the
-        # force-free earlier in this method (before denoise, per its own definition
-        # above) in the non-group-mode branches, but H3_LOWVRAM_GROUP always has
-        # `force_free_te=False` (transformer_ref's tiny footprint never needed it
-        # before denoise) -- so it has to be freed here, at decode, instead.
-        def _restore_decode_steady_state_ref():
-            # generate() の `_restore_decode_steady_state()` と同じ役割の ref2va 版。
-            # 正常系と decode 例外時の両方から呼ぶ(例外時に復元しないと後続リクエストが
-            # 不整合な常駐セットを引き継いで連鎖 OOM する -- generate() 側の同名 closure の
-            # コメント参照)。
-            self._vae_to_cpu()
-            if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
-                with self._load_lock:
-                    self._ensure_transformer_ref(progress)
-                    if force_free_te:
-                        # Restore the bnb-4bit steady state (transformer_ref + TE-nf4 both
-                        # resident) for the *next* request -- this request force-freed TE-nf4
-                        # before denoise to make room for the reference-lengthened sequence's
-                        # attention activations (see above). Reloaded after transformer_ref so
-                        # the two big reloads are not competing for VRAM at the same time,
-                        # mirroring generate()'s own force_free_te reload ordering.
+        # --- H3_DECODE_STREAM / H3_DECODE_DEVICE (既定 OFF): decode を denoise から分離する ---
+        # 条件を満たすときだけ、denoise 直後に生成ロックを手放し、decode + uint8 変換を専用
+        # ストリーム/別 GPU で行う (`_decode_ref2va_deferred` の docstring に安全性の根拠)。
+        # 満たさない/フラグ OFF なら下の従来経路 (インライン decode) がそのまま走る。
+        _decode_deferred = self.decode_deferred_active()
+        decode_info = None
+        if _decode_deferred:
+            _holder = [state.get("latents"), state.get("audio_latents")]
+            # 重い参照を手放してから (= 次リクエストに VRAM を返してから) 生成ロックを解放する。
+            state = prompt_embeds = text_token_tags = encoded = vocal_lock_latents = None
+            (frames_uint8, audio_np, sampling_rate, rms, peak, peak_vram, decode_time,
+             decode_info) = self._decode_ref2va_deferred(pipe, _holder, progress, on_denoise_done)
+        else:
+            if progress:
+                progress.update(phase="decoding", message="動画/音声をデコード中...")
+            # bf16 mode: transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) would exceed
+            # this card's ~95.6GB (same three-way conflict as everywhere else in this
+            # file), so transformer_ref is dropped for this short decode window and
+            # reloaded right after (see below).
+            # int8 both-resident mode: `transformer` (t2va's) was already freed at this
+            # method's entry and never reloaded before now (see the entry-section and
+            # force_free_te comments above) -- resident set going into decode is just
+            # transformer_ref(34) + TE-nf4(21) = 55GB, and adding the vae pair(11) is only
+            # 66GB, comfortably under budget. So transformer_ref does NOT need to be
+            # dropped here in this mode; it is left alone (stays resident straight through
+            # decode and into the next request, which is the whole point of int8 mode for
+            # ref2va<->ref2va requests specifically).
+            # H3_LOWVRAM_GROUP: `transformer_ref` is left alone here -- same reasoning as
+            # generate()'s own decode section (a group-offloaded transformer_ref's actual
+            # GPU footprint never conflicted with the vae pair's headroom in the first
+            # place). TE-nf4 DOES need force-freeing here though, for the same reason found
+            # by this task's own 32GB-ballast diagnostic against generate()'s t2va path (see
+            # that decode section's own comment for the full `_log_gpu_tensor_diag()`
+            # investigation): TE-nf4's own ~21GB is real, live, referenced memory, not
+            # reclaimable via `empty_cache()` alone, and it is not needed by either decode
+            # step (MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep only touch
+            # vae/audio_vae/video_processor). `force_free_te` was already True and did the
+            # force-free earlier in this method (before denoise, per its own definition
+            # above) in the non-group-mode branches, but H3_LOWVRAM_GROUP always has
+            # `force_free_te=False` (transformer_ref's tiny footprint never needed it
+            # before denoise) -- so it has to be freed here, at decode, instead.
+            def _restore_decode_steady_state_ref():
+                # generate() の `_restore_decode_steady_state()` と同じ役割の ref2va 版。
+                # 正常系と decode 例外時の両方から呼ぶ(例外時に復元しないと後続リクエストが
+                # 不整合な常駐セットを引き継いで連鎖 OOM する -- generate() 側の同名 closure の
+                # コメント参照)。
+                if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
+                    self._vae_to_cpu()
+                if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
+                    with self._load_lock:
+                        self._ensure_transformer_ref(progress)
+                        if force_free_te:
+                            # Restore the bnb-4bit steady state (transformer_ref + TE-nf4 both
+                            # resident) for the *next* request -- this request force-freed TE-nf4
+                            # before denoise to make room for the reference-lengthened sequence's
+                            # attention activations (see above). Reloaded after transformer_ref so
+                            # the two big reloads are not competing for VRAM at the same time,
+                            # mirroring generate()'s own force_free_te reload ordering.
+                            self._load_text_encoder(progress)
+                        if H3_TRANSFORMER_BOTH_RESIDENT and H3_EAGER_VARIANT_RESTORE:
+                            # Restore the int8 both-resident steady state (`transformer` +
+                            # `transformer_ref` + TE-nf4 all resident) for the *next* request.
+                            # `transformer` (t2va's) was freed at this method's entry to make
+                            # room for the reference VAE-encode step and has stayed freed
+                            # through denoise/decode since (see the entry-section comment).
+                            # Now that decode's own vae-pair trip is done (`_vae_to_cpu()` just
+                            # above), there is headroom again: transformer_ref(34) + TE-nf4(21)
+                            # = 55GB resident, +34GB for this reload = 89GB, the same steady
+                            # state `generate()`'s own t2va path settles into. Reloaded last
+                            # (after transformer_ref/TE, whichever of those needed restoring)
+                            # so it is not competing with them for VRAM during their own
+                            # reloads.
+                            self._ensure_transformer(progress)
+                elif H3_LOWVRAM_GROUP:
+                    # `transformer_ref` was force-freed unconditionally at this method's entry
+                    # (see the entry-section comment) and is not reloaded here -- ref2va never
+                    # keeps a cross-request transformer_ref steady state in this mode (matches
+                    # plain bnb-4bit's own non-both-resident choice). TE-nf4 is reloaded though,
+                    # for the same reasoning as generate()'s own t2va decode tail: the next
+                    # request (t2va or ref2va) needs TE first regardless, so restoring it now
+                    # avoids paying its reload cost on that request's own critical path.
+                    with self._load_lock:
                         self._load_text_encoder(progress)
-                    if H3_TRANSFORMER_BOTH_RESIDENT and H3_EAGER_VARIANT_RESTORE:
-                        # Restore the int8 both-resident steady state (`transformer` +
-                        # `transformer_ref` + TE-nf4 all resident) for the *next* request.
-                        # `transformer` (t2va's) was freed at this method's entry to make
-                        # room for the reference VAE-encode step and has stayed freed
-                        # through denoise/decode since (see the entry-section comment).
-                        # Now that decode's own vae-pair trip is done (`_vae_to_cpu()` just
-                        # above), there is headroom again: transformer_ref(34) + TE-nf4(21)
-                        # = 55GB resident, +34GB for this reload = 89GB, the same steady
-                        # state `generate()`'s own t2va path settles into. Reloaded last
-                        # (after transformer_ref/TE, whichever of those needed restoring)
-                        # so it is not competing with them for VRAM during their own
-                        # reloads.
-                        self._ensure_transformer(progress)
+                # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
+                # "nothing big resident between requests" reasoning as generate()'s own
+                # lowvram decode tail.
+
+            if _keep_ref2va_active():
+                # H3_KEEP_REF2VA=1: decode 窓でも transformer_ref/TE を落とさない (LOWVRAM=1 では
+                # 元々 decode 後に再ロードしないので、ここで落とすと次リクエストが丸ごと再ロードになる)。
+                logger.info("ref2va: transformer_ref/text_encoder stay resident through decode (H3_KEEP_REF2VA=1)")
+            elif TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
+                self._free_transformer_ref()
             elif H3_LOWVRAM_GROUP:
-                # `transformer_ref` was force-freed unconditionally at this method's entry
-                # (see the entry-section comment) and is not reloaded here -- ref2va never
-                # keeps a cross-request transformer_ref steady state in this mode (matches
-                # plain bnb-4bit's own non-both-resident choice). TE-nf4 is reloaded though,
-                # for the same reasoning as generate()'s own t2va decode tail: the next
-                # request (t2va or ref2va) needs TE first regardless, so restoring it now
-                # avoids paying its reload cost on that request's own critical path.
                 with self._load_lock:
-                    self._load_text_encoder(progress)
-            # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
-            # "nothing big resident between requests" reasoning as generate()'s own
-            # lowvram decode tail.
-
-        if TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
-            self._free_transformer_ref()
-        elif H3_LOWVRAM_GROUP:
-            with self._load_lock:
-                self._free_text_encoder(force=True)
-        self._vae_to_gpu()
-        t_decode = time.time()
-        try:
-            video_decode_step = _cpu_norm_video_decode_step()
-            _, state = video_decode_step(pipe, state)
-            audio_decode_step = MiniMaxH3AudioDecodeStep()
-            _, state = audio_decode_step(pipe, state)
-            decode_time = time.time() - t_decode
-
-            videos = state.get("videos")
-            audio = state.get("audio")
-            sampling_rate = state.get("sampling_rate")
-
-            video_tensor = videos[0] if isinstance(videos, list) else videos
-            # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
-            # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
-            frames_uint8 = frames_to_uint8(video_tensor)
-            audio_np = audio[0].float().cpu().numpy()
-            rms = float(np.sqrt(np.mean(audio_np**2)))
-            peak = float(np.max(np.abs(audio_np)))
-
-            peak_vram = torch.cuda.max_memory_allocated() / 1e9
-
-            del video_tensor, videos, audio
-            gc.collect()
-            torch.cuda.empty_cache()
-        except BaseException:
-            logger.exception(
-                "ref2va decode failed -- freeing partial buffers and restoring the steady "
-                "state before re-raising (so the next request does not inherit a corrupted "
-                "resident set)"
-            )
-            gc.collect()
-            torch.cuda.empty_cache()
+                    self._free_text_encoder(force=True)
+            _dbg_pre_peak = 0.0
+            if H3_DEBUG_DECODE_MEM:
+                # 窓前までのピークを退避してからリセット (結果の peak_vram_gb は合成して保つ)。
+                torch.cuda.synchronize()
+                _dbg_pre_peak = torch.cuda.max_memory_allocated() / 1e9
+                logger.info("[DECODE_MEM] before vae_to_gpu: pre-window peak=%.2fGB gpu=%s", _dbg_pre_peak, gpu_mem_gb())
+                torch.cuda.reset_peak_memory_stats()
+            self._vae_to_gpu("decode")  # H3_VAE_SPLIT 時は decode 側だけ (それ以外は従来どおり全体)
+            if H3_DEBUG_DECODE_MEM:
+                logger.info("[DECODE_MEM] after vae_to_gpu: gpu=%s", gpu_mem_gb())
+            t_decode = time.time()
             try:
-                _restore_decode_steady_state_ref()
-            except Exception:
-                # 復元自体の失敗で元の decode 例外を潰さない(原因情報は元例外側にある)。
-                logger.exception("steady-state restore after ref2va decode failure also failed")
-            raise
+                video_decode_step = _cpu_norm_video_decode_step()
+                _, state = video_decode_step(pipe, state)
+                audio_decode_step = MiniMaxH3AudioDecodeStep()
+                _, state = audio_decode_step(pipe, state)
+                decode_time = time.time() - t_decode
 
-        _restore_decode_steady_state_ref()
+                videos = state.get("videos")
+                audio = state.get("audio")
+                sampling_rate = state.get("sampling_rate")
+
+                video_tensor = videos[0] if isinstance(videos, list) else videos
+                # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
+                # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
+                frames_uint8 = frames_to_uint8(video_tensor)
+                audio_np = audio[0].float().cpu().numpy()
+                rms = float(np.sqrt(np.mean(audio_np**2)))
+                peak = float(np.max(np.abs(audio_np)))
+
+                peak_vram = torch.cuda.max_memory_allocated() / 1e9
+                if H3_DEBUG_DECODE_MEM:
+                    logger.info("[DECODE_MEM] decode window peak=%.2fGB gpu=%s", peak_vram, gpu_mem_gb())
+                    peak_vram = max(peak_vram, _dbg_pre_peak)
+
+                del video_tensor, videos, audio
+                gc.collect()
+                torch.cuda.empty_cache()
+            except BaseException:
+                logger.exception(
+                    "ref2va decode failed -- freeing partial buffers and restoring the steady "
+                    "state before re-raising (so the next request does not inherit a corrupted "
+                    "resident set)"
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
+                try:
+                    _restore_decode_steady_state_ref()
+                except Exception:
+                    # 復元自体の失敗で元の decode 例外を潰さない(原因情報は元例外側にある)。
+                    logger.exception("steady-state restore after ref2va decode failure also failed")
+                raise
+
+            _restore_decode_steady_state_ref()
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
         ref_mode = "ref2i" if still else "ref2va"
         job_stub = f"{ref_mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
+        _t_mux0 = time.time()
         _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
+        mux_time = time.time() - _t_mux0
 
         # 参照付き静止画モード: 中央フレームを PNG として書き出す (generate() の still と同じ)
         png_path = None
@@ -6526,11 +9803,20 @@ class MiniMaxH3Runner:
             "turbo": instant["turbo"],
             "mute": bool(mute),
             "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
+            "reference_image_short_edge": resolved_short_edge,
+            "vocal_lock": bool(vocal_lock_effective),
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
             ],
         }
+        # --- 以下は新フラグ (H3_REF_LATENT_CACHE / H3_DECODE_*) が有効なときだけ付く追加キー ---
+        # (フラグ OFF の既定では従来と同一のキー集合を返す)
+        if H3_REF_LATENT_CACHE:
+            result["ref_latent_cache"] = ref_latent_cache_status
+        if decode_info is not None:
+            result["decode_mode"] = decode_info
+            result["mux_time_s"] = round(mux_time, 2)
         if progress:
             progress.update(phase="done", message="完了", result_path=str(png_path) if png_path else str(mp4_path))
         logger.info("ref2va generation done: %s",
@@ -6556,6 +9842,10 @@ class MiniMaxH3Runner:
         # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
         # `_mux_mp4` の docstring 参照)。
         mute: bool = False,
+        # 単発 generate_ref2va() と同じ per-request override。全場面共通
+        # (references 自体が全場面共通なのと同じ理由、バッチ内で場面ごとに変える
+        # ユースケースが無いため)。
+        reference_image_short_edge: int | None = None,
     ) -> dict:
         """参照共通・プロンプト違いの ref2va 生成 N 本を、`H3_LOWVRAM=1` の固定費を
         バッチ全体で1回に償却して回す (`generate_still_batch()` の ref2va 版)。
@@ -6631,6 +9921,9 @@ class MiniMaxH3Runner:
                     "場面間で尺が揃う保証がないためバッチでは使えません)。"
                 )
             batch_num_frames = seconds_to_num_frames(seconds)
+        # Fail fast, before acquiring `self._load_lock` / doing any loading work below
+        # (same early-validation placement as the other `raise ValueError`s just above).
+        resolved_short_edge = _resolve_ref_image_short_edge(reference_image_short_edge)
 
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
             MiniMaxH3PrepareConditionLatentsStep,
@@ -6672,13 +9965,28 @@ class MiniMaxH3Runner:
         # バッチは場面ループの外・リクエスト先頭で1回 (generate_still_batch() と同じ
         # 理由 -- 全場面共通の turbo 状態を、以降の場面ループ内で回る
         # `MiniMaxH3SetTimestepsStep` より前に適用しておく)。
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=True)
         pipe = self._pipe_ref
+
+        # Same per-request override as generate_ref2va() (see that call site's comment
+        # for the mechanism / cache-safety note). Applied once here, before the
+        # per-scene setup-step loop below, since `references` (and hence this value) is
+        # constant across all scenes in a batch and `pipe` is the same shell each
+        # iteration reuses.
+        pipe.register_to_config(reference_image_short_edge=resolved_short_edge)
+        if resolved_short_edge != H3_REF_IMAGE_SHORT_EDGE_DEFAULT:
+            logger.info(
+                "ref batch reference_image_short_edge=%d (default=%d)%s",
+                resolved_short_edge, H3_REF_IMAGE_SHORT_EDGE_DEFAULT,
+                " [per-request override]" if reference_image_short_edge is not None else " [H3_REF_IMAGE_SHORT_EDGE]",
+            )
 
         # --- encode 位相 (TE 常駐): 全場面の setup + テキスト/参照ビジョンエンコード ---
         t_encode = time.time()
         scenes: list[dict] = []
         for idx, prompt in enumerate(prompts):
+            # フェーズ境界での中断チェック(encoding): 場面ごとの setup ループ境界。
+            interrupt_controller.check()
             if progress:
                 progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
             state = PipelineState()
@@ -6709,33 +10017,57 @@ class MiniMaxH3Runner:
         # H3_REF_PREFIX_CACHE のモジュールコメントと scripts/probe_ref_prefix_cache.py。
         # setup は場面ごとに再実行済みだが normalized_references はプロンプト非依存
         # (デコード/リサイズのみ) なので、先頭場面のものを代表としてプレフィックスに使う。
-        if H3_REF_PREFIX_CACHE:
-            if progress:
-                progress.update(phase="encoding", message="参照プレフィックスをエンコード中 (全場面で共有)...")
-            encoded = _encode_ref_prompts_shared_prefix(
-                pipe, prompts, scenes[0]["state"].get("normalized_references"),
-                device=DEVICE, dtype=torch.bfloat16,
-            )
-            for scene, (prompt_embeds, text_token_tags) in zip(scenes, encoded):
-                scene["state"].set("prompt_embeds", prompt_embeds)
-                scene["state"].set("text_token_tags", text_token_tags)
-        else:
-            for idx, scene in enumerate(scenes):
+        # TE 外部常駐 (`H3_TE_DEVICE`): 単発の `generate_ref2va()` と同じく、エンコードは
+        # `_te_attached()` の窓の中で・`self._encode_device` (= TE のいる側) に対して行い、
+        # 結果だけを `_to_compute_device()` で計算用GPUへ運ぶ。この3点セットが無いと、
+        # 窓の外で `pipe.text_encoder` が None のままエンコードに入り
+        # `AttributeError: 'NoneType' object has no attribute 'config'`
+        # (`_encode_ref_prompts_shared_prefix` の num_layers 参照) で落ちる。
+        # **バッチ経路にだけこの対応が無く、上の `_te_external_usable_for("ref2va")` の
+        # ガードは通す**ため、`H3_TE_DEVICE` 指定時の /api/ref2i_batch・/api/ref2va_batch は
+        # 一度も成功していなかった (2026-08-20 実機で再現・修正。単発 ref2va 側で
+        # 2026-08-13 に踏んだ「ガードを緩めた瞬間に発火する」のと同型)。
+        # TE 同居時 (既定) は3つとも素通しで、挙動はバイト単位で不変。
+        with self._te_attached():
+            if H3_REF_PREFIX_CACHE:
                 if progress:
-                    progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
-                with torch.no_grad():
-                    prompt_embeds, text_token_tags = _encode_ref2va_prompt(
-                        pipe, scene["prompt"], scene["state"].get("normalized_references"),
-                        device=DEVICE, dtype=torch.bfloat16,
-                    )
-                scene["state"].set("prompt_embeds", prompt_embeds)
-                scene["state"].set("text_token_tags", text_token_tags)
+                    progress.update(phase="encoding", message="参照プレフィックスをエンコード中 (全場面で共有)...")
+                encoded = _encode_ref_prompts_shared_prefix(
+                    pipe, prompts, scenes[0]["state"].get("normalized_references"),
+                    device=self._encode_device, dtype=torch.bfloat16,
+                )
+                for scene, (prompt_embeds, text_token_tags) in zip(scenes, encoded):
+                    prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
+                    scene["state"].set("prompt_embeds", prompt_embeds)
+                    scene["state"].set("text_token_tags", text_token_tags)
+                # フェーズ境界での中断チェック(encoding): 共有プレフィックスの
+                # 前方計算が終わった直後(こちらは単発の長い呼び出しなのでループ境界ではなく
+                # 呼び出し直後に1回)。
+                interrupt_controller.check()
+            else:
+                for idx, scene in enumerate(scenes):
+                    # フェーズ境界での中断チェック(encoding): 場面ごとのフォールバック
+                    # エンコードループ境界。
+                    interrupt_controller.check()
+                    if progress:
+                        progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
+                    with torch.no_grad():
+                        prompt_embeds, text_token_tags = _encode_ref2va_prompt(
+                            pipe, scene["prompt"], scene["state"].get("normalized_references"),
+                            device=self._encode_device, dtype=torch.bfloat16,
+                        )
+                    prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
+                    scene["state"].set("prompt_embeds", prompt_embeds)
+                    scene["state"].set("text_token_tags", text_token_tags)
 
         # --- 参照VAEエンコード位相: VAE を1回だけ GPU へ (TE は常駐のまま --
         # 単発 generate_ref2va の lowvram 分岐と同じ同居構成で、48GB 級なら
         # TE(21GB)+vae(11GB) は問題なく収まることを単発実測で確認済み) ---
         self._vae_to_gpu()
         for idx, scene in enumerate(scenes):
+            # フェーズ境界での中断チェック(encoding): 場面ごとの参照VAEエンコード
+            # ループ境界。
+            interrupt_controller.check()
             if progress:
                 progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} の参照をVAEエンコード中...")
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
@@ -6756,7 +10088,7 @@ class MiniMaxH3Runner:
             _, state = latents_step(pipe, state)
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
+            timesteps_step = _make_set_timesteps_step()
             _, state = timesteps_step(pipe, state)
             scene["state"] = state
         encode_time = time.time() - t_encode
@@ -6765,6 +10097,7 @@ class MiniMaxH3Runner:
         with self._load_lock:
             self._free_text_encoder(force=True)
             self._ensure_transformer_ref(progress)
+        self._ensure_hyperflow_ref(progress=progress)
         self.apply_instant_settings(self._pipe_ref.transformer_ref, instant, is_ref=True, progress=progress)
 
         # --- denoise 位相: 全場面を順に ---
@@ -6786,10 +10119,11 @@ class MiniMaxH3Runner:
 
             step_times: list[float] = []
             cache_skips = [0]
-            denoise_step = MiniMaxH3Ref2VADenoiseStep()
+            denoise_step = _maybe_hyperflowify_denoise_step(MiniMaxH3Ref2VADenoiseStep())
             orig_loop_step = denoise_step.loop_step
 
             def timed_loop_step(components, bstate, i, t, _idx=idx, _step_times=step_times, _skips=cache_skips):
+                interrupt_controller.check()
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 _step_times.append(time.time() - ts)
@@ -6919,6 +10253,7 @@ class MiniMaxH3Runner:
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
             "mute": bool(mute),
+            "reference_image_short_edge": resolved_short_edge,
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
