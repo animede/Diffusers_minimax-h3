@@ -6792,6 +6792,14 @@ class MiniMaxH3Runner:
         reason = None
         if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
             reason = "H3_KEEP_REF2VA=1 + H3_KEEP_REF2VA_VAE=1 + H3_LOWVRAM=1 (VAE 常駐) が必要"
+        elif (H3_VAE_SPLIT and not H3_DECODE_VAE
+              and self._decode_target_device() == DEVICE):
+            # H3_VAE_SPLIT では標準 VAE のデコーダはデコード窓でだけ GPU に載る (常駐しない)。
+            # deferred decode はロックを手放した後に走り、次リクエストのエンコードが並行して
+            # VAE を出し入れしうるので、ここでデコーダを GPU へ戻すことはできない。light VAE
+            # (H3_DECODE_VAE) と別 GPU (H3_DECODE_DEVICE) は専用コピーを使うので影響しない。
+            reason = ("H3_VAE_SPLIT=1 では標準 VAE のデコーダが常駐しないため、同じ GPU での "
+                      "deferred decode には H3_DECODE_VAE(light)か別 GPU の H3_DECODE_DEVICE が必要")
         elif H3_DECODE_DEVICE:
             try:
                 d = torch.device(H3_DECODE_DEVICE)
