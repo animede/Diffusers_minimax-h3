@@ -3301,6 +3301,8 @@ token_refiner は bf16 ベース + bf16 デルタ**という混在状態にな�
 
 ## ライセンス
 
+本リポジトリのソースコードの著作権者: © 2026 YUZUKI (animede)。著作権表示と [NOTICE](NOTICE) の内容は、Apache-2.0 第4条に基づき再配布時も保持してください。
+
 **このリポジトリのコードは Apache License 2.0**([LICENSE](LICENSE))。
 モデル重みは含まれない。
 
