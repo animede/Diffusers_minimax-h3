@@ -963,6 +963,25 @@ H3_TRANSFORMER_PREQUANT = os.environ.get("H3_TRANSFORMER_PREQUANT", "1").strip()
 H3_TRANSFORMER_PREQUANT_DIR = Path(
     os.environ.get("H3_TRANSFORMER_PREQUANT_DIR", str(H3_TE_PREQUANT_DIR))
 )
+
+# transformer / transformer_ref の bf16 重み(各 ~66GB)を HF から取りに行くのは
+# H3_ALLOW_WEIGHT_DOWNLOAD=1 のときだけ (2026-10-19 追加、既定 OFF)。
+#
+# 動機: 重みは `main` で解決するため、上流 (MiniMaxAI/MiniMax-H3) が更新されると
+# ローカルの refs/main が新コミットへ進み、bf16 ロード経路 (bf16 プリセット、または
+# int8 量子化済みキャッシュの meta 不一致によるフォールバック) が**黙って**計 ~133GB の
+# 再DLを始める (起動中に数十分、gateway も応答しなくなる)。既定ではキャッシュ済みの
+# ファイルだけで読み (`local_files_only=True`)、無ければ再DLせずエラーにする。
+# HF_HUB_OFFLINE=1 で全体を止める案は diffusers 0.40.0.dev0 がシャード分割 VAE の
+# 読み込みで API を呼んで壊れるため不可 (revert 96c4719)。transformer にだけ効かせる。
+H3_ALLOW_WEIGHT_DOWNLOAD = os.environ.get("H3_ALLOW_WEIGHT_DOWNLOAD", "0").strip() == "1"
+_TRANSFORMER_HUB_KWARGS = {} if H3_ALLOW_WEIGHT_DOWNLOAD else {"local_files_only": True}
+_TRANSFORMER_DOWNLOAD_HINT = (
+    "" if H3_ALLOW_WEIGHT_DOWNLOAD else
+    " If the bf16 shards are simply not cached (e.g. upstream MiniMaxAI/MiniMax-H3 was "
+    "updated), this is the H3_ALLOW_WEIGHT_DOWNLOAD guard: restart with "
+    "H3_ALLOW_WEIGHT_DOWNLOAD=1 to download them (~66GB each for transformer / transformer_ref)."
+)
 # TE (17-21GB) よりシャードがはるかに大きい (~34GB/インスタンス) ため、TE の既定 25GB
 # より大きい下限を既定にする。
 H3_TRANSFORMER_PREQUANT_MIN_FREE_GB = float(
@@ -1776,6 +1795,54 @@ if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_AN
 #     _ensure_hyperflow_ref()(単一チョークポイント、ref2va と ref バッチ両方を通る)。
 # フェーズA probe 実測(2026-09-26): int8 prequant transformer_ref に PEFT が
 # TorchaoLoraLinear でそのまま適用可、LoRA 常駐 +2.87GB、ロード 6.5s。
+# 実験用(既定 OFF): Pika H3 Flex のサンプラー。Pika の Ref2VA/FL2VA アダプタは
+# 6 回評価・固定の時刻 (base grid 1000/750/500/250/100/40/0 を video shift 12 /
+# audio shift 3 で変換) で、各ステップの x0 予測に「新しいノイズ」を足して次の時刻へ
+# 戻す方式 (renoise) で蒸留されている。通常の Euler では同じ結果にならない
+# (Pika-Labs/Pika-H3-Flex の core/sampling.py が仕様)。アダプタ本体は既存の
+# turbo LoRA 経路で読む (H3_TURBO_LORA_REPO=Pika-Labs/Pika-H3-Flex、
+# H3_TURBO_LORA_FILE=ref2va/adapter.safetensors、H3_TURBO_LORA_SCALE=1.0)。
+H3_PIKA_RENOISE = os.environ.get("H3_PIKA_RENOISE", "0").strip() == "1"
+_PIKA_KNOTS = (1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0)
+
+
+def _install_pika_renoise(scheduler, shift: float) -> None:
+    """scheduler インスタンスの set_timesteps/step を Pika の renoise に差し替える。"""
+    sigmas = torch.tensor([shift * q / (1 + (shift - 1) * q) for q in _PIKA_KNOTS], dtype=torch.float32)
+    orig_set = scheduler.set_timesteps
+    state = {"gen": None}
+
+    def set_timesteps(num_inference_steps=None, device=None, sigmas_arg=None, **kw):
+        orig_set(device=device, sigmas=sigmas)
+        state["gen"] = None
+
+    def step(model_output, timestep, sample, return_dict=True):
+        if scheduler._step_index is None:
+            scheduler._step_index = scheduler.index_for_timestep(timestep)
+        i = scheduler._step_index
+        t = timestep if isinstance(timestep, torch.Tensor) else torch.tensor(timestep)
+        sigma_t = (1 - t.to(device=sample.device, dtype=torch.float32))
+        while sigma_t.ndim < sample.ndim:
+            sigma_t = sigma_t.unsqueeze(-1)
+        x0 = sample.float() + sigma_t * model_output.float()
+        sigma_next = float(scheduler.sigmas[i + 1])
+        if sigma_next > 0:
+            if state["gen"] is None:
+                # 同じ seed のリクエストなら同じノイズ列になるよう、初期潜在から決める。
+                seed = int(abs(float(sample.float().sum())) * 1000) % (2**31)
+                state["gen"] = torch.Generator(device=sample.device).manual_seed(seed)
+            eps = torch.randn(x0.shape, device=sample.device, dtype=torch.float32, generator=state["gen"])
+            prev = (1 - sigma_next) * x0 + sigma_next * eps
+        else:
+            prev = x0
+        scheduler._step_index = i + 1
+        prev = prev.to(sample.dtype)
+        return (prev,) if not return_dict else type("Out", (), {"prev_sample": prev})()
+
+    scheduler.set_timesteps = set_timesteps
+    scheduler.step = step
+
+
 H3_HYPERFLOW = os.environ.get("H3_HYPERFLOW", "0").strip() == "1"
 H3_HYPERFLOW_LORA = os.environ.get("H3_HYPERFLOW_LORA", "videorebirth/hyperflow").strip()
 if H3_HYPERFLOW and H3_TURBO_LORA:
@@ -3173,6 +3240,20 @@ def _register_minimax_h3_block_for_fbc() -> None:
     )
 
 
+# H3_LORA_FUSE (2026-11-04 probe、既定 0 = 従来どおり): turbo LoRA ラッパーの要素ごとの演算を減らす。
+# 1 step のプロファイル(1024×768・175f・Pika)で、出力全体への `scale *`(scale=1.0 でも走る)が 0.40s、
+# base 出力への加算が 0.60s だった。
+#   1 = scale == 1.0 のとき掛け算を省く(1.0 * d は恒等なのでビット一致)。
+#   2 = 1 に加え、LoRA の B 側の GEMM を base 出力へ addmm_ で直接足す(加算カーネルが消える。
+#       丸めが 1 回減るのでビット一致ではない)。
+_h3_lf = os.environ.get("H3_LORA_FUSE", "0").strip()
+H3_LORA_FUSE = int(_h3_lf) if _h3_lf in ("1", "2") else 0
+# H3_BLOCK_COMPILE=1 (2026-11-04 probe、既定 0): turbo LoRA を巻いたあと transformer_ref の 50 ブロックを
+# torch.compile する(core/pruned.py の compile_transformer_blocks。attention 本体は graph break)。
+# H3_PRUNED_COMPILE=3 と同じ処理だが、ConvRot 系に限らず(int8wo でも)使える。
+H3_BLOCK_COMPILE = os.environ.get("H3_BLOCK_COMPILE", "0").strip() == "1"
+
+
 class _TurboLoRALinear(torch.nn.Module):
     """`y = base(x) + B(A(x))`, applied at run time (never fused into `base`'s weight).
 
@@ -3214,11 +3295,26 @@ class _TurboLoRALinear(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return self.base(x)
+        if H3_LORA_FUSE:
+            return self._forward_fused(x)
         # scale=1.0 のとき `1.0 * delta` は IEEE 的に恒等なので、Ostris 版の従来挙動と
         # bit 単位で同一 (回帰性を保つ)。
         return self.base(x) + self.scale * torch.nn.functional.linear(
             torch.nn.functional.linear(x, self.lora_a), self.lora_b
         )
+
+    def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
+        """H3_LORA_FUSE=1/2 の経路(モジュール先頭のコメント参照)。"""
+        y = self.base(x)
+        t = torch.nn.functional.linear(x, self.lora_a)
+        if H3_LORA_FUSE >= 2 and y.is_contiguous() and t.dtype == y.dtype == self.lora_b.dtype:
+            n = y.shape[-1]
+            y.view(-1, n).addmm_(t.reshape(-1, t.shape[-1]), self.lora_b.t(), alpha=self.scale)
+            return y
+        d = torch.nn.functional.linear(t, self.lora_b)
+        if self.scale != 1.0:
+            d = self.scale * d
+        return y + d
 
     # `MiniMaxH3AdaLayerNormModulation.forward()`/`MiniMaxH3AdaLayerNormOut.forward()`
     # (transformer_minimax_h3.py) both read `self.linear.weight.dtype` directly to decide
@@ -4368,6 +4464,10 @@ class MiniMaxH3Runner:
         # 重要 -- プロセス全体の base はこの値 (H3_VIDEO_SHIFT 指定時はそれ、未指定なら
         # 配布 config の 12.0) であって、常に 12.0 ではない。
         self._base_video_shift = self._pipe.scheduler.shift
+        if H3_PIKA_RENOISE:
+            _install_pika_renoise(self._pipe.scheduler, 12.0)
+            _install_pika_renoise(self._pipe.audio_scheduler, 3.0)
+            logger.info("Pika H3 Flex renoise sampler installed (6 evals, video shift 12 / audio shift 3)")
         self._vae_loaded = True
         logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
                      "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
@@ -4642,6 +4742,7 @@ class MiniMaxH3Runner:
                     dtype=torch.bfloat16,
                     quantization_config={"transformer": quant_config},
                     device_map={"transformer": "cuda"},
+                    **_TRANSFORMER_HUB_KWARGS,
                 )
         elif H3_TRANSFORMER_QUANT == "ck-w4a8":
             # base = Kijai の AdaLN-pruned W4A8(fl2va_pruned_w4a8_mixed)を
@@ -4666,8 +4767,9 @@ class MiniMaxH3Runner:
             )
             loaded_from_prequant = True
         else:
-            self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
-            self._pipe.transformer.to(DEVICE)
+            self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16, **_TRANSFORMER_HUB_KWARGS)
+            if getattr(self._pipe, "transformer", None) is not None:  # 失敗時は直下の明示チェックで報告
+                self._pipe.transformer.to(DEVICE)
         # `ModularPipeline.load_components()` swallows the underlying exception
         # internally (`modular_pipeline.py`'s `try/except Exception: ... logger.warning
         # (...); continue` around each component's `spec.load()`) and does NOT
@@ -4685,7 +4787,7 @@ class MiniMaxH3Runner:
             raise RuntimeError(
                 "transformer load failed (see the diffusers 'Failed to create component "
                 "transformer' warning above for the underlying error, often CUDA OOM) -- "
-                "self._pipe.transformer is still None after load_components()."
+                "self._pipe.transformer is still None after load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         # 初回のみ (量子化を実際にその場で行ったときだけ): 量子化済みの重みを保存して
         # おき、次回以降のロードを短縮する。turbo LoRA の構造的 wrap や attention
@@ -4939,12 +5041,13 @@ class MiniMaxH3Runner:
             dtype=torch.bfloat16,
             quantization_config={"transformer": quant_config},
             device_map={"transformer": "cpu"},
+            **_TRANSFORMER_HUB_KWARGS,
         )
         if getattr(self._pipe, "transformer", None) is None:
             raise RuntimeError(
                 "transformer load failed (see the diffusers 'Failed to create component "
                 "transformer' warning above for the underlying error) -- "
-                "self._pipe.transformer is still None after load_components()."
+                "self._pipe.transformer is still None after load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         t1 = time.time()
         logger.info(
@@ -5211,10 +5314,12 @@ class MiniMaxH3Runner:
                     dtype=torch.bfloat16,
                     quantization_config={"transformer_ref": quant_config},
                     device_map={"transformer_ref": "cuda"},
+                    **_TRANSFORMER_HUB_KWARGS,
                 )
         else:
-            self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16)
-            self._pipe_ref.transformer_ref.to(DEVICE)
+            self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16, **_TRANSFORMER_HUB_KWARGS)
+            if getattr(self._pipe_ref, "transformer_ref", None) is not None:  # 失敗時は直下の明示チェックで報告
+                self._pipe_ref.transformer_ref.to(DEVICE)
         # See `_ensure_transformer`'s matching check/comment: `load_components()` does
         # not re-raise on a failed component load (e.g. CUDA OOM), it only logs a
         # warning and leaves the attribute unset -- verify explicitly rather than let a
@@ -5224,7 +5329,7 @@ class MiniMaxH3Runner:
                 "transformer_ref load failed (see the diffusers 'Failed to create "
                 "component transformer_ref' warning above for the underlying error, "
                 "often CUDA OOM) -- self._pipe_ref.transformer_ref is still None after "
-                "load_components()."
+                "load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         # See `_ensure_transformer`'s matching save call: only on a fresh in-place
         # quantize, and before turbo LoRA/attn backend/FBC/AdaLN precompute setup below.
@@ -5336,12 +5441,13 @@ class MiniMaxH3Runner:
             dtype=torch.bfloat16,
             quantization_config={"transformer_ref": quant_config},
             device_map={"transformer_ref": "cpu"},
+            **_TRANSFORMER_HUB_KWARGS,
         )
         if getattr(self._pipe_ref, "transformer_ref", None) is None:
             raise RuntimeError(
                 "transformer_ref load failed (see the diffusers 'Failed to create "
                 "component transformer_ref' warning above for the underlying error) -- "
-                "self._pipe_ref.transformer_ref is still None after load_components()."
+                "self._pipe_ref.transformer_ref is still None after load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         t1 = time.time()
         logger.info(
@@ -5573,7 +5679,7 @@ class MiniMaxH3Runner:
                 from core import pruned as pruned_mod
 
                 pruned_mod.compile_turbo_wrappers(transformer, _TurboLoRALinear)
-            if is_ref and H3_PRUNED_COMPILE_LEVEL >= 3:
+            if is_ref and (H3_PRUNED_COMPILE_LEVEL >= 3 or H3_BLOCK_COMPILE):
                 from core import pruned as pruned_mod
 
                 pruned_mod.compile_transformer_blocks(transformer)

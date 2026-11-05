@@ -54,7 +54,7 @@ T2I・Ref2I は「超短尺動画を生成し中央フレームを取り出す�
 
 ### LLM プロンプト強化
 
-`POST /api/prompt/enhance` がローカル LLM(既定 `H3_LLM_URL=http://127.0.0.1:64650`、gemma4-31B Q4_K_M を想定)を使い、プロンプトを H3 公式スキルの記法(`h3-official`)へ整形する。
+`POST /api/prompt/enhance` がローカル LLM(既定 `H3_LLM_URL=http://127.0.0.1:64660`、gemma4-31B Q4_K_M を想定)を使い、プロンプトを H3 公式スキルの記法(`h3-official`)へ整形する。
 
 - **構造**: T2VA は3フィールド(`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`)、Ref2VA は6フィールド。`[Shot n]` のカット記法、`<d>[言語] 台詞</d>` の話者付き台詞タグを公式仕様どおりに出力する。
 - **バリデータ**(`core/prompt_check.py`、規則 F1〜F8): フィールド順序・先頭ショットの時刻無し・カット時刻の厳密増加・尺内判定・ショット尺の下限・`<d>` タグ整合・台詞の尺内収まり・話者ID の8規則を機械判定する。F5(ショット尺下限)・F7(台詞の尺内収まり)は公式仕様に無い、本アプリが実用上追加した規則である。
@@ -513,7 +513,8 @@ VRAM・所要時間・PSNR・MD5・ASR判定など、品質や性能に関する
 | `H3_VAE_SMALLCLIP_FIX` | `1` | 超短尺(静止画モード)でのVAEデコード修正 |
 | `H3_REF_PREFIX_CACHE` | `1` | 参照バッチのKVプレフィックス共有 |
 | `H3_REF_PREFIX_CACHE_SINGLE` | `0` | 単発 ref2va のリクエスト間でもKVプレフィックスを再利用(画像参照のみ、+1.0GiB VRAM) |
-| `H3_LLM_URL` | `http://127.0.0.1:64650` | プロンプト強化に使うローカルLLM |
+| `H3_LLM_URL` | `http://127.0.0.1:64660` | プロンプト強化に使うローカルLLM |
+| `H3_LLM_API_KEY` | なし | LLMサーバのAPIキー(`Authorization: Bearer` で送る)。環境変数が無ければリポジトリ直下の `config.local.env`(git管理外)の同名行を読む |
 
 このほかにも診断・デバッグ用の環境変数があるが、通常運用で変更するのは上記が中心である。UIから即時反映できる項目(FBC・Sage・Turbo)は、恒久的に変えたい場合のみ環境変数で指定すればよい。
 

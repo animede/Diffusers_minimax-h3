@@ -54,7 +54,7 @@ All of these are designed to amortize, once over the entire batch, the fixed cos
 
 ### LLM Prompt Enhancement
 
-`POST /api/prompt/enhance` uses a local LLM (default `H3_LLM_URL=http://127.0.0.1:64650`, assuming gemma4-31B Q4_K_M) to reformat prompts into the notation of the official H3 skill (`h3-official`).
+`POST /api/prompt/enhance` uses a local LLM (default `H3_LLM_URL=http://127.0.0.1:64660`, assuming gemma4-31B Q4_K_M) to reformat prompts into the notation of the official H3 skill (`h3-official`).
 
 - **Structure**: T2VA has 3 fields (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`); Ref2VA has 6 fields. It outputs the `[Shot n]` cut notation and the `<d>[language] line</d>` speaker-tagged dialogue notation according to the official specification.
 - **Validator** (`core/prompt_check.py`, rules F1–F8): mechanically checks 8 rules — field order, absence of a timestamp on the first shot, strictly increasing cut timestamps, whether it fits within the duration, minimum shot duration, `<d>` tag consistency, whether dialogue fits within the duration, and speaker ID. F5 (minimum shot duration) and F7 (dialogue fitting within duration) are not in the official spec; they are rules this app added for practical purposes.
@@ -516,7 +516,8 @@ All claims about quality or performance — VRAM, time required, PSNR, MD5, ASR 
 | `H3_VAE_SMALLCLIP_FIX` | `1` | VAE decode fix for ultra-short clips (still-image mode) |
 | `H3_REF_PREFIX_CACHE` | `1` | KV prefix sharing for reference batches |
 | `H3_REF_PREFIX_CACHE_SINGLE` | `0` | Also reuse the KV prefix *across* single ref2va requests (image references only, +1.0GiB VRAM) |
-| `H3_LLM_URL` | `http://127.0.0.1:64650` | Local LLM used for prompt enhancement |
+| `H3_LLM_URL` | `http://127.0.0.1:64660` | Local LLM used for prompt enhancement |
+| `H3_LLM_API_KEY` | none | API key for the LLM server (sent as `Authorization: Bearer`). If unset, read from the same-named line in the git-ignored `config.local.env` at the repo root |
 
 There are other environment variables for diagnostics/debugging as well, but the above are the ones typically changed in normal operation. For items that apply immediately from the UI (FBC, Sage, Turbo), specify them via environment variables only if you want to change them permanently.
 

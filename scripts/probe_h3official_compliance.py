@@ -38,6 +38,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
+from core.llm import llm_auth_headers  # noqa: E402  (LLM 認証ヘッダ。/tokenize・/props にも要る)
 
 OUT_DIR = BASE_DIR / "outputs" / "ab_h3official_compliance"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -75,7 +76,7 @@ def _tokenize_count(llm_url: str, text: str) -> int | None:
     try:
         req = urllib.request.Request(
             f"{llm_url}/tokenize", data=json.dumps({"content": text}).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **llm_auth_headers()},
         )
         return len(json.load(urllib.request.urlopen(req, timeout=60))["tokens"])
     except Exception:
@@ -195,7 +196,8 @@ def main():
     llm_url = get_llm_url()
     logging.info("LLM: %s / repeats=%d / tag=%s", llm_url, REPEATS, TAG)
 
-    props = json.load(urllib.request.urlopen(f"{llm_url}/props", timeout=30))
+    props_req = urllib.request.Request(f"{llm_url}/props", headers=llm_auth_headers())
+    props = json.load(urllib.request.urlopen(props_req, timeout=30))
     n_ctx = props["default_generation_settings"]["n_ctx"]
     logging.info("n_ctx = %d", n_ctx)
 

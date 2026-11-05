@@ -16,7 +16,7 @@
         "H3_TE_DEVICE=cuda:1",
         "H3_VIDEO_VAE_FP16=1",
         "H3_KEEP_TRANSFORMER=1",
-        "H3_LLM_URL=http://127.0.0.1:64650",
+        "H3_LLM_URL=http://127.0.0.1:64660",
         "venv/bin/python",
         "-m",
         "uvicorn",

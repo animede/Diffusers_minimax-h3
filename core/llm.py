@@ -13,8 +13,10 @@ H3 のクラウド版(Hailuo AI)は内部にプロンプト整形層を持つが
 - 日本語プロンプトがそのまま効く。焦点距離(35/50/65/100mm)・カメラワーク・音の指示も
   ショット単位で通る
 
-接続先は環境変数 H3_LLM_URL(既定 http://127.0.0.1:64650)。gemma4-31B(Q4_K_M)で
-動作確認済み。小型〜中型LLMは指示だけでは形式に従わないことがあるため、各モードに
+接続先は環境変数 H3_LLM_URL(無ければ config.local.env の同名行、既定 http://127.0.0.1:64660)。gemma4-31B(Q4_K_M)で
+動作確認済み。認証が必要なLLMサーバには H3_LLM_API_KEY を `Authorization: Bearer` で送る
+(環境変数が無ければリポジトリ直下の config.local.env(git 管理外)の同名行を読み、どちらも
+無ければヘッダを付けない)。小型〜中型LLMは指示だけでは形式に従わないことがあるため、各モードに
 few-shot 例を入れてある(diffusers-server の LLM強化で確立した知見)。
 """
 import json
@@ -27,8 +29,10 @@ from pathlib import Path
 
 logger = logging.getLogger("minimax_h3.llm")
 
-DEFAULT_LLM_URL = "http://127.0.0.1:64650"
+DEFAULT_LLM_URL = "http://127.0.0.1:64660"
 LLM_TIMEOUT_S = 180  # h3-official は system prompt が長く(15.8KB/23.6KB)応答も遅いため延長
+# H3_LLM_URL / H3_LLM_API_KEY が環境変数に無いときに読むローカル設定(KEY=VALUE 行、git 管理外)
+LOCAL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.local.env"
 
 _SKILLS_CACHE_DIR = Path(__file__).resolve().parent.parent / "skills_cache" / "h3-prompt-writing"
 
@@ -38,7 +42,27 @@ class LLMConnectionError(Exception):
 
 
 def get_llm_url() -> str:
-    return os.environ.get("H3_LLM_URL", DEFAULT_LLM_URL).rstrip("/")
+    """H3_LLM_URL(環境変数 → config.local.env の同名行 → 既定)。"""
+    return (os.environ.get("H3_LLM_URL") or _local_setting("H3_LLM_URL") or DEFAULT_LLM_URL).rstrip("/")
+
+
+def _local_setting(name: str) -> str:
+    """config.local.env の `name=値` を返す(ファイルや行が無ければ "")。"""
+    try:
+        lines = LOCAL_CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip() == name:
+            return value.strip().strip("\"'")
+    return ""
+
+
+def llm_auth_headers() -> dict:
+    """H3_LLM_API_KEY(無ければ config.local.env の同名行)の Bearer ヘッダ。キーが無ければ {}。"""
+    key = os.environ.get("H3_LLM_API_KEY") or _local_setting("H3_LLM_API_KEY")
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 def chat_completion(system_prompt: str, user_text: str, *, temperature: float = 0.6) -> str:
@@ -54,7 +78,7 @@ def chat_completion(system_prompt: str, user_text: str, *, temperature: float = 
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **llm_auth_headers()},
         method="POST",
     )
     try:

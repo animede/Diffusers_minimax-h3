@@ -409,8 +409,13 @@ only set these if you want to change them permanently):
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache (denoise -25%; measured ineffective on the int8+SDPA trajectory) |
 | `H3_ATTN_BACKEND` | `sage` | The sage build is sm_120-only. **Any other GPU must use `default` (SDPA)** |
 | `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use; incompatible with `group`) |
+| `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | When the bf16 transformer / transformer_ref weights (~66GB each) are not cached, download them from HF only if `1` (default: no download, fail with a hint) |
+| `H3_PIKA_RENOISE` | `0` | Renoise sampler for the Pika H3 Flex turbo LoRA (experimental) |
+| `H3_BLOCK_COMPILE` | `0` | `1` torch.compiles the 50 transformer_ref blocks after the turbo LoRA is applied (attention itself is a graph break). About -13% per step at 1024×768 on an RTX PRO 6000; +5-14s on the first call only |
+| `H3_LORA_FUSE` | `0` | Cuts element-wise work in the turbo LoRA wrapper: `1` skips the multiply when scale is 1.0 (bit-identical) / `2` also fuses the add into the GEMM. No extra gain on top of `H3_BLOCK_COMPILE` |
 | `H3_VIDEO_VAE_FP16` | `0` | fp16-ify the video VAE (reduces decode peak; required at 16GB and below) |
-| `H3_LLM_URL` | `http://127.0.0.1:64650` | Local LLM used for prompt enhancement (optional feature) |
+| `H3_LLM_URL` | `http://127.0.0.1:64660` | Local LLM used for prompt enhancement (optional feature) |
+| `H3_LLM_API_KEY` | none | API key for the LLM server (sent as `Authorization: Bearer`). If unset, read from the same-named line in the git-ignored `config.local.env` at the repo root |
 
 ## VRAM/RAM design (important, based on measurements)
 
@@ -3032,7 +3037,7 @@ prompts into the H3 official guide's format. A local reproduction of the cloud H
 internal prompt-formatting layer.
 
 - Connection target: environment variable `H3_LLM_URL` (default
-  `http://127.0.0.1:64650`). Returns 502 if unreachable (does not affect the generation
+  `http://127.0.0.1:64660`). Returns 502 if unreachable (does not affect the generation
   feature)
 - `POST /api/prompt/enhance` {text, mode, seconds, task, lang}
 - Modes (the UI's "LLM enhance" button + mode selector):

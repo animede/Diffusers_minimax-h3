@@ -11,3 +11,6 @@ skills_cache/
 # 実行環境ごとの起動設定。LLM サーバのアドレスなど環境固有の値を書くため追跡しない
 # (雛形は .claude/launch.json.example をコピーして使う)
 .claude/launch.json
+
+# LLM の API キー等のローカル設定(core/llm.py が読む)。秘匿値のため追跡しない
+config.local.env
