@@ -90,6 +90,12 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 # ※ sm_120 以外は H3_ATTN_BACKEND=default が必須(既定の sage は sm_120 専用ビルド)
 
+# 8GB 単体(768²×5 秒 ピーク 7.5GB)/ 6GB 単体(512²×5 秒 ピーク 4.7GB)。2026-11-15 の 3 段のストリーミング
+# (投影 TE の LM 層・token_refiner・VAE デコーダ、下の「低 VRAM の到達点」)。上の 16GB の行に H3_TE_STREAM=1 を足すだけ
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 \
+  H3_ATTN_BACKEND=default \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+
 # 8GB×2(TE を2枚目GPUへ)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   H3_ATTN_BACKEND=default H3_TE_DEVICE=cuda:1 \
@@ -358,6 +364,7 @@ venv/bin/python scripts/download_t2va.py
 | 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒(2026-11-15 の自作ストリーマで denoise は約 1.7 倍速、下の `H3_GROUP_STREAM`) |
 | 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
 | **16GB 単体**(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / 約25分※ |
+| **8GB 単体 / 6GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1` | 768²: peak 7.5GB / 512²: peak 4.7GB(48GB 機で 256 / 137 秒、Gen3 x4 の箱では上の※と同じ転送律速) |
 | **12GB 単体**(見込み・未実測) | 16GB 単体と同じ | 実ピーク11.4GBが12GiBに入る計算。参照系・768×1344は不可 |
 | **8GB×2**(バラスト実測) | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB / 約25.6分※ |
 
@@ -809,6 +816,40 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
   `aten.view unimplemented` で落ちるため)。bf16 原本を消した箱では `meta.json` の `source_snapshot` の照合を省略する。
 - 解放は `BlockStreamer.release()`(`cudaHostUnregister`)で行い、`_host_emptyCache` に頼らない。
 - ホスト RAM: ピン留め 30.1GiB(diffusers 版の pinned 辞書 34GB と同程度)。RAM ガード(`H3_GROUP_OFFLOAD_MIN_RAM_GB`)はそのまま。
+
+### 2026-11-15: 低 VRAM の到達点 — 16GB 構成を 8GB / 6GB へ(3 段のストリーミング)
+
+同じ設計を、group モードで GPU に残っていた残り 3 つにも当てた。いずれも配置換えだけで**出力は MD5 一致**。
+
+1. **投影 TE の LM 層**(`H3_TE_STREAM=1` が `H3_TE_PROJ` にも効くようにした)。4B の 36 層 1.9GiB をピン留めホストに置き、
+   エンコード中だけ流す。group モードは TE をデノイズ中も常駐させる段取りなので、デノイズのピークが下がる。
+2. **token_refiner の 2 ブロック**(`H3_GROUP_STREAM_REFINER`、既定 1)。int8 化の対象外で bf16 1.5GiB が常駐していた。
+3. **video VAE デコーダの 36 ブロック**(`H3_GROUP_STREAM_VAE`、既定 `auto` = 最初のデコードで空き VRAM が 8GB 未満なら流す)。
+   VAE 5.2GiB(fp16)の 4.8GiB がデコーダで、1・2 のあとはここがピークだった。タイルごとに送り直すのでデコードは遅くなる。
+
+実測(RTX PRO 5000 48GB の GPU0、`H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1`、t2va 5 秒 30 step、seed 1):
+
+| | 基準(自作ストリーマのみ) | +1 投影 TE | +2 token_refiner | +3 VAE デコーダ |
+|---|---:|---:|---:|---:|
+| 512²×5 秒 ピーク | 8.59GB | 8.33GB | 6.79GB | **4.67GB** |
+| 768²×5 秒 ピーク | 10.78GB | 9.54GB | 7.99GB | **7.45GB** |
+| 512² デノイズ / デコード | 90 / 6 秒 | 86 / 6 秒 | 90 / 6 秒 | 89 / 17 秒 |
+| 768² デノイズ / デコード | 200 / 11 秒 | 193 / 11 秒 | 195 / 11 秒 | 195 / 30 秒 |
+
+起動直後の GPU 常駐は 0.18GB。残るピークはデノイズの活性で、これは解像度と長さで決まる。
+
+4. **feed-forward のトークン分割**(`H3_FF_CHUNK`、既定 `auto` = group モードで 8192 トークン、`0` で無効)。ブロックで最大の
+   一時メモリは SwiGLU の射影(トークンごとに 2 × ffn_dim 14336 の bf16 = 57KB)で、トークンを 8192 個ずつ通すと
+   一時メモリがその分だけになる。トークンごとの演算なので結果は同じ(MD5 一致)。
+
+| 1K を含む活性のピーク(デノイズ段階、同構成) | 分割なし | `H3_FF_CHUNK=8192` |
+|---|---:|---:|
+| 768²×5 秒 | 7.45GB | **6.26GB** |
+| 1024²×5 秒(12.6 万トークン、13.9 秒/step) | 10.73GB | **9.34GB** |
+
+残るのは attention の Q・K・V・出力(1024² で各 1.35GB)と残差ストリームで、正確なままでは削れない下限に近い。
+これより下げるにはクエリ分割の attention(K・V は丸ごと、Q と出力だけチャンク)が次の手で、1024²×5 秒で 7GB 前後の見込み。
+`/api/status` の `group_stream_refiner` / `group_stream_vae` / `ff_chunk` で状態を確認できる。
 
 `H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、
 24〜32GB級カードでは transformer 単体でも収まらない。`H3_LOWVRAM=group` は

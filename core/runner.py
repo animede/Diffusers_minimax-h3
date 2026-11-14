@@ -1353,7 +1353,8 @@ H3_TE_DIET = os.environ.get("H3_TE_DIET", "0").strip() == "1"
 # denoise / decode の間は LM 層は使われない -> その間の GPU 常駐を ~13GiB 減らす。
 # 層単位の移動 (モジュール丸ごとのスワップではない)・値は不変なので出力はビット一致。
 # 適用は `_apply_te_diet` の直後 (同じ2箇所)。TE が計算用 GPU に載る bnb-4bit 構成専用
-# (H3_TE_DEVICE 外部常駐・H3_TE_QUANT=none・H3_TE_PROJ では無視)。ホスト RAM は pinned
+# (H3_TE_DEVICE 外部常駐・H3_TE_QUANT=none では無視)。2026-11-15 から H3_TE_PROJ(投影 4B TE、
+# bnb-4bit)にも適用する(`_load_text_encoder_proj`、LM 層 ~2.7GiB を流す)。ホスト RAM は pinned
 # 確保分 (~14GiB) + 余裕を MemAvailable で確認し、足りなければ RuntimeError。
 # `H3_TE_STREAM_WINDOW` (既定 2 = LTX-2.5 と同じ): 先読みする層数。既定 (0) は挙動不変。
 H3_TE_STREAM = os.environ.get("H3_TE_STREAM", "0").strip() == "1"
@@ -1575,6 +1576,25 @@ H3_GROUP_OFFLOAD_LOW_CPU_MEM = os.environ.get("H3_GROUP_OFFLOAD_LOW_CPU_MEM", "0
 H3_GROUP_STREAM = os.environ.get("H3_GROUP_STREAM", "own").strip().lower()
 if H3_GROUP_STREAM not in ("own", "diffusers"):
     raise ValueError(f"H3_GROUP_STREAM must be 'own' or 'diffusers', got {H3_GROUP_STREAM!r}")
+# own のとき token_refiner の 2 ブロック(bf16 1.5GiB)も流す(既定 1)。0 で GPU 常駐(従来)。
+H3_GROUP_STREAM_REFINER = os.environ.get("H3_GROUP_STREAM_REFINER", "1").strip() == "1"
+# own のとき video VAE デコーダの 36 ブロック(fp16 で 4.8GiB、VAE 5.2GiB の大半)もデコード中に流す。
+# 低 VRAM 構成ではデコードがピーク(512² で 8.3GB、768² で 9.5GB、うち VAE の重み 5.2GB)だったため。
+#   auto (既定) 最初のデコードで空き VRAM が H3_GROUP_STREAM_VAE_FREE_GB 未満なら流す(以後固定)
+#   1 / 0      常に流す / 流さない(従来どおり VAE 全体を GPU へ)
+# 流すとデコードはタイルごとに 36 ブロックを送り直すため遅くなる(512² 6 → 17 秒、768² 11 → 30 秒)。
+# H3_VAE_PINNED=1(VAE 全体のピン留め往復)とは併用せず、そちらが優先。
+H3_GROUP_STREAM_VAE = os.environ.get("H3_GROUP_STREAM_VAE", "auto").strip().lower()
+if H3_GROUP_STREAM_VAE not in ("auto", "1", "0"):
+    raise ValueError(f"H3_GROUP_STREAM_VAE must be 'auto', '1' or '0', got {H3_GROUP_STREAM_VAE!r}")
+H3_GROUP_STREAM_VAE_FREE_GB = float(os.environ.get("H3_GROUP_STREAM_VAE_FREE_GB", "8").strip() or "8")
+
+# feed-forward のトークン分割 (2026-11-15)。H3 のブロックで一番大きい一時メモリは SwiGLU の射影
+# (トークンごとに 2 x ffn_dim 14336 の bf16 = 57KB、768²x5 秒の 7.1 万トークンで 4.1GB、さらに積 2GB)。
+# トークンを `H3_FF_CHUNK` 個ずつに分けて feed-forward を通すと一時メモリがチャンク分になる。
+# トークンごとの演算なので結果は同じ(bf16 の丸めも同じ)。auto = group モードで 8192、他は 0(無効)。
+_H3_FF_CHUNK_RAW = os.environ.get("H3_FF_CHUNK", "auto").strip().lower()
+H3_FF_CHUNK = (8192 if H3_LOWVRAM_GROUP else 0) if _H3_FF_CHUNK_RAW == "auto" else int(_H3_FF_CHUNK_RAW)
 if H3_GROUP_OFFLOAD_LOW_CPU_MEM and "H3_GROUP_OFFLOAD_USE_STREAM" not in os.environ:
     H3_GROUP_OFFLOAD_USE_STREAM = False
 
@@ -4621,6 +4641,37 @@ class MiniMaxH3Runner:
         if not to_cpu:
             torch.cuda.synchronize()
 
+    def _vae_stream_enabled(self) -> bool:
+        if not (H3_LOWVRAM_GROUP and H3_GROUP_STREAM == "own" and not H3_VAE_PINNED and TE_QUANT == "bnb-4bit"):
+            return False
+        if H3_GROUP_STREAM_VAE != "auto":
+            return H3_GROUP_STREAM_VAE == "1"
+        decided = getattr(self, "_vae_stream_decided", None)
+        if decided is None:
+            free_gb = torch.cuda.mem_get_info(DEVICE)[0] / 1e9
+            decided = free_gb < H3_GROUP_STREAM_VAE_FREE_GB
+            self._vae_stream_decided = decided
+            logger.info("vae decoder streaming: %s (free VRAM %.1fGB %s %.0fGB, H3_GROUP_STREAM_VAE=auto)",
+                        "on" if decided else "off", free_gb, "<" if decided else ">=", H3_GROUP_STREAM_VAE_FREE_GB)
+        return decided
+
+    def _vae_stream_move(self, device) -> None:
+        """video VAE のデコーダブロックは常にホスト(ピン留め)に置き、残り(encoder、デコーダの入出力層、
+        audio_vae)だけを device へ動かす。ストリーマは初回に作ってプロセス中は持ち続ける。"""
+        from core import blockstream
+
+        vae = self._pipe.vae
+        if getattr(self, "_vae_streamer", None) is None:
+            self._vae_streamer = blockstream.BlockStreamer(
+                vae.decoder.transformer_blocks, DEVICE, window=2, root=vae.decoder)
+            logger.info("vae.decoder: own block streamer %s", self._vae_streamer.describe())
+        for name, child in vae.named_children():
+            if name == "decoder":
+                blockstream.move_non_block_children(child, "transformer_blocks", device)
+            else:
+                child.to(device)
+        self._pipe.audio_vae.to(device)
+
     def _vae_to_gpu(self, part: str = "all"):
         """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
         phase. A single short one-way trip, not a standing swap -- see module docstring.
@@ -4639,7 +4690,11 @@ class MiniMaxH3Runner:
             return
         t0 = time.time()
         moved = False
-        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+        if self._vae_stream_enabled():
+            self._vae_stream_move(DEVICE)
+            self._vae_gpu_parts = {"encode", "decode"}
+            moved = True
+        if not moved and H3_VAE_PINNED and self._vae_pin_masters() is not None:
             tensors = self._vae_pin_tensor_list(need if split else None)
             if tensors is None and split:
                 tensors = self._vae_pin_tensor_list(None)  # 未知の子モジュール: 全体移動へ退避
@@ -4667,7 +4722,9 @@ class MiniMaxH3Runner:
         if TE_QUANT != "bnb-4bit" or not self._vae_on_gpu:
             return
         t0 = time.time()
-        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+        if self._vae_stream_enabled():
+            self._vae_stream_move(CPU)
+        elif H3_VAE_PINNED and self._vae_pin_masters() is not None:
             self._vae_pinned_move(self._vae_pin_tensor_list(None), CPU)
         else:
             self._pipe.vae.to(CPU)
@@ -4976,11 +5033,22 @@ class MiniMaxH3Runner:
             streamers = getattr(self, "_block_streamers", None)
             if streamers is None:
                 self._block_streamers = streamers = {}
-            moved_gib = blockstream.move_non_block_children(module, "transformer_blocks", DEVICE)
+            skip = {"transformer_blocks"}
+            if H3_GROUP_STREAM_REFINER and hasattr(module, "token_refiner"):
+                skip.add("token_refiner")
+            moved_gib = blockstream.move_non_block_children(module, skip, DEVICE)
             streamers[name] = blockstream.BlockStreamer(
                 module.transformer_blocks, DEVICE, window=H3_GROUP_OFFLOAD_BLOCKS + 1, root=module)
-            logger.info("%s: own block streamer %s, non-block modules resident on GPU %.2f GiB",
-                        name, streamers[name].describe(), moved_gib)
+            if "token_refiner" in skip:
+                # token_refiner の 2 ブロック(bf16 1.5GiB、int8 化対象外)も流す。final_norm だけ GPU に置く。
+                refiner = module.token_refiner
+                blockstream.move_non_block_children(refiner, "refiner_blocks", DEVICE)
+                streamers[name + ":refiner"] = blockstream.BlockStreamer(
+                    refiner.refiner_blocks, DEVICE, window=1, root=refiner)
+            logger.info("%s: own block streamer %s%s, non-block modules resident on GPU %.2f GiB",
+                        name, streamers[name].describe(),
+                        f", token_refiner {streamers[name + ':refiner'].describe()}" if "token_refiner" in skip else "",
+                        moved_gib)
             return
         module.enable_group_offload(
             onload_device=DEVICE,
@@ -4993,10 +5061,34 @@ class MiniMaxH3Runner:
             low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
         )
 
+    @staticmethod
+    def _apply_ff_chunk(module, chunk: int) -> int:
+        """各ブロックの feed-forward をトークン `chunk` 個ずつに分けて実行する(結果は同じ)。適用数を返す。"""
+        if chunk <= 0:
+            return 0
+        count = 0
+        for block in list(module.transformer_blocks) + list(getattr(getattr(module, "token_refiner", None), "refiner_blocks", [])):
+            ff = block.ff
+            if getattr(ff, "_h3_ff_chunked", False):
+                continue
+            original = ff.forward
+
+            def chunked(hidden_states, *args, _orig=original, _chunk=chunk, **kwargs):
+                if hidden_states.shape[1] <= _chunk:
+                    return _orig(hidden_states, *args, **kwargs)
+                return torch.cat([_orig(part, *args, **kwargs) for part in hidden_states.split(_chunk, dim=1)], dim=1)
+
+            ff.forward = chunked
+            ff._h3_ff_chunked = True
+            count += 1
+        return count
+
     def _release_block_streamer(self, name: str) -> None:
-        streamer = (getattr(self, "_block_streamers", None) or {}).pop(name, None)
-        if streamer is not None:
-            logger.info("%s: block streamer released (%.1f GiB unpinned)", name, streamer.release())
+        streamers = getattr(self, "_block_streamers", None) or {}
+        for key in (name, name + ":refiner"):
+            streamer = streamers.pop(key, None)
+            if streamer is not None:
+                logger.info("%s: block streamer released (%.1f GiB unpinned)", key, streamer.release())
 
     def _ensure_transformer_group(self, progress: ProgressState | None = None):
         """`H3_LOWVRAM_GROUP` ("group" mode) transformer loading: CPU-resident int8 +
@@ -5102,6 +5194,9 @@ class MiniMaxH3Runner:
             t1 - t0, ram_gb(),
         )
         self._attach_group_offload(self._pipe.transformer, "transformer")
+        if H3_FF_CHUNK:
+            logger.info("transformer: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
+                        H3_FF_CHUNK, self._apply_ff_chunk(self._pipe.transformer, H3_FF_CHUNK))
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_ATTN_BACKEND:
@@ -5496,6 +5591,9 @@ class MiniMaxH3Runner:
             t1 - t0, ram_gb(),
         )
         self._attach_group_offload(self._pipe_ref.transformer_ref, "transformer_ref")
+        if H3_FF_CHUNK:
+            logger.info("transformer_ref: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
+                        H3_FF_CHUNK, self._apply_ff_chunk(self._pipe_ref.transformer_ref, H3_FF_CHUNK))
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
         if H3_ATTN_BACKEND:
@@ -6577,6 +6675,17 @@ class MiniMaxH3Runner:
         )
         _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
         _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+        if H3_TE_STREAM and not self._te_external:
+            # 2026-11-15: 投影 TE(Qwen3-VL-4B)にも TE_STREAM を適用する。構造は 32B と同じ
+            # (`model.language_model.layers`、bnb Params4bit)で、LM 層 ~2.7GiB をピン留めホストに置き
+            # エンコード中だけ流す。group モードでは TE をデノイズ中も常駐させる段取りなので、
+            # これがデノイズ時のピークを ~2.7GB 下げる(16GB 級の構成で 768² 10.8 → 8GB 台)。
+            t_stream = time.time()
+            pinned = _apply_te_stream(self._pipe.text_encoder)
+            logger.info(
+                "text_encoder (H3_TE_PROJ) after H3_TE_STREAM (window=%d, pinned %.2fGiB, %.1fs). gpu=%s ram=%s",
+                H3_TE_STREAM_WINDOW, pinned, time.time() - t_stream, gpu_mem_gb(), ram_gb(),
+            )
         self._detach_te_if_external()
 
         # 投影行列は一度だけロードしてキャッシュする (`self._pipe._te_projection`,
@@ -7228,6 +7337,10 @@ class MiniMaxH3Runner:
             "vram_limit_gb": float(H3_VRAM_LIMIT_GB) if H3_VRAM_LIMIT_GB else None,
             "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
             "group_stream": H3_GROUP_STREAM if H3_LOWVRAM_GROUP else None,
+            "group_stream_refiner": H3_GROUP_STREAM_REFINER if H3_LOWVRAM_GROUP else None,
+            "ff_chunk": H3_FF_CHUNK,
+            "group_stream_vae": (H3_GROUP_STREAM_VAE if getattr(self, "_vae_stream_decided", None) is None
+                                 else ("on" if self._vae_stream_decided else "off")) if H3_LOWVRAM_GROUP else None,
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
             "attn_backend": H3_ATTN_BACKEND or "default",

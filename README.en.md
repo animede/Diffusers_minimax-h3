@@ -62,7 +62,7 @@ steps. All speeds are on this box's **PCIe Gen3 x4 slot + sm_89 (4060 Ti) + SDPA
 
 | Config | t2i 768² | t2va 5s 768² | ref2i | i2va (image ref) | audio ref | 768×1344 5s |
 |---|---|---|---|---|---|---|
-| **Real RTX 4060 Ti 16GB, single** | ○ 498s / peak 7.4GB | ○ 25 min / 11.4GB | ○ | ○ 39 min / 9.41GB | ○ 54 min / 11.96GB | ○ 66 min / 13.37GB (15.2GB real = ceiling) |
+| **Real RTX 4060 Ti 16GB, single** | ○ 498s / peak 7.4GB | ○ 25 min / 11.4GB (2026-11-15: 7.45GB with `H3_TE_STREAM=1`, 4.67GB at 512²) | ○ | ○ 39 min / 9.41GB | ○ 54 min / 11.96GB | ○ 66 min / 13.37GB (15.2GB real = ceiling) |
 | **8GiB × 2** (compute + TE, ballast-simulated) | ○ 512s / 6.4GB | ○ 25.6 min / 7.23GB | ○ 17.7 min / 6.69GB | × OOM | × OOM | × OOM |
 | **12GB, single** | △ estimate | △ | △ | △ | close to × (14.7GB real) | × |
 | **48GB + 20GB** (two cards, turbo LoRA) | ○ 9.7s | ○ 44.2s | ○ | ○ | ○ | ○ |
@@ -89,6 +89,12 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   H3_ATTN_BACKEND=default \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 # Note: anything other than sm_120 requires H3_ATTN_BACKEND=default (the default sage is an sm_120-only build)
+
+# 8GB single (768² x 5 s, peak 7.5GB) / 6GB single (512² x 5 s, peak 4.7GB): the three streaming stages of
+# 2026-11-15 (projection TE layers, token_refiner, VAE decoder; see "Where low VRAM stands"). Just add H3_TE_STREAM=1
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 \
+  H3_ATTN_BACKEND=default \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 
 # 8GB × 2 (put the TE on the second GPU)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
@@ -886,6 +892,45 @@ Measured (GPU0 of an RTX PRO 5000 Blackwell 48 GB, `H3_LOWVRAM=group H3_TE_PRUNE
 - Release goes through `BlockStreamer.release()` (`cudaHostUnregister`) instead of relying on `_host_emptyCache`.
 - Host RAM: 30.1 GiB pinned (about the same as the diffusers path's 34 GB pinned dict). The RAM guard
   (`H3_GROUP_OFFLOAD_MIN_RAM_GB`) is unchanged.
+
+### 2026-11-15: where low VRAM stands — from the 16GB configuration to 8GB / 6GB (three streaming stages)
+
+The same design was applied to the three things that still stayed on the GPU in group mode. All are placement
+changes only, and **the outputs match by MD5**.
+
+1. **The projection TE's LM layers** (`H3_TE_STREAM=1` now also applies to `H3_TE_PROJ`): the 4B model's 36 layers
+   (1.9 GiB) live in pinned host memory and stream only during encoding. Group mode keeps the TE resident through
+   denoise, so this lowers the denoise peak.
+2. **The token_refiner's two blocks** (`H3_GROUP_STREAM_REFINER`, default 1): excluded from int8, 1.5 GiB of bf16 stayed resident.
+3. **The video VAE decoder's 36 blocks** (`H3_GROUP_STREAM_VAE`, default `auto` = stream when less than 8 GB of VRAM is
+   free at the first decode): 4.8 GiB of the VAE's 5.2 GiB (fp16) is the decoder, and after 1 and 2 this was the peak.
+   Blocks are re-sent per tile, so decoding gets slower.
+
+Measured (GPU0 of an RTX PRO 5000 48 GB, `H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1`,
+t2va 5 s, 30 steps, seed 1):
+
+| | baseline (in-house streamer only) | +1 projection TE | +2 token_refiner | +3 VAE decoder |
+|---|---:|---:|---:|---:|
+| 512² x 5 s peak | 8.59 GB | 8.33 GB | 6.79 GB | **4.67 GB** |
+| 768² x 5 s peak | 10.78 GB | 9.54 GB | 7.99 GB | **7.45 GB** |
+| 512² denoise / decode | 90 / 6 s | 86 / 6 s | 90 / 6 s | 89 / 17 s |
+| 768² denoise / decode | 200 / 11 s | 193 / 11 s | 195 / 11 s | 195 / 30 s |
+
+Resident VRAM right after startup is 0.18 GB. What remains at the peak is the denoise activations, which depend on
+resolution and length.
+
+4. **Token-chunked feed-forward** (`H3_FF_CHUNK`, default `auto` = 8192 tokens in group mode, `0` disables). The largest
+   transient in a block is the SwiGLU projection (2 × ffn_dim 14336 bf16 = 57 KB per token); running the feed-forward
+   8192 tokens at a time bounds that transient. It is a per-token operation, so the result is the same (MD5 match).
+
+| Activation peak incl. 1K (denoise phase, same configuration) | unchunked | `H3_FF_CHUNK=8192` |
+|---|---:|---:|
+| 768² × 5 s | 7.45 GB | **6.26 GB** |
+| 1024² × 5 s (126k tokens, 13.9 s/step) | 10.73 GB | **9.34 GB** |
+
+What remains is the attention's Q, K, V and output (1.35 GB each at 1024²) plus the residual stream, close to the floor
+for an exact result. The next lever below that is query-chunked attention (full K/V, chunked Q and output), expected
+around 7 GB for 1024² × 5 s. `/api/status` reports `group_stream_refiner`, `group_stream_vae` and `ff_chunk`.
 
 `H3_LOWVRAM=1` (48GB tier) loads the full transformer (34GB) onto the GPU every request,
 so it doesn't even fit alone on a 24-32GB-tier card. `H3_LOWVRAM=group` ports the

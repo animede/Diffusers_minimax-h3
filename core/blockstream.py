@@ -194,11 +194,13 @@ class BlockStreamer:
                 "pinned_gib": round(self.pinned_bytes / 1024**3, 2)}
 
 
-def move_non_block_children(root: torch.nn.Module, blocks_attr: str, device) -> float:
-    """ブロック以外(埋め込み・token_refiner・出力層など)を GPU に置く。移した GiB を返す。"""
+def move_non_block_children(root: torch.nn.Module, blocks_attr, device) -> float:
+    """ブロック以外(埋め込み・出力層など)を GPU に置く。`blocks_attr` は名前か名前の集合(流す側に残す子)。
+    移した GiB を返す。"""
+    skip = {blocks_attr} if isinstance(blocks_attr, str) else set(blocks_attr)
     moved = 0
     for name, child in root.named_children():
-        if name == blocks_attr:
+        if name in skip:
             continue
         child.to(device)
         moved += sum(p.numel() * p.element_size() for p in child.parameters())
