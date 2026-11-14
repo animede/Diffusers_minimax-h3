@@ -355,7 +355,7 @@ venv/bin/python scripts/download_t2va.py
 | 96GB | (指定なし=既定) | peak 92GB / 約160秒 |
 | 80GB級 | `H3_TRANSFORMER_QUANT=int8` | peak 59.7GB / 約160秒 |
 | 48GB級 | `H3_LOWVRAM=1` | peak 38.9GB / 約215秒 |
-| 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒 |
+| 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒(2026-11-15 の自作ストリーマで denoise は約 1.7 倍速、下の `H3_GROUP_STREAM`) |
 | 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
 | **16GB 単体**(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / 約25分※ |
 | **12GB 単体**(見込み・未実測) | 16GB 単体と同じ | 実ピーク11.4GBが12GiBに入る計算。参照系・768×1344は不可 |
@@ -777,6 +777,38 @@ to_q/k/vを削除せず+12.8GBリークする**(明示deleteで対処)。AdaLN�
 - 既定OFFでは既存基準とMD5一致(回帰ゼロ)
 
 ## 24〜32GB級VRAM対応 (`H3_LOWVRAM=group`、2026-08-05追加)
+
+### 2026-11-15: ブロック転送を自作の窓付き先読みに置き換え(`H3_GROUP_STREAM`、既定 `own`)
+
+`H3_LOWVRAM=group` のブロック転送は、diffusers の `enable_group_offload(block_level, use_stream=True)` から
+`core/blockstream.py` の自作ストリーマに置き換えた(`H3_GROUP_STREAM=diffusers` で従来に戻せる)。
+TE の `H3_TE_STREAM`(`core/testream.py`)と同じ設計で、50 ブロック(int8、計 30.1GiB)をピン留めした
+ホスト RAM に置き、コピー専用 stream で window 個(`H3_GROUP_OFFLOAD_BLOCKS`+1、既定 2)先のブロックを
+送りながら計算する。ブロック以外(埋め込み・token_refiner・出力層、bf16 で 1.6GiB)は GPU に常駐。
+torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale` / `zero_point` を差し替える
+(diffusers の `_restore_torchao_tensor` と同じ方式)。flux3-klein-studio の 6GB 対応で実証した設計の移植。
+
+実測(RTX PRO 5000 Blackwell 48GB の GPU0、`H3_LOWVRAM=group H3_TE_PRUNE=1`、t2va 512²×5 秒 124f、30 step、seed 1、2 回ずつ):
+
+| | diffusers 版(`H3_GROUP_STREAM=diffusers`) | 自作版(`own`、既定) |
+|---|---:|---:|
+| デノイズ、`H3_CACHE=none` | 164.9〜165.0 秒(5.68 秒/step) | **96.4〜96.5 秒(3.32 秒/step)** |
+| デノイズ、`H3_CACHE=fbc`(既定) | 165.5〜167.6 秒(FBC が 1 step も飛ばない) | **85.6〜86.1 秒(FBC が 6/30 step を飛ばす)** |
+| ピーク VRAM | 17.7〜18.3GB | 19.5〜20.0GB(ブロック以外の常駐 +1.6GiB) |
+| 出力(MD5) | `H3_CACHE=none` で自作版と**完全一致** | 同左 |
+| ロード(ピン留め) | 20 秒(34GB を pinned 辞書へ) | 15 秒(ブロックごとに 1 本のバッファへ) |
+
+- 速さの差は転送方式そのもの(FBC オフ同士で 1.71 倍)。既製品はグループごとのフック固定費と、CPU が計算に先回りして
+  GPU 側の解放が遅れる構造のため(`docs/lowvram-techniques.md` の 4.2 節と同じ)。
+- **FirstBlockCache が group モードでも効くようになった**。diffusers 版では FBC が 1 step も飛ばしておらず
+  (「速度の正直な注記」の `cache_skipped_steps: 0` はこれ)、自作版では閾値 0.05 で 30 step 中 6 step を飛ばす。
+  その分だけ出力は FBC オフと変わる(FBC 本来の挙動)。完全一致が要るときは `H3_CACHE=none`。
+- group モードの transformer は、量子化済みキャッシュ(`models/prequant/transformer_int8`)があればそれを CPU に読む
+  ようにした(bf16 原本が HF キャッシュに無くても起動できる。他モードと同じ fail-open)。キャッシュから読んだ
+  Int8Tensor は `requires_grad=False` に固定する(diffusers 版の `swap_tensors` が autograd を辿って
+  `aten.view unimplemented` で落ちるため)。bf16 原本を消した箱では `meta.json` の `source_snapshot` の照合を省略する。
+- 解放は `BlockStreamer.release()`(`cudaHostUnregister`)で行い、`_host_emptyCache` に頼らない。
+- ホスト RAM: ピン留め 30.1GiB(diffusers 版の pinned 辞書 34GB と同程度)。RAM ガード(`H3_GROUP_OFFLOAD_MIN_RAM_GB`)はそのまま。
 
 `H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、
 24〜32GB級カードでは transformer 単体でも収まらない。`H3_LOWVRAM=group` は

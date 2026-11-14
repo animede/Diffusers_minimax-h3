@@ -374,7 +374,7 @@ at the top and the dated 2026-08-11 sections for details).
 | 96GB | (none = default) | peak 92GB / about 160s |
 | 80GB tier | `H3_TRANSFORMER_QUANT=int8` | peak 59.7GB / about 160s |
 | 48GB tier | `H3_LOWVRAM=1` | peak 38.9GB / about 215s |
-| 32GB tier | `H3_LOWVRAM=group` | peak 28.7GB / about 280s |
+| 32GB tier | `H3_LOWVRAM=group` | peak 28.7GB / about 280s (denoise about 1.7x faster since the 2026-11-15 streamer, see `H3_GROUP_STREAM` below) |
 | 18GB tier | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / about 280-320s |
 | **Single 16GB** (real 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / about 25min* |
 | **Single 12GB** (projected, unmeasured) | same as single 16GB | the measured 11.4GB peak should fit in 12GiB; reference modes and 768×1344 will not |
@@ -848,6 +848,44 @@ bf16-ification).
 - With default OFF, this MD5-matches the existing baseline (zero regression)
 
 ## 24-32GB-tier VRAM support (`H3_LOWVRAM=group`, added 2026-08-05)
+
+### 2026-11-15: block transfer replaced by an in-house windowed prefetch streamer (`H3_GROUP_STREAM`, default `own`)
+
+The block transfer of `H3_LOWVRAM=group` moved from diffusers' `enable_group_offload(block_level, use_stream=True)`
+to the streamer in `core/blockstream.py` (`H3_GROUP_STREAM=diffusers` restores the old path). It follows the
+design of the text encoder's `H3_TE_STREAM` (`core/testream.py`): the 50 int8 blocks (30.1 GiB) live in
+page-locked host RAM and a copy stream sends `window` blocks ahead of the computation (`H3_GROUP_OFFLOAD_BLOCKS`+1,
+default 2). Everything that is not a block (embedders, token_refiner, output layers, 1.6 GiB in bf16) stays on the
+GPU. torchao `Int8Tensor`s are moved through their inner `qdata` / `scale` / `zero_point` tensors rather than the
+outer wrapper (the same approach as diffusers' `_restore_torchao_tensor`). This is the design proven in
+flux3-klein-studio's 6 GB work, ported here.
+
+Measured (GPU0 of an RTX PRO 5000 Blackwell 48 GB, `H3_LOWVRAM=group H3_TE_PRUNE=1`, t2va 512² x 5 s = 124 frames,
+30 steps, seed 1, two runs each):
+
+| | diffusers (`H3_GROUP_STREAM=diffusers`) | in-house (`own`, default) |
+|---|---:|---:|
+| Denoise, `H3_CACHE=none` | 164.9-165.0 s (5.68 s/step) | **96.4-96.5 s (3.32 s/step)** |
+| Denoise, `H3_CACHE=fbc` (default) | 165.5-167.6 s (FBC never skips a step) | **85.6-86.1 s (FBC skips 6 of 30 steps)** |
+| Peak VRAM | 17.7-18.3 GB | 19.5-20.0 GB (+1.6 GiB of resident non-block modules) |
+| Output (MD5) | **identical** to the in-house streamer with `H3_CACHE=none` | same |
+| Load (pinning) | 20 s (34 GB into a pinned dict) | 15 s (one buffer per block) |
+
+- The speed difference is the transfer scheme itself (1.71x with FBC off on both sides): the stock hooks pay a
+  fixed cost per group and let the CPU run ahead of the GPU, which delays the frees (section 4.2 of
+  `docs/lowvram-techniques.md`).
+- **FirstBlockCache now works in group mode.** Under the diffusers path FBC never skipped a step (the
+  `cache_skipped_steps: 0` noted under "An honest note on speed"); the in-house streamer skips 6 of 30 at the
+  default threshold 0.05, so the output differs from FBC-off by exactly FBC's intended approximation. Use
+  `H3_CACHE=none` when the exact result matters.
+- The group-mode transformer now loads from the prequantized cache (`models/prequant/transformer_int8`) onto the CPU
+  when present (the bf16 shards no longer need to be in the HF cache; same fail-open as the other modes). Int8Tensors
+  read from the cache are pinned to `requires_grad=False` (diffusers' `swap_tensors` otherwise walks autograd and
+  fails with `aten.view unimplemented`). On a box whose bf16 shards were deleted, the `source_snapshot` check of
+  `meta.json` is skipped.
+- Release goes through `BlockStreamer.release()` (`cudaHostUnregister`) instead of relying on `_host_emptyCache`.
+- Host RAM: 30.1 GiB pinned (about the same as the diffusers path's 34 GB pinned dict). The RAM guard
+  (`H3_GROUP_OFFLOAD_MIN_RAM_GB`) is unchanged.
 
 `H3_LOWVRAM=1` (48GB tier) loads the full transformer (34GB) onto the GPU every request,
 so it doesn't even fit alone on a 24-32GB-tier card. `H3_LOWVRAM=group` ports the

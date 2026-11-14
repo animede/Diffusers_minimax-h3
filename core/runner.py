@@ -1564,6 +1564,17 @@ H3_GROUP_OFFLOAD_USE_STREAM = os.environ.get("H3_GROUP_OFFLOAD_USE_STREAM", "1")
 # since `low_cpu_mem_usage=True` + `use_stream=True` together are exactly the broken
 # combination) or the pin_memory() crash returns.
 H3_GROUP_OFFLOAD_LOW_CPU_MEM = os.environ.get("H3_GROUP_OFFLOAD_LOW_CPU_MEM", "0").strip() == "1"
+
+# "group" モードのブロック転送の実装 (2026-11-15)。
+#   own       (既定) core/blockstream.py の窓付き先読み。TE の `core/testream.py` と同じ設計で、
+#             ブロック以外(埋め込み・token_refiner・出力層、bf16 で約 1.7GB)は GPU 常駐、
+#             50 ブロックはピン留めしたホスト RAM から window 個先読みで流す。diffusers 版より
+#             フック固定費が小さく、CPU の先回りで GPU 側の解放が遅れることもない
+#             (flux3-klein-studio の flux3_stream.py で実証した設計)。
+#   diffusers 従来の `enable_group_offload(block_level, use_stream)`(上の knob がそのまま効く)。
+H3_GROUP_STREAM = os.environ.get("H3_GROUP_STREAM", "own").strip().lower()
+if H3_GROUP_STREAM not in ("own", "diffusers"):
+    raise ValueError(f"H3_GROUP_STREAM must be 'own' or 'diffusers', got {H3_GROUP_STREAM!r}")
 if H3_GROUP_OFFLOAD_LOW_CPU_MEM and "H3_GROUP_OFFLOAD_USE_STREAM" not in os.environ:
     H3_GROUP_OFFLOAD_USE_STREAM = False
 
@@ -4956,6 +4967,37 @@ class MiniMaxH3Runner:
                 "this box's actual headroom."
             )
 
+    def _attach_group_offload(self, module, name: str) -> None:
+        """group モードのブロック転送を `module`(CPU 常駐 int8)に取り付ける。`H3_GROUP_STREAM` で
+        core/blockstream.py(own)か diffusers の enable_group_offload かを選ぶ。"""
+        if H3_GROUP_STREAM == "own":
+            from core import blockstream
+
+            streamers = getattr(self, "_block_streamers", None)
+            if streamers is None:
+                self._block_streamers = streamers = {}
+            moved_gib = blockstream.move_non_block_children(module, "transformer_blocks", DEVICE)
+            streamers[name] = blockstream.BlockStreamer(
+                module.transformer_blocks, DEVICE, window=H3_GROUP_OFFLOAD_BLOCKS + 1, root=module)
+            logger.info("%s: own block streamer %s, non-block modules resident on GPU %.2f GiB",
+                        name, streamers[name].describe(), moved_gib)
+            return
+        module.enable_group_offload(
+            onload_device=DEVICE,
+            offload_device=CPU,
+            offload_type="block_level",
+            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
+            non_blocking=True,
+            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
+            record_stream=False,
+            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
+        )
+
+    def _release_block_streamer(self, name: str) -> None:
+        streamer = (getattr(self, "_block_streamers", None) or {}).pop(name, None)
+        if streamer is not None:
+            logger.info("%s: block streamer released (%.1f GiB unpinned)", name, streamer.release())
+
     def _ensure_transformer_group(self, progress: ProgressState | None = None):
         """`H3_LOWVRAM_GROUP` ("group" mode) transformer loading: CPU-resident int8 +
         diffusers block-level group offload, for 24-32GB-class cards.
@@ -5036,13 +5078,18 @@ class MiniMaxH3Runner:
             Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
-        self._pipe.load_components(
-            names=["transformer"],
-            dtype=torch.bfloat16,
-            quantization_config={"transformer": quant_config},
-            device_map={"transformer": "cpu"},
-            **_TRANSFORMER_HUB_KWARGS,
-        )
+        # 2026-11-15: 量子化済みキャッシュ (models/prequant/transformer_int8) があればそれを CPU に読む
+        # (bf16 原本が HF キャッシュに無くても動く。他モードと同じ fail-open)。無ければ従来の
+        # bf16 ロード + その場量子化。
+        if not (H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=False), is_ref=False, progress=progress, device=CPU)):
+            self._pipe.load_components(
+                names=["transformer"],
+                dtype=torch.bfloat16,
+                quantization_config={"transformer": quant_config},
+                device_map={"transformer": "cpu"},
+                **_TRANSFORMER_HUB_KWARGS,
+            )
         if getattr(self._pipe, "transformer", None) is None:
             raise RuntimeError(
                 "transformer load failed (see the diffusers 'Failed to create component "
@@ -5054,16 +5101,7 @@ class MiniMaxH3Runner:
             "transformer loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
-        self._pipe.transformer.enable_group_offload(
-            onload_device=DEVICE,
-            offload_device=CPU,
-            offload_type="block_level",
-            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
-            non_blocking=True,
-            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
-            record_stream=False,
-            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
-        )
+        self._attach_group_offload(self._pipe.transformer, "transformer")
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_ATTN_BACKEND:
@@ -5191,6 +5229,7 @@ class MiniMaxH3Runner:
         # mode's transformer/transformer_ref pair, group mode never keeps both resident
         # at once (not verified to fit two ~34GB CPU-resident copies alongside TE-nf4
         # reload headroom within this mode's RAM guard -- see H3_GROUP_OFFLOAD_MIN_RAM_GB).
+        self._release_block_streamer("transformer")
         del self._pipe.transformer
         self._pipe.transformer = None
         self._transformer_loaded = False
@@ -5436,13 +5475,15 @@ class MiniMaxH3Runner:
             Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
-        self._pipe_ref.load_components(
-            names=["transformer_ref"],
-            dtype=torch.bfloat16,
-            quantization_config={"transformer_ref": quant_config},
-            device_map={"transformer_ref": "cpu"},
-            **_TRANSFORMER_HUB_KWARGS,
-        )
+        if not (H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=True), is_ref=True, progress=progress, device=CPU)):
+            self._pipe_ref.load_components(
+                names=["transformer_ref"],
+                dtype=torch.bfloat16,
+                quantization_config={"transformer_ref": quant_config},
+                device_map={"transformer_ref": "cpu"},
+                **_TRANSFORMER_HUB_KWARGS,
+            )
         if getattr(self._pipe_ref, "transformer_ref", None) is None:
             raise RuntimeError(
                 "transformer_ref load failed (see the diffusers 'Failed to create "
@@ -5454,16 +5495,7 @@ class MiniMaxH3Runner:
             "transformer_ref loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
-        self._pipe_ref.transformer_ref.enable_group_offload(
-            onload_device=DEVICE,
-            offload_device=CPU,
-            offload_type="block_level",
-            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
-            non_blocking=True,
-            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
-            record_stream=False,
-            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
-        )
+        self._attach_group_offload(self._pipe_ref.transformer_ref, "transformer_ref")
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
         if H3_ATTN_BACKEND:
@@ -5497,6 +5529,7 @@ class MiniMaxH3Runner:
         # _free_text_encoder (CLAUDE.md #33: no whole-module CPU-staging trips for
         # 60GB+ modules on this box). In H3_LOWVRAM_GROUP mode this reclaims host RAM
         # (see _free_transformer's matching comment), not VRAM.
+        self._release_block_streamer("transformer_ref")
         del self._pipe_ref.transformer_ref
         self._pipe_ref.transformer_ref = None
         self._transformer_ref_loaded = False
@@ -6250,7 +6283,7 @@ class MiniMaxH3Runner:
         return meta
 
     def _load_transformer_from_prequant(
-        self, cache_dir: Path, is_ref: bool, progress: ProgressState | None = None
+        self, cache_dir: Path, is_ref: bool, progress: ProgressState | None = None, device=None
     ) -> bool:
         """量子化済みキャッシュから transformer(_ref) を読む。成功したら True。
 
@@ -6270,12 +6303,21 @@ class MiniMaxH3Runner:
             return False
         current_meta = self._transformer_prequant_metadata(pruned=False)
         if saved_meta != current_meta:
-            logger.info(
-                "transformer 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
-                "扱いにします (通常経路で作り直します): %s\n保存済み=%s\n現在=%s",
-                cache_dir, saved_meta, current_meta,
-            )
-            return False
+            # 2026-11-15: bf16 の原本を HF キャッシュから消した箱では source_snapshot だけが None になる。
+            # 原本が無いのだから更新の検知もできず、作り直しもできない(ロードが失敗するだけ)ので、
+            # それ以外が一致していればキャッシュを有効とみなす。
+            if (current_meta.get("source_snapshot") is None
+                    and {k: v for k, v in saved_meta.items() if k != "source_snapshot"}
+                    == {k: v for k, v in current_meta.items() if k != "source_snapshot"}):
+                logger.info("transformer 量子化済みキャッシュ: bf16 原本が無いので source_snapshot の照合を省略して使います: %s",
+                            cache_dir)
+            else:
+                logger.info(
+                    "transformer 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
+                    "扱いにします (通常経路で作り直します): %s\n保存済み=%s\n現在=%s",
+                    cache_dir, saved_meta, current_meta,
+                )
+                return False
         label = "transformer_ref" if is_ref else "transformer"
         if progress:
             progress.update(
@@ -6287,7 +6329,16 @@ class MiniMaxH3Runner:
             from diffusers import MiniMaxH3Transformer3DModel
 
             tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
-            tr = tr.to(DEVICE)
+            # 推論専用。キャッシュから読んだ torchao Int8Tensor は requires_grad=True のままで、diffusers の
+            # group offload が使う torch.utils.swap_tensors が autograd の辺を辿ろうとして
+            # 「Int8Tensor dispatch: aten.view unimplemented」で落ちる(2026-11-15、group モードで実測)。
+            for param in tr.parameters():
+                try:
+                    param.requires_grad_(False)
+                except Exception:  # noqa: BLE001
+                    pass
+            # group モード (device=CPU) はホスト常駐のまま使う(from_pretrained は CPU に読む)
+            tr = tr.to(DEVICE if device is None else device)
         except Exception:
             logger.exception(
                 "%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",
@@ -7176,6 +7227,7 @@ class MiniMaxH3Runner:
             # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
             "vram_limit_gb": float(H3_VRAM_LIMIT_GB) if H3_VRAM_LIMIT_GB else None,
             "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
+            "group_stream": H3_GROUP_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
             "attn_backend": H3_ATTN_BACKEND or "default",
