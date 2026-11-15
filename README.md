@@ -90,8 +90,9 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 # ※ sm_120 以外は H3_ATTN_BACKEND=default が必須(既定の sage は sm_120 専用ビルド)
 
-# 6GB 単体(768²×5 秒 デノイズ 4.9GB)/ 8GB 単体(1024²×5 秒 6.8GB)。2026-11-15 のストリーミングとメモリ節約版 forward
-# (下の「低 VRAM の到達点」)。上の 16GB の行に H3_TE_STREAM=1 H3_TE_DIET=1 を足すだけ(残りは既定で有効)
+# 6GB 単体(768²×5 秒 4.6GB、1024²×5 秒は空きに応じて attention をヘッド分割して 4.8GB)/ 8GB 単体(1024² 6.4GB、分割なし)。
+# 2026-11-15 のストリーミングとメモリ節約版 forward(下の「低 VRAM の到達点」)。上の 16GB の行に
+# H3_TE_STREAM=1 H3_TE_DIET=1 を足すだけ(残りは既定で有効。さらに下げるなら H3_CACHE=none で 1024² 3.0GB)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 H3_TE_DIET=1 \
   H3_ATTN_BACKEND=default \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
@@ -364,7 +365,7 @@ venv/bin/python scripts/download_t2va.py
 | 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒(2026-11-15 の自作ストリーマで denoise は約 1.7 倍速、下の `H3_GROUP_STREAM`) |
 | 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
 | **16GB 単体**(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / 約25分※ |
-| **6GB 単体 / 8GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 768²: デノイズ 4.85GB / 1024²: 6.82GB(48GB 機で 257 / 509 秒。Gen3 x4 の箱では上の※と同じ転送律速) |
+| **6GB 単体 / 8GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 768²: 4.62GB / 1024²: 6.41GB(MD5 一致の既定。48GB 機で 272 / 552 秒)。空きが足りないときは attention をヘッド分割して 1024² 4.79GB(別サンプル相当、+15%)、`H3_CACHE=none` なら 3.03GB。Gen3 x4 の箱では上の※と同じ転送律速 |
 | **12GB 単体**(見込み・未実測) | 16GB 単体と同じ | 実ピーク11.4GBが12GiBに入る計算。参照系・768×1344は不可 |
 | **8GB×2**(バラスト実測) | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB / 約25.6分※ |
 
@@ -845,9 +846,9 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
 | 1K を含む活性のピーク(デノイズ段階、同構成) | 分割なし | `H3_FF_CHUNK=8192` |
 |---|---:|---:|
 | 768²×5 秒 | 7.45GB | **6.26GB** |
-| 1024²×5 秒(12.6 万トークン、13.9 秒/step) | 10.73GB | **9.34GB** |
+| 1024²×5 秒(3.8 万トークン、13.9 秒/step) | 10.73GB | **9.34GB** |
 
-残るのは attention の K・V(1024² で各 1.8GB)と出力・残差ストリームで、正確なままでは削れない下限に近い。
+残るのは attention の K・V(1024² で各 0.55GB)と出力・残差ストリームで、正確なままでは削れない下限に近い。
 
 5. **attention のクエリ分割**(`H3_ATTN_Q_CHUNK`、既定 0 = 無効、`core/attnchunk.py`)。K・V は丸ごと作り、Q の射影・
    QK ノルム・RoPE・カーネル・出力射影を 8192 トークンずつ回す(結果は MD5 一致)。効くのは 1K 以上で、
@@ -857,7 +858,7 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
 ここまでで 1024²×5 秒は 8.5GB。さらに 3 つで「後ちょっと」を詰めた(いずれも MD5 一致)。
 
 6. **メモリ節約版のブロック forward**(`H3_LEAN_BLOCK`、既定 `auto` = group モードで 8192 トークン、`core/leanblock.py`)。
-   元の forward は norm1 の出力・attention の出力・norm2 の出力・FF の出力を全トークン分(1024² で各 1.35GB)作ってから
+   元の forward は norm1 の出力・attention の出力・norm2 の出力・FF の出力を全トークン分(1024² で各 0.41GB)作ってから
    足す。正規化 → 変調 → 射影/attention/FF → ゲート → 残差加算をチャンクで通し、全トークン分の中間は入力・出力・
    K・V の 4 本だけにする。4(FF 分割)と 5(クエリ分割)を包含する。norm をチャンクごとに 2 回計算する分、1024² で約 7% 遅い。
 7. **流す単位をブロックの 1/3 に**(`H3_GROUP_STREAM_UNITS=half`、既定)。adaln_proj → attn → ff の順に 150 単位で流し、
@@ -870,10 +871,45 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
 | 768²×5 秒 | 10.78GB | 7.45GB | **4.85GB** |
 | 1024²×5 秒 | 10.73GB(デノイズ) | — | **6.82GB** |
 
-残るのは attention の K・V(1024² で各 1.8GB)と入力・出力の残差ストリーム、チャンク分の一時メモリで、正確なままでは
-ここが下限。**768²×5 秒が 6GB カード、1024²×5 秒が 8GB カード**の範囲に入った(デコードは VAE を流せばデノイズより低い)。
-`/api/status` の `group_stream_refiner` / `group_stream_vae` / `group_stream_units` / `ff_chunk` / `attn_q_chunk` /
-`lean_block` で状態を確認できる。
+ここまでが午前。午後に 1024²×5 秒の内訳を測り直す(`H3_LEAN_DEBUG=1` がブロック 0〜2 の allocated / peak を出す)と、
+トークンは 38,321(動画 31,744 + 音声 + テキスト)で、残差ストリーム 1 本が 0.41GB、K・V が各 0.55GB、ブロック内の一時
+メモリは attention 段が最大(K・V 1.1GB + sage がカーネル内で作る int8 の写し + チャンク分)だった。さらに 4 つ。
+
+9. **fp32 パッチ埋め込みの丸め**(`core/leanblock.py` の `shrink_prologue`、`H3_LEAN_BLOCK` と一緒に入る)。transformer の
+   forward は `proj_in`(fp32 のまま残す層)の出力を全トークン分作って bf16 に丸めて詰めるが、丸める前の fp32 の方が
+   ローカル変数としてブロックのループ中ずっと残る(1024² で 0.68GB)。射影の出口で同じ丸めをしてから返すので値は
+   同じまま、残るのが半分になる。1024² 6.82 → **6.41GB**、768² 4.85 → **4.62GB**(MD5 一致)。
+10. **残差の in-place 更新**(同)。ブロック 2 以降は入力バッファに直接書く(各チャンクは自分の行を読み終えてから書く
+    ので結果は同じ。MD5 一致)。FBC はブロック 0 の入力と出力を参照するのでブロック 0・1 は新しいバッファに書き、
+    FBC が持つ残差 3 本(head_block_output / head_block_residual / tail_block_residuals、1024² で計 1.2GB)と合わせると
+    ピークはブロック 1 のまま → FBC 有効時の総合値は変わらない。`H3_CACHE=none` なら全ブロック in-place で 1 本下がる。
+11. **ヘッド分割の attention**(`H3_ATTN_HEAD_GROUPS`、既定 `auto`)。K・V・Q を 56 ヘッドの G 分割で順に作る(to_q/to_k/to_v
+    の重みの行スライス。torchao の Int8Tensor はストリーマが中身だけ GPU に置くので、中身をスライスして組み直す)。
+    各グループの attention 出力は全ヘッド分の 1 本(attn_out)に書き、出力射影はそこから全ヘッドまとめて行う。同時に
+    持つのが K・V の 2 本から attn_out + K/G + V/G になり、sage がカーネル内で作る K・V の写しも 1/G になる。
+    正規化と変調を G 回やり直すので遅い(G=4 +13%、G=8 +15〜35%、G=28 +70%)。**計算は同じだがビット一致はしない**:
+    GEMM の行数(7168/G)と attention カーネルのヘッド数が変わるとカーネル選択と加算順序が変わり、bf16 の最下位
+    ビットが動くことがある(sage は K の平均を引く前処理がヘッド数とトークン数の組み合わせで揃ったり揃わなかったり
+    する)。30 ステップで増幅されて別のサンプル相当の動画になる(基準との PSNR は 1024² 34.4dB / 768² 38.7dB。FBC の
+    有無の差が 34.2dB なので、既定で使っている FBC の近似と同程度の差で、品質低下ではない)。そのため **auto は G=1 で
+    収まるときは必ず G=1** を選び、収まらないときだけ 4 → 7 → 8 → 14 → 28 の順に空き VRAM(`H3_VRAM_LIMIT_GB` の上限も
+    見る)に入る最小の G を使う。G=4 固定で 1024² 5.09GB(16.7 秒/step、+8%)、G=8 固定で 1024² **4.79GB**(17.9 秒/step)、768² **3.95GB**
+    (8.8 秒/step)。5.8GB 上限で auto に任せると G=4 → 28 を選んで 4.79GB(26 秒/step)。ブロック単位の診断で一致した
+    組み合わせ(1024² の G=4)でも 30 ステップの実機出力は MD5 が変わったので、G>1 は常に「別サンプル」と考える。
+12. **FBC を切る**(`H3_CACHE=none`)。FBC の残差 3 本が消え、全ブロック in-place になる。G=8 と合わせて 1024²×5 秒の
+    デノイズが **3.03GB**(30 ステップ全部計算するので 23 秒/step。FBC 自体が別サンプル相当の近似なので出力は変わる)。
+
+| ピーク VRAM(同構成、総合値) | 〜8(午前) | 9〜10(MD5 一致、既定) | + ヘッド分割 G=8(別サンプル) | + `H3_CACHE=none` |
+|---|---:|---:|---:|---:|
+| 512²×5 秒 | 3.27GB | **2.90GB** | — | — |
+| 768²×5 秒 | 4.85GB | **4.62GB** | 3.95GB | — |
+| 1024²×5 秒 | 6.82GB | **6.41GB** | 4.79GB | 3.03GB |
+
+正確なまま(MD5 一致)では **512² 2.90GB / 768² 4.62GB / 1024² 6.41GB** が下限で、残りは K・V と残差ストリームと FBC の残差 3 本。
+ヘッド分割を許せば **1024²×5 秒が 6GB カード**に入る(auto が必要なときだけ使う)。`/api/status` の
+`group_stream_refiner` / `group_stream_vae` / `group_stream_units` / `ff_chunk` / `attn_q_chunk` / `lean_block` /
+`attn_head_groups` と、直近の forward が選んだ `lean_block_last`(トークン数・G・in-place の開始ブロック)で状態を
+確認できる(生成結果の JSON にも `lean_block_last` が入る)。
 
 `H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、
 24〜32GB級カードでは transformer 単体でも収まらない。`H3_LOWVRAM=group` は

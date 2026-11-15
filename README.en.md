@@ -62,7 +62,7 @@ steps. All speeds are on this box's **PCIe Gen3 x4 slot + sm_89 (4060 Ti) + SDPA
 
 | Config | t2i 768² | t2va 5s 768² | ref2i | i2va (image ref) | audio ref | 768×1344 5s |
 |---|---|---|---|---|---|---|
-| **Real RTX 4060 Ti 16GB, single** | ○ 498s / peak 7.4GB | ○ 25 min / 11.4GB (2026-11-15: denoise 4.85GB with `H3_TE_STREAM=1 H3_TE_DIET=1`, 6.82GB at 1024²) | ○ | ○ 39 min / 9.41GB | ○ 54 min / 11.96GB | ○ 66 min / 13.37GB (15.2GB real = ceiling) |
+| **Real RTX 4060 Ti 16GB, single** | ○ 498s / peak 7.4GB | ○ 25 min / 11.4GB (2026-11-15: 4.62GB with `H3_TE_STREAM=1 H3_TE_DIET=1`, 6.41GB at 1024²; 4.79GB with head-grouped attention, 3.03GB with `H3_CACHE=none`) | ○ | ○ 39 min / 9.41GB | ○ 54 min / 11.96GB | ○ 66 min / 13.37GB (15.2GB real = ceiling) |
 | **8GiB × 2** (compute + TE, ballast-simulated) | ○ 512s / 6.4GB | ○ 25.6 min / 7.23GB | ○ 17.7 min / 6.69GB | × OOM | × OOM | × OOM |
 | **12GB, single** | △ estimate | △ | △ | △ | close to × (14.7GB real) | × |
 | **48GB + 20GB** (two cards, turbo LoRA) | ○ 9.7s | ○ 44.2s | ○ | ○ | ○ | ○ |
@@ -90,8 +90,9 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 # Note: anything other than sm_120 requires H3_ATTN_BACKEND=default (the default sage is an sm_120-only build)
 
-# 6GB single (768² x 5 s, denoise 4.9GB) / 8GB single (1024² x 5 s, 6.8GB): the 2026-11-15 streaming and lean forward
-# (see "Where low VRAM stands"). Just add H3_TE_STREAM=1 H3_TE_DIET=1 to the 16GB line (the rest is on by default)
+# 6GB single (768² x 5 s 4.6GB; 1024² x 5 s 4.8GB with head-grouped attention chosen from the free VRAM) / 8GB single
+# (1024² 6.4GB, no grouping): the 2026-11-15 streaming and lean forward (see "Where low VRAM stands"). Just add
+# H3_TE_STREAM=1 H3_TE_DIET=1 to the 16GB line (the rest is on by default; H3_CACHE=none takes 1024² to 3.0GB)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 H3_TE_DIET=1 \
   H3_ATTN_BACKEND=default \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
@@ -926,9 +927,9 @@ resolution and length.
 | Activation peak incl. 1K (denoise phase, same configuration) | unchunked | `H3_FF_CHUNK=8192` |
 |---|---:|---:|
 | 768² × 5 s | 7.45 GB | **6.26 GB** |
-| 1024² × 5 s (126k tokens, 13.9 s/step) | 10.73 GB | **9.34 GB** |
+| 1024² × 5 s (38k tokens, 13.9 s/step) | 10.73 GB | **9.34 GB** |
 
-What remains is the attention's K and V (1.8 GB each at 1024²) plus the output and the residual stream, close to the
+What remains is the attention's K and V (0.55 GB each at 1024²) plus the output and the residual stream, close to the
 floor for an exact result.
 
 5. **Query-chunked attention** (`H3_ATTN_Q_CHUNK`, default 0 = off, `core/attnchunk.py`). K and V are built in full; the
@@ -940,7 +941,7 @@ That left 1024² × 5 s at 8.5 GB. Three more changes closed the gap (all MD5-id
 
 6. **A memory-lean block forward** (`H3_LEAN_BLOCK`, default `auto` = 8192 tokens in group mode, `core/leanblock.py`).
    The original forward materializes the norm1 output, the attention output, the norm2 output and the FF output for
-   all tokens (1.35 GB each at 1024²) before adding them. The lean version runs normalization → modulation →
+   all tokens (0.41 GB each at 1024²) before adding them. The lean version runs normalization → modulation →
    projections/attention/FF → gate → residual add in chunks, so the only full-length tensors are the input, the
    output, K and V. It subsumes 4 (FF chunking) and 5 (query chunking); recomputing the norm per chunk costs about 7%
    at 1024².
@@ -955,10 +956,51 @@ That left 1024² × 5 s at 8.5 GB. Three more changes closed the gap (all MD5-id
 | 768² × 5 s | 10.78 GB | 7.45 GB | **4.85 GB** |
 | 1024² × 5 s | 10.73 GB (denoise) | — | **6.82 GB** |
 
-What remains is the attention's K and V (1.8 GB each at 1024²), the input and output residual streams and the chunk
-transients: the floor for an exact result. **768² × 5 s now fits a 6 GB card and 1024² × 5 s an 8 GB card** (decode
-stays below the denoise peak with the streamed VAE). `/api/status` reports `group_stream_refiner`, `group_stream_vae`,
-`group_stream_units`, `ff_chunk`, `attn_q_chunk` and `lean_block`.
+That was the morning. In the afternoon the 1024² × 5 s breakdown was re-measured (`H3_LEAN_DEBUG=1` logs allocated / peak
+around blocks 0-2): 38,321 tokens (31,744 video + audio + text), one residual-stream buffer 0.41 GB, K and V 0.55 GB each,
+and the largest transient inside a block is the attention phase (K + V 1.1 GB + the int8 copies sage makes inside its
+kernel + the chunk). Four more changes:
+
+9. **Rounding the fp32 patch embeddings** (`shrink_prologue` in `core/leanblock.py`, installed together with
+   `H3_LEAN_BLOCK`). The transformer forward computes the `proj_in` output (a layer kept in fp32) for all tokens and
+   rounds it to bf16 when packing, but the fp32 version survives as a local variable for the whole block loop (0.68 GB at
+   1024²). Rounding at the projection's exit gives the same values with half the residency. 1024² 6.82 → **6.41 GB**,
+   768² 4.85 → **4.62 GB** (MD5 match).
+10. **In-place residual update** (same module). From block 2 on, each block writes into its input buffer (every chunk
+    finishes reading its own rows before writing them, so the result is the same; MD5 match). FBC references the input
+    and output of block 0, so blocks 0 and 1 write new buffers; together with the three residual tensors FBC keeps
+    (head_block_output / head_block_residual / tail_block_residuals, 1.2 GB in total at 1024²) the peak stays at block 1,
+    so the overall figure does not move with FBC on. With `H3_CACHE=none` every block is in place and one buffer is saved.
+11. **Head-grouped attention** (`H3_ATTN_HEAD_GROUPS`, default `auto`). K, V and Q are built for the 56 heads in G groups
+    (row slices of the to_q/to_k/to_v weights; the streamer keeps only the inner tensors of torchao's Int8Tensor on the
+    GPU, so the slice is rebuilt from them). Each group's attention output goes into one full-width buffer (attn_out) and
+    the output projection runs from it for all heads at once. The resident set goes from two buffers (K, V) to
+    attn_out + K/G + V/G, and the K/V copies sage makes inside its kernel shrink by G as well. Recomputing the norm and
+    modulation G times costs time (G=4 +13%, G=8 +15-35%, G=28 +70%). **Same math, but not bit-identical**: changing the
+    GEMM width (7168/G) and the head count seen by the attention kernel changes kernel selection and summation order,
+    so the last bf16 bit can move (sage's K-mean centering matches or not depending on the head count and token count).
+    Thirty steps amplify that into a different sample of the same video (PSNR against the baseline 34.4 dB at 1024²,
+    38.7 dB at 768²; FBC on vs off differs by 34.2 dB, so this is the same order as the FBC approximation that is on by
+    default, not a quality loss). Therefore **auto always picks G=1 when G=1 fits** and otherwise the smallest of
+    4 → 7 → 8 → 14 → 28 that fits the free VRAM (a `H3_VRAM_LIMIT_GB` cap is honored). Fixed G=4: 1024² 5.09 GB (16.7 s/step, +8%).
+    Fixed G=8: 1024² **4.79 GB** (17.9 s/step), 768² **3.95 GB** (8.8 s/step). Under a 5.8 GB cap, auto chose G=4 → 28 and
+    peaked at 4.79 GB (26 s/step). Even a combination that matched bit-for-bit in a single-block check (G=4 at 1024²) gave a
+    different MD5 after 30 real steps, so treat any G>1 as a different sample.
+12. **Turning FBC off** (`H3_CACHE=none`) drops the three FBC residuals and makes every block in place. With G=8 the
+    1024² × 5 s denoise peaks at **3.03 GB** (all 30 steps are computed, 23 s/step; FBC itself is an approximation, so the
+    output changes).
+
+| Peak VRAM (same configuration, overall) | up to 8 (morning) | 9-10 (MD5 match, default) | + head groups G=8 (different sample) | + `H3_CACHE=none` |
+|---|---:|---:|---:|---:|
+| 512² × 5 s | 3.27 GB | **2.90 GB** | — | — |
+| 768² × 5 s | 4.85 GB | **4.62 GB** | 3.95 GB | — |
+| 1024² × 5 s | 6.82 GB | **6.41 GB** | 4.79 GB | 3.03 GB |
+
+Exact (MD5-identical) results bottom out at **512² 2.90 GB / 768² 4.62 GB / 1024² 6.41 GB**; what remains is K and V, the residual stream
+and the three FBC residuals. Allowing head groups puts **1024² × 5 s on a 6 GB card** (auto uses them only when needed).
+`/api/status` reports `group_stream_refiner`, `group_stream_vae`, `group_stream_units`, `ff_chunk`, `attn_q_chunk`,
+`lean_block`, `attn_head_groups` and `lean_block_last` (token count, G and the first in-place block of the latest forward;
+the generation result JSON carries `lean_block_last` too).
 
 `H3_LOWVRAM=1` (48GB tier) loads the full transformer (34GB) onto the GPU every request,
 so it doesn't even fit alone on a 24-32GB-tier card. `H3_LOWVRAM=group` ports the

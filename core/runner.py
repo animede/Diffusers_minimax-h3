@@ -1609,6 +1609,15 @@ _H3_LEAN_BLOCK_RAW = os.environ.get("H3_LEAN_BLOCK", "auto").strip().lower()
 H3_LEAN_BLOCK = (8192 if H3_LOWVRAM_GROUP else 0) if _H3_LEAN_BLOCK_RAW == "auto" else int(_H3_LEAN_BLOCK_RAW)
 if H3_LEAN_BLOCK % 128:
     raise ValueError(f"H3_LEAN_BLOCK must be a multiple of 128, got {H3_LEAN_BLOCK}")
+# attention のヘッド分割数 (2026-11-15、core/leanblock.py)。K・V・Q をヘッド G 分割で順に作り、同時に持つ大きな
+# バッファを K・V の 2 本から attn_out + K/G + V/G にする(カーネル内部の K・V の写しも 1/G)。計算は同じだが、
+# カーネル選択が変わるので bf16 の最下位ビットは一致しないことがある(別サンプル相当の動画になる。品質は同等)。
+# 正規化と変調を G 回やり直すぶん遅い(G=4 +13%、G=8 +35%、G=28 +70〜140%)。auto = 空き VRAM に G=1 が
+# 収まらないときだけ、収まる最小の G(4 → 7 → 8 → 14 → 28)をブロック 0 で選ぶ。H3_LEAN_BLOCK が有効なときだけ意味を持つ。
+_H3_ATTN_HEAD_GROUPS_RAW = os.environ.get("H3_ATTN_HEAD_GROUPS", "auto").strip().lower()
+H3_ATTN_HEAD_GROUPS = 0 if _H3_ATTN_HEAD_GROUPS_RAW in ("", "auto") else int(_H3_ATTN_HEAD_GROUPS_RAW)
+if H3_ATTN_HEAD_GROUPS < 0:
+    raise ValueError(f"H3_ATTN_HEAD_GROUPS must be 'auto' or a positive integer, got {H3_ATTN_HEAD_GROUPS}")
 # own ストリーマの単位: block(1 ブロック 0.65GiB、常駐 2 つ)/ half(adaln_proj・attn・ff の 3 単位、常駐は小さい 2 つ)。
 H3_GROUP_STREAM_UNITS = os.environ.get("H3_GROUP_STREAM_UNITS", "half").strip().lower()
 if H3_GROUP_STREAM_UNITS not in ("block", "half"):
@@ -5087,6 +5096,17 @@ class MiniMaxH3Runner:
             low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
         )
 
+    def _lean_last(self):
+        """直近の forward で lean block が選んだ設定(トークン数・ヘッド分割数・in-place 開始ブロック)。"""
+        pipes = ((getattr(self, "_pipe_ref", None), "transformer_ref"), (getattr(self, "_pipe", None), "transformer"))
+        if getattr(self, "_active_variant", None) != "ref2va":
+            pipes = pipes[::-1]
+        for pipe, attr in pipes:
+            state = getattr(getattr(pipe, attr, None), "_h3_lean_state", None)
+            if state is not None and state.last:
+                return dict(state.last)
+        return None
+
     @staticmethod
     def _apply_ff_chunk(module, chunk: int) -> int:
         """各ブロックの feed-forward をトークン `chunk` 個ずつに分けて実行する(結果は同じ)。適用数を返す。"""
@@ -5231,8 +5251,11 @@ class MiniMaxH3Runner:
         if H3_LEAN_BLOCK:
             from core import leanblock
 
-            logger.info("transformer: lean block forward, %d tokens per chunk, on %d blocks (H3_LEAN_BLOCK)",
-                        H3_LEAN_BLOCK, leanblock.enable(self._pipe.transformer, H3_LEAN_BLOCK))
+            logger.info("transformer: lean block forward, %d tokens per chunk, head groups %s, on %d blocks "
+                        "(H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS)", H3_LEAN_BLOCK, _H3_ATTN_HEAD_GROUPS_RAW,
+                        leanblock.enable(self._pipe.transformer, H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS))
+            logger.info("transformer: patch embeddings rounded to %s at %s (no fp32 copies held during the blocks)",
+                        self._pipe.transformer.context_embedder.weight.dtype, leanblock.shrink_prologue(self._pipe.transformer))
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_ATTN_BACKEND:
@@ -5638,8 +5661,11 @@ class MiniMaxH3Runner:
         if H3_LEAN_BLOCK:
             from core import leanblock
 
-            logger.info("transformer_ref: lean block forward, %d tokens per chunk, on %d blocks (H3_LEAN_BLOCK)",
-                        H3_LEAN_BLOCK, leanblock.enable(self._pipe_ref.transformer_ref, H3_LEAN_BLOCK))
+            logger.info("transformer_ref: lean block forward, %d tokens per chunk, head groups %s, on %d blocks "
+                        "(H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS)", H3_LEAN_BLOCK, _H3_ATTN_HEAD_GROUPS_RAW,
+                        leanblock.enable(self._pipe_ref.transformer_ref, H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS))
+            logger.info("transformer_ref: patch embeddings rounded to %s at %s (no fp32 copies held during the blocks)",
+                        self._pipe_ref.transformer_ref.context_embedder.weight.dtype, leanblock.shrink_prologue(self._pipe_ref.transformer_ref))
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
         if H3_ATTN_BACKEND:
@@ -7391,12 +7417,14 @@ class MiniMaxH3Runner:
             "ff_chunk": H3_FF_CHUNK,
             "attn_q_chunk": H3_ATTN_Q_CHUNK,
             "lean_block": H3_LEAN_BLOCK,
+            "attn_head_groups": _H3_ATTN_HEAD_GROUPS_RAW if H3_LEAN_BLOCK else None,
             "group_stream_units": H3_GROUP_STREAM_UNITS if H3_LOWVRAM_GROUP else None,
             "group_stream_vae": (H3_GROUP_STREAM_VAE if getattr(self, "_vae_stream_decided", None) is None
                                  else ("on" if self._vae_stream_decided else "off")) if H3_LOWVRAM_GROUP else None,
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
             "attn_backend": H3_ATTN_BACKEND or "default",
+            "lean_block_last": self._lean_last() if H3_LEAN_BLOCK else None,
             "cache_mode": H3_CACHE if not H3_TURBO_LORA else "none (force-disabled by H3_TURBO_LORA)",
             "cache_threshold": H3_CACHE_THRESHOLD if (H3_CACHE == "fbc" and not H3_TURBO_LORA) else None,
             "turbo_lora": H3_TURBO_LORA,
@@ -8822,6 +8850,7 @@ class MiniMaxH3Runner:
             # "cache"/"turbo"/"attn_backend" below are the new, directly-machine-
             # readable equivalents.
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache_mode": instant["cache"] if not instant["turbo"] else "none (force-disabled by turbo=1)",
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
@@ -9186,6 +9215,7 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
@@ -10128,6 +10158,7 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache_mode": instant["cache"] if not instant["turbo"] else "none (force-disabled by turbo=1)",
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
@@ -10581,6 +10612,7 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
