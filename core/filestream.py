@@ -1,0 +1,392 @@
+"""ブロックの重みを RAM に常駐させず、safetensors から直接 GPU へ流す(`H3_GROUP_STREAM_HOST=file`、2026-11-15)。
+
+`core/blockstream.py`(pinned)は int8 transformer 全体(30GiB)をピン留めしたホスト RAM に置くので、
+RAM 48GB 級が前提になる。こちらは minimax-h3-image-server の `app/filestream.py` と同じ方式で、単位(ブロック、
+または adaln_proj / attn / ff の 1/3 ブロック)ごとに
+
+  量子化済みキャッシュ(safetensors) --(8 スレッドで 32MB ずつ並列 read)--> ピン留めした受け皿(2 本で交互)
+    --(copy stream で非同期 H2D)--> GPU
+
+と流す。読み込みは次の単位を先に始め(ディスクと GPU 計算を重ねる)、使い終わった GPU 側は参照を切るだけ
+(重みは不変なので書き戻しは無い)。モデル本体は `from_pretrained` の mmap のまま(RAM に展開しない)で、
+流す単位のテンソルは 0 要素のプレースホルダに差し替えて手放す。
+
+ページキャッシュの使い方: 読んだ範囲は OS のページキャッシュに残り、次のステップの read はそこから返る(速い)。
+全体がキャッシュに収まらない RAM では、巡回アクセスを LRU に任せると毎ステップ全部が押し出されて全量をディスクから
+読み直すことになるので、末尾の `drop` 単位だけは読み終えるたびに `posix_fadvise(DONTNEED)` で捨て、残りをキャッシュに
+留める(image server で実測済みの方式)。drop の数は auto で「原本 + 余裕 − 使える RAM」から決める。
+Windows には fadvise が無いので drop は効かない(`FILE_FLAG_SEQUENTIAL_SCAN` で開くだけ)。
+
+出力は pinned / 全常駐と同じ(同じ int8 の重みを同じ場所に置くだけ。MD5 一致を確認)。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import struct
+import sys
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+
+import torch
+
+from core.blockstream import _inner_names, _set, collect_slots
+
+logger = logging.getLogger("minimax_h3.filestream")
+
+_ALIGN = 4096            # 受け皿内のテンソル境界(dtype の view が取れるように整列)
+_CHUNK = 32 << 20        # 並列読みの単位(1 スレッド逐次だと 1.6GB/s、8 スレッド × 32MB で NVMe の上限まで出る、実測)
+_READ_THREADS = 8
+_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "U8": torch.uint8, "I8": torch.int8,
+           "I32": torch.int32, "I64": torch.int64, "F8_E4M3": torch.float8_e4m3fn, "BOOL": torch.bool}
+
+
+class FileRegion:
+    """ファイル内の 1 テンソル分の領域と GPU 側の形。"""
+    __slots__ = ("path", "offset", "nbytes", "dtype", "shape")
+
+    def __init__(self, path: Path, offset: int, nbytes: int, dtype: torch.dtype, shape: tuple[int, ...]):
+        self.path, self.offset, self.nbytes, self.dtype, self.shape = path, offset, nbytes, dtype, shape
+
+
+def safetensors_index(paths: list[Path]) -> dict[str, tuple[Path, int, int, torch.dtype | None, tuple]]:
+    """各ファイルのヘッダから {名前: (path, ファイル内オフセット, バイト数, dtype, shape)} を作る。"""
+    index = {}
+    for path in paths:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(n))
+        data0 = 8 + n
+        for k, v in header.items():
+            if k != "__metadata__":
+                index[k] = (path, data0 + v["data_offsets"][0], v["data_offsets"][1] - v["data_offsets"][0],
+                            _DTYPES.get(v["dtype"]), tuple(v["shape"]))
+    return index
+
+
+def slot_names(unit: torch.nn.Module, prefix: str) -> list[str | None]:
+    """`collect_slots(unit)` と同じ順序で、各スロットの safetensors 上の名前。torchao の wrapper の内側は
+    diffusers の直列化規則(`<module>.weight` → `<module>._weight_<inner>`)。名前が付けられないものは None。"""
+    names, seen = [], set()
+    for pname, p in unit.named_parameters(recurse=True):
+        if id(p) in seen:
+            continue
+        seen.add(id(p))
+        full = prefix + pname
+        inner = _inner_names(p)
+        if inner:
+            head, _, leaf = full.rpartition(".")
+            names += [f"{head}._{leaf}_{attr}" if head else f"_{leaf}_{attr}" for attr in inner]
+        else:
+            names.append(full)
+        qs = getattr(p, "quant_state", None)
+        if qs is not None:
+            # bitsandbytes の Params4bit: safetensors では `<weight>.absmax` / `<weight>.quant_map`。offset と
+            # 二重量子化の state2 には名前が無い(小さいので GPU に常駐)
+            for owner, nested in ((qs, False), (getattr(qs, "state2", None), True)):
+                if owner is None:
+                    continue
+                for attr in ("absmax", "code", "offset"):
+                    if isinstance(getattr(owner, attr, None), torch.Tensor):
+                        names.append(None if nested else {"absmax": full + ".absmax", "code": full + ".quant_map"}.get(attr))
+    for bname, _ in unit.named_buffers(recurse=True):
+        names.append(prefix + bname)
+    return names
+
+
+def host_cache_budget_gb() -> float:
+    """この後ページキャッシュに使える見込みのホスト RAM(GB)。MemAvailable と、cgroup の上限があれば
+    「上限 − このプロセスの匿名メモリ」の小さい方(cgroup の使用量はキャッシュ込みなので使わない)。"""
+    avail = _mem_available_gb()
+    try:
+        anon = _process_anon_gb()
+        rel = open("/proc/self/cgroup").read().strip().split(":", 2)[-1]
+        node = Path("/sys/fs/cgroup" + rel)
+        while True:
+            mx = node / "memory.max"
+            if mx.exists():
+                v = mx.read_text().strip()
+                if v != "max":
+                    avail = min(avail, int(v) / 2**30 - anon)
+            if node == Path("/sys/fs/cgroup") or node == node.parent:
+                break
+            node = node.parent
+    except (OSError, ValueError):
+        pass
+    return max(avail, 0.0)
+
+
+def _mem_available_gb() -> float:
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 2**30
+    except Exception:  # noqa: BLE001
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 2**20
+        except OSError:
+            pass
+    return 0.0
+
+
+def _process_anon_gb() -> float:
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("RssAnon:"):
+                return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return 0.0
+
+
+class _Reader:
+    """ファイルの指定範囲をピン留めバッファへ読む。32MB ずつ複数スレッドで並列に読む。"""
+
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(_READ_THREADS, thread_name_prefix="filestream-read")
+        self.local = threading.local()      # pread の無い OS(Windows)はスレッドごとに fd
+        self.shared: dict[Path, int] = {}
+        self.lock = threading.Lock()
+        self.has_pread = hasattr(os, "preadv")
+
+    def _open(self, path: Path) -> int:
+        flags = os.O_RDONLY
+        if sys.platform == "win32":
+            flags |= os.O_BINARY | getattr(os, "O_SEQUENTIAL", 0)
+        return os.open(str(path), flags)
+
+    def _fd(self, path: Path) -> int:
+        if self.has_pread:
+            with self.lock:
+                fd = self.shared.get(path)
+                if fd is None:
+                    fd = self.shared[path] = self._open(path)
+            return fd
+        return self._file(path).fileno()
+
+    def _file(self, path: Path):
+        files = getattr(self.local, "files", None)
+        if files is None:
+            files = self.local.files = {}
+        f = files.get(path)
+        if f is None:
+            f = files[path] = open(self._open(path), "rb", buffering=0)
+        return f
+
+    def _read_chunk(self, path: Path, mv: memoryview, offset: int) -> None:
+        got, n = 0, len(mv)
+        if self.has_pread:
+            fd = self._fd(path)
+        else:
+            f = self._file(path)
+        while got < n:
+            if self.has_pread:
+                k = os.preadv(fd, [mv[got:]], offset + got)
+            else:
+                f.seek(offset + got)
+                k = f.readinto(mv[got:])
+            if not k:
+                raise OSError(f"short read: {path.name} offset={offset} got={got}/{n}")
+            got += k
+
+    def read_unit(self, buf: torch.Tensor, plan: list, drop: bool) -> None:
+        """plan = [(slot, FileRegion, 受け皿内オフセット)] をまとめて並列に読む。drop なら読んだ範囲をキャッシュから捨てる。"""
+        mv = memoryview(buf.numpy())
+        futs = [self.pool.submit(self._read_chunk, r.path, mv[pos + c:pos + min(c + _CHUNK, r.nbytes)], r.offset + c)
+                for _, r, pos in plan for c in range(0, r.nbytes, _CHUNK)]
+        for f in futs:
+            f.result()
+        if drop and hasattr(os, "posix_fadvise"):
+            for _, r, _ in plan:
+                os.posix_fadvise(self._fd(r.path), r.offset, r.nbytes, os.POSIX_FADV_DONTNEED)
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=True)
+        for fd in self.shared.values():
+            os.close(fd)
+        self.shared.clear()
+
+
+class FileBlockStreamer:
+    """`units`(順に呼ばれるモジュール列)のテンソルを safetensors から受け皿経由で GPU へ流す。
+    `core/blockstream.BlockStreamer` と同じフック構成(root の forward 入口で先読み開始、各単位の pre/post hook)。
+
+    - root: forward の入口になるモジュール(transformer、または token_refiner)
+    - names_root: safetensors 上の名前の基準になるモジュール(transformer。単位のモジュールパスが名前の接頭辞)
+    - drop_units: 末尾の何単位を読むたびにキャッシュから捨てるか("auto" = 使える RAM からはみ出す分)
+    - reserve_gb: この後ホスト RAM に乗る見込みのもの(TE / VAE のピン留め等)。auto の予算から先に引く
+    """
+
+    def __init__(self, units, device, *, root: torch.nn.Module, names_root: torch.nn.Module, files: list[Path],
+                 label: str, drop_units: str | int = "auto", reserve_gb: float = 0.0, ring: int = 2):
+        self.units = list(units)
+        self.device = torch.device(device)
+        self.label = label
+        self.n = len(self.units)
+        index = safetensors_index(files)
+        mod_names = {id(m): nm for nm, m in names_root.named_modules()}
+        self.plans, self.masters, resident_bytes, missing, total = [], [], 0, [], 0
+        for unit in self.units:
+            prefix = mod_names[id(unit)] + "."
+            plan, masters, pos = [], [], 0
+            for (owner, attr, t), name in zip(collect_slots(unit), slot_names(unit, prefix)):
+                ent = index.get(name) if name else None
+                nb = t.numel() * t.element_size()
+                if ent is not None and t.numel() == 0:
+                    # 既にプレースホルダ(vaecache.detach_blocks など): 形と dtype はファイルの方を信じる
+                    region = FileRegion(ent[0], ent[1], ent[2], ent[3], ent[4])
+                elif ent is None or ent[2] != nb or ent[3] != t.dtype:
+                    _set(owner, attr, t.to(self.device))          # ファイルに無い(小さい)ものは GPU に常駐
+                    resident_bytes += nb
+                    if name:
+                        missing.append(name)
+                    continue
+                else:
+                    region = FileRegion(ent[0], ent[1], nb, t.dtype, tuple(t.shape))
+                nb = region.nbytes
+                plan.append(((owner, attr), region, pos))
+                masters.append(((owner, attr), torch.empty(0, dtype=region.dtype)))
+                _set(owner, attr, masters[-1][1])                  # mmap の原本を手放す
+                pos += (nb + _ALIGN - 1) // _ALIGN * _ALIGN
+            self.plans.append(plan)
+            self.masters.append(masters)
+            total += pos
+        if missing:
+            logger.warning("file streaming (%s): %d tensors not found in the files, kept on the GPU, e.g. %s",
+                           label, len(missing), missing[:3])
+        self.unit_bytes = max((plan[-1][2] + plan[-1][1].nbytes if plan else 0) for plan in self.plans) if self.plans else 0
+        self.unit_bytes = (self.unit_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
+        self.total_gb = total / 2**30
+        self.ring = max(2, int(ring))
+        self.drop_from = self.n - self._decide_drop(drop_units, reserve_gb)
+        self.reader = _Reader()
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"filestream-{label}")
+        # 受け皿は torch.empty(匿名メモリ)を cudaHostRegister でピン留めする(pin_memory() の cudaHostAlloc は
+        # cgroup に file として計上され、ページキャッシュの予算計算から漏れる、image server で実測)
+        self.bufs = []
+        for _ in range(self.ring):
+            buf = torch.empty(max(self.unit_bytes, _ALIGN), dtype=torch.uint8)
+            err = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), buf.numel(), 0)
+            if int(err) != 0:
+                raise RuntimeError(f"cudaHostRegister failed ({err}): not enough lockable host memory?")
+            self.bufs.append(buf)
+        self.buf_free: list[torch.cuda.Event | None] = [None] * self.ring
+        self.pending: dict[int, tuple[int, Future]] = {}
+        self.copy_stream = torch.cuda.Stream(self.device)
+        self.pinned_bytes = self.ring * self.unit_bytes
+        self._handles = []
+        for i, unit in enumerate(self.units):
+            self._handles.append(unit.register_forward_pre_hook(self._make_pre(i)))
+            self._handles.append(unit.register_forward_hook(self._make_post(i)))
+        self._handles.append(root.register_forward_pre_hook(self._begin))
+        self._wait = self._rt = self._t0 = 0.0
+        self._passes = 0
+        logger.info("file streaming (%s): %d units (%.2f GiB) read from %d files, staging %d x %.2f GiB pinned, "
+                    "drop %d units after use, resident %.2f GiB",
+                    label, self.n, self.total_gb, len(files), self.ring, self.unit_bytes / 2**30,
+                    self.n - self.drop_from, resident_bytes / 2**30)
+
+    def _decide_drop(self, drop_units, reserve_gb: float) -> int:
+        if self.n == 0:
+            return 0
+        per_unit = self.total_gb / self.n
+        if isinstance(drop_units, str) and drop_units.strip().lower() == "auto":
+            budget = host_cache_budget_gb()
+            margin = 1.0 + float(reserve_gb) + self.ring * self.unit_bytes / 2**30
+            k = int(math.ceil(max(0.0, self.total_gb + margin - budget) / max(per_unit, 1e-9)))
+            logger.info("file streaming (%s): page-cache budget %.1f GiB for %.1f GiB of weights (+%.1f GiB reserved) "
+                        "-> drop %d/%d units after use", self.label, budget, self.total_gb, margin, min(k, self.n), self.n)
+        else:
+            k = int(drop_units)
+        return min(max(k, 0), self.n)
+
+    # -- 読み込み ------------------------------------------------------------------
+    def _read_unit(self, i: int, b: int) -> None:
+        ev = self.buf_free[b]
+        if ev is not None:
+            ev.synchronize()           # この受け皿からの前回の H2D が終わるまで待つ
+        t = time.time()
+        self.reader.read_unit(self.bufs[b], self.plans[i], drop=i >= self.drop_from)
+        self._rt += time.time() - t
+
+    def prefetch(self, i: int) -> None:
+        if 0 <= i < self.n and i not in self.pending:
+            b = i % self.ring
+            self.pending[i] = (b, self.pool.submit(self._read_unit, i, b))
+
+    def _reset(self) -> None:
+        """新しい forward の入口: 前回の forward で消費されなかった先読み(FBC で飛んだ単位)を捨てる。"""
+        for _, fut in self.pending.values():
+            fut.result()
+        self.pending.clear()
+
+    # -- GPU へ ----------------------------------------------------------------------
+    def _load_to_gpu(self, i: int) -> None:
+        if i not in self.pending:
+            self.prefetch(i)
+        b, fut = self.pending.pop(i)
+        t = time.time()
+        fut.result()
+        self._wait += time.time() - t
+        if i == 0:
+            self._t0 = t
+        buf = self.bufs[b]
+        compute = torch.cuda.current_stream(self.device)
+        with torch.cuda.stream(self.copy_stream):
+            for (owner, attr), r, pos in self.plans[i]:
+                g = buf[pos:pos + r.nbytes].view(r.dtype).view(r.shape).to(self.device, non_blocking=True)
+                g.record_stream(compute)
+                _set(owner, attr, g)
+            ev = torch.cuda.Event()
+            ev.record(self.copy_stream)
+        self.buf_free[b] = ev
+        compute.wait_event(ev)
+
+    def _begin(self, _module, _args) -> None:
+        self._reset()
+        for i in range(min(self.ring - 1, self.n)):
+            self.prefetch(i)
+
+    def _make_pre(self, i: int):
+        def pre(_m, _args):
+            self._load_to_gpu(i)
+            self.prefetch(i + self.ring - 1)
+        return pre
+
+    def _make_post(self, i: int):
+        def post(_m, _args, _out):
+            for (owner, attr), placeholder in self.masters[i]:
+                _set(owner, attr, placeholder)      # GPU 側は参照が切れて解放(record_stream が再利用を守る)
+            if i == self.n - 1:
+                self._passes += 1
+                if self._passes <= 3 or self._passes % 50 == 0:
+                    logger.info("file streaming (%s) pass %d: %.2fs, %.2fs waiting for reads, %.0f ms/unit read",
+                                self.label, self._passes, time.time() - self._t0, self._wait,
+                                1000 * self._rt / max(self.n, 1))
+                self._wait = self._rt = 0.0
+        return post
+
+    def release(self) -> float:
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+        self.pool.shutdown(wait=True)
+        self.reader.close()
+        torch.cuda.synchronize(self.device)
+        cudart = torch.cuda.cudart()
+        for buf in self.bufs:
+            cudart.cudaHostUnregister(buf.data_ptr())
+        freed = self.pinned_bytes / 2**30
+        self.bufs = []
+        self.pinned_bytes = 0
+        return freed
+
+    def describe(self) -> dict:
+        return {"blocks": self.n, "host": "file", "weights_gib": round(self.total_gb, 2),
+                "staging_gib": round(self.ring * self.unit_bytes / 2**30, 2), "drop_units": self.n - self.drop_from}

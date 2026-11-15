@@ -92,7 +92,8 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 
 # 6GB single (768² x 5 s 4.6GB; 1024² x 5 s 4.8GB with head-grouped attention chosen from the free VRAM) / 8GB single
 # (1024² 6.4GB, no grouping): the 2026-11-15 streaming and lean forward (see "Where low VRAM stands"). Just add
-# H3_TE_STREAM=1 H3_TE_DIET=1 to the 16GB line (the rest is on by default; H3_CACHE=none takes 1024² to 3.0GB)
+# H3_TE_STREAM=1 H3_TE_DIET=1 to the 16GB line (the rest is on by default; H3_CACHE=none takes 1024² to 3.0GB).
+# Host RAM: 48GB+ pins the weights (fast); 32GB / 16GB PCs stream them from the quantized cache automatically (H3_GROUP_STREAM_HOST)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 H3_TE_DIET=1 \
   H3_ATTN_BACKEND=default \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
@@ -285,7 +286,7 @@ minimax-h3/
 | | Requirement |
 |---|---|
 | GPU | Minimum: a **single 16GB card** (all features, measured, slow) or **8GB×2** (up to t2i/t2va/ref2i). **48GB tier** recommended for comfortable use. Per-config measurements: "[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" at the top |
-| Host RAM | 64GB or more recommended (`H3_LOWVRAM=group` keeps ~34GB of int8 weights resident in RAM, so 48GB+ free is needed) |
+| Host RAM | 64GB or more recommended for pinned weights (`H3_LOWVRAM=group` keeps ~34GB of int8 weights resident in RAM, so 48GB+ free is needed); below 48GB the weights are streamed from the quantized cache instead (`H3_GROUP_STREAM_HOST=file`, 1K at the same speed on 32GB, slower at 512²) |
 | Disk | About 145GB (T2VA/FL2VA only) / about 207GB (if Ref2VA is also used) |
 | CUDA | 12.8 series (to match torch 2.9.0+cu128). If building SageAttention, `nvcc` must also be the same series |
 | Python | 3.12 |
@@ -982,7 +983,8 @@ kernel + the chunk). Four more changes:
     Thirty steps amplify that into a different sample of the same video (PSNR against the baseline 34.4 dB at 1024²,
     38.7 dB at 768²; FBC on vs off differs by 34.2 dB, so this is the same order as the FBC approximation that is on by
     default, not a quality loss). Therefore **auto always picks G=1 when G=1 fits** and otherwise the smallest of
-    4 → 7 → 8 → 14 → 28 that fits the free VRAM (a `H3_VRAM_LIMIT_GB` cap is honored). Fixed G=4: 1024² 5.09 GB (16.7 s/step, +8%).
+    4 → 7 → 8 → 14 → 28 that fits the free VRAM (a `H3_VRAM_LIMIT_GB` cap is honored; decided at the first forward of a
+    generation and kept for that generation, after reserving FBC's three residuals and 1 GiB of slack). Fixed G=4: 1024² 5.09 GB (16.7 s/step, +8%).
     Fixed G=8: 1024² **4.79 GB** (17.9 s/step), 768² **3.95 GB** (8.8 s/step). Under a 5.8 GB cap, auto chose G=4 → 28 and
     peaked at 4.79 GB (26 s/step). Even a combination that matched bit-for-bit in a single-block check (G=4 at 1024²) gave a
     different MD5 after 30 real steps, so treat any G>1 as a different sample.
@@ -1001,6 +1003,77 @@ and the three FBC residuals. Allowing head groups puts **1024² × 5 s on a 6 GB
 `/api/status` reports `group_stream_refiner`, `group_stream_vae`, `group_stream_units`, `ff_chunk`, `attn_q_chunk`,
 `lean_block`, `attn_head_groups` and `lean_block_last` (token count, G and the first in-place block of the latest forward;
 the generation result JSON carries `lean_block_last` too).
+
+### PCs with 32 GB / 16 GB of host RAM: streaming the weights straight from the files (`H3_GROUP_STREAM_HOST=file`, 2026-11-15)
+
+Everything above keeps the whole int8 transformer (30 GiB) in pinned host RAM, which assumes a 48 GB-class machine.
+`H3_GROUP_STREAM_HOST=file` (`core/filestream.py`, the same scheme as minimax-h3-image-server's `app/filestream.py`) reads
+each unit (a third of a block) from the prequantized cache (safetensors; `from_pretrained` maps the files, so nothing is
+expanded into RAM) with 8 threads in 32 MB chunks into a small pinned staging ring (3 × 0.24 GiB, two units of read-ahead)
+and copies from there to the GPU. The only mandatory host RAM is that ring plus the token_refiner's (2 × 0.36 GiB); whatever
+else fits in the OS page cache makes it faster. The tail units that do not fit the cache are dropped with
+`posix_fadvise(DONTNEED)` after every read so the cyclic access does not flush everything through LRU (the number is `auto`:
+weights + the TE / VAE pinning that comes later − usable RAM, honoring a cgroup limit). In file mode the VAE decoder's
+streaming source is not pinned either (the fp16 copy is used as is). The int8 weights are the same, so the output is the same.
+
+- `H3_GROUP_STREAM_HOST`: `auto` (default: file when the installed RAM is below `H3_GROUP_STREAM_FILE_BELOW_GB` = 48 GB),
+  `pinned`, `file`. Falls back to pinned when the weights were quantized from bf16 at load (no cache file to read).
+  `H3_GROUP_STREAM_DROP_UNITS` (auto / a number), `H3_GROUP_STREAM_RING` (staging buffers, default 3). `/api/status` reports
+  `group_stream_host` / `group_stream_file`.
+- Windows has no `fadvise`, so the drop control does not apply (reading itself works, opened with
+  `FILE_FLAG_SEQUENTIAL_SCAN`; the same scheme was verified on the image server's RTX 3050 / 16 GB RAM machine).
+
+Measured on GPU0 of the 48 GB machine with the RAM limit emulated by a cgroup and the cache's page cache dropped before
+each run (this machine's NVMe reads 3.3 GB/s directly; every output is MD5-identical to pinned):
+
+| Where the weights live | Mandatory host RAM | 512² × 5 s | 1024² × 5 s | Notes |
+|---|---:|---:|---:|---|
+| pinned (reference) | about 38 GiB (transformer 30 + refiner 1.4 + TE 1.9 + VAE 4.5) | 2.98 s/step | 15.1 s/step | VRAM 2.90 / 6.41 GB |
+| file, no RAM limit (warm cache) | about 8 GiB | 3.11 s/step | — | VRAM 2.49 GB (one less unit prefetched on the GPU) |
+| file, 28 GB RAM cap (a 32 GB PC) | same | 6.1 s/step | **14.7 s/step** | 94 of 150 units read from disk; at 1K the reads hide behind compute |
+| file, 16 GB RAM cap | same | 8.0 s/step | — | all 150 units read from disk (30 GiB/step), MD5 match |
+| file, 12 GB RAM cap (a 16 GB PC), VAE and TE from files too (below) | about 2 GiB | 8.0 s/step | **15.4 s/step** | MD5 match; the VAE is pinned only during the decode when RAM allows |
+
+At 1K the reads (worst case 30 GiB/step ÷ 3.3 GB/s ≈ 9 s) hide behind 15 s of compute, so it is as fast as pinned; 512² is
+read-bound and takes about twice as long. **A 32 GB PC runs 1024² × 5 s at the pinned speed, and a 16 GB PC runs 1K too** (speed depends on the disk's sequential
+read speed). In the first 12 GB-cap test the process's anonymous memory reached about 12 GB right before the decode (`proc_anon_gb`:
+the fp16 copy of the VAE 4.8, staging 1.6, the TE's pinned layers 1.9-2.4, baseline 0.6, plus the decode's frame buffers).
+The two remaining pieces were moved to the same scheme, and 1K now runs with 16 GB of RAM:
+
+- **An fp16 cache of the VAE decoder** (`core/vaecache.py`, `models/prequant/vae_decoder_fp16/`, 4.5 GiB, written once in
+  2 s). In file mode the decoder blocks are not cast to fp16 at startup (that copy was 4.8 GiB of anonymous memory); they
+  become 0-element placeholders. At decode time the free RAM decides: **with 4.5 GiB + 2 GiB available the cache is read
+  into pinned memory in 1.4 s and kept only for that decode** (same speed as pinned); otherwise it is streamed from the
+  file per tile (1K decode 48 → 95 s). The pinned copy is released afterwards. The values are the same rounding as
+  `vae.to(float16)`, so the output is unchanged.
+- **A quantized cache of the projection TE** (`H3_TE_PROJ_PREQUANT=1`, default, `models/prequant/te_proj_<model>_bnb-4bit/`).
+  The bnb-4bit TE is saved once (2 s) and loaded from there afterwards (on this machine the load takes the same 9-10 s as
+  quantizing from bf16, but it reads 2.2 GB of nf4 instead of 8 GB of bf16, which matters on a slow disk). In file mode its 36 LM layers (1.9 GiB) are streamed straight from that file instead of being
+  pinned (staging 2 × 0.06 GiB).
+
+With that, **1024² × 5 s completes under the 12 GB cap** (a 16 GB PC): 15.4 s/step, decode 97 s streamed from the file,
+MD5 match; 768² runs at 8.3 s/step (the VAE is pinned for the decode, 30 s; MD5 match). The mandatory host RAM is the staging ring plus the TE's
+(about 1 GiB) and the process itself, about 2 GiB in total.
+
+#### VRAM class × host RAM class at a glance (t2va 5 s, 30 steps, the default low-VRAM configuration)
+
+Speeds are seconds per step on this machine (RTX PRO 5000); an RTX 3050 takes several times longer. ○ = fits with
+MD5-identical output, △ = fits with head groups (a different sample) or `H3_CACHE=none`, ✗ = does not fit.
+
+| VRAM \ host RAM | 16 GB (file, every unit from disk) | 32 GB (file, part from disk) | 48 GB+ (pinned) |
+|---|---|---|---|
+| **6 GB** | 512² ○ 8.0 / 768² ○ 8.3. 1K △ about 17 (head groups; decode streamed from the file, 97 s) | 512² ○ 6.1 / 768² ○ 7.1. 1K △ 16.8 (auto picks G=4, 4.4 GB) | 512² ○ 3.0 / 768² ○ 7.1. 1K △ (head groups 4.8 GB, `H3_CACHE=none` 3.0 GB) |
+| **8 GB** | same; 1K ○ 15.4 (5.8 GB, decode 97 s) | same; 1K ○ 14.7 (5.8 GB) | same; 1K ○ 15.1 (6.4 GB) |
+| **12-16 GB** | same | same; with 8 GB+ of free VRAM the VAE is not streamed and the decode is faster (768²: 31 → about 11 s) | same |
+| **24 GB+** | same | the earlier tables (`H3_LOWVRAM=1` family) also apply | same |
+
+- VRAM decides what fits: 512² (2.9 GB) and 768² (4.6 GB) fit 6 GB; 1K stays MD5-identical on 8 GB (pinned 6.4 GB /
+  file 5.8 GB) and needs head groups (auto uses them only when required) or `H3_CACHE=none` on 6 GB.
+- Host RAM decides the speed: 48 GB+ pins the weights and is fastest, 32 GB runs 768² and 1K at the same speed and 512²
+  at 2×, 16 GB runs 512² at 2.7× and 768² at 1.1×, and 1K runs as well (the VAE and the TE are streamed from files too).
+- File mode prefetches one unit less on the GPU, so the VRAM peak drops too (512² 2.49 / 768² 3.71 / 1K 5.76 GB).
+  Whether the streamed VAE decoder is pinned in file mode is `H3_GROUP_STREAM_VAE_PIN` (auto = RAM 24 GB+; without it
+  the 768² decode goes 31 → 53 s).
 
 `H3_LOWVRAM=1` (48GB tier) loads the full transformer (34GB) onto the GPU every request,
 so it doesn't even fit alone on a 24-32GB-tier card. `H3_LOWVRAM=group` ports the

@@ -96,30 +96,59 @@ def slots_bytes(module: torch.nn.Module) -> int:
 class BlockStreamer:
     """`blocks`(順に呼ばれる nn.ModuleList)をピン留めしたホスト RAM に置き、window 個先読みで GPU へ流す。"""
 
-    def __init__(self, blocks, device, *, window: int = 2, root: torch.nn.Module | None = None):
+    def __init__(self, blocks, device, *, window: int = 2, root: torch.nn.Module | None = None, pin: bool = True,
+                 source_files=None, names_root: torch.nn.Module | None = None):
+        """source_files / names_root: ブロックのテンソルが 0 要素のプレースホルダ(core/vaecache.detach_blocks)のとき、
+        safetensors からピン留めバッファへ直接読んで原本にする(デコードの間だけピン留めし、release() で元に戻す)。"""
         self.blocks = list(blocks)
         self.device = torch.device(device)
         self.window = max(1, int(window))
+        self.pin = bool(pin)
+        self._from_files = None
+        if source_files:
+            from core import filestream
+
+            index = filestream.safetensors_index(list(source_files))
+            mod_names = {id(m): nm for nm, m in names_root.named_modules()}
+            self._from_files = (index, mod_names, filestream._Reader())
         self.copy_stream = torch.cuda.Stream(self.device)
         self.events: list[torch.cuda.Event | None] = [None] * len(self.blocks)
         self.masters: list[list[tuple[object, str, torch.Tensor]]] = []
         self._pinned: list[torch.Tensor] = []
         self._handles = []
         self.pinned_bytes = 0
+        self.pageable_bytes = 0
+        self._placeholders: list[tuple[object, str, torch.Tensor]] = []
         for block in self.blocks:
-            self.masters.append(self._pin_block(block))
+            self.masters.append(self._pin_block(block) if self.pin else self._pageable_block(block))
         for i, block in enumerate(self.blocks):
             self._handles.append(block.register_forward_pre_hook(self._make_pre(i)))
             self._handles.append(block.register_forward_hook(self._make_post(i)))
         if root is not None:
             self._handles.append(root.register_forward_pre_hook(self._begin))
-        logger.info("block streamer: %d blocks, %.2f GiB pinned, window %d, device %s",
-                    len(self.blocks), self.pinned_bytes / 1024**3, self.window, self.device)
+        logger.info("block streamer: %d blocks, %.2f GiB %s, window %d, device %s",
+                    len(self.blocks), (self.pinned_bytes if self.pin else self.pageable_bytes) / 1024**3,
+                    "pinned" if self.pin else "pageable host memory (not pinned)", self.window, self.device)
 
     # -- host memory ----------------------------------------------------------------------
     def _pin_block(self, block: torch.nn.Module):
         slots = collect_slots(block)
-        sizes = [t.numel() * t.element_size() for _, _, t in slots]
+        regions = None
+        if self._from_files is not None:
+            from core import filestream
+
+            index, mod_names, _ = self._from_files
+            prefix = mod_names[id(block)] + "."
+            regions = []
+            for (owner, attr, t), name in zip(slots, filestream.slot_names(block, prefix)):
+                ent = index.get(name) if name else None
+                if t.numel() == 0 and ent is not None:
+                    regions.append(filestream.FileRegion(ent[0], ent[1], ent[2], ent[3], ent[4]))
+                else:
+                    regions.append(None)
+            sizes = [(r.nbytes if r is not None else t.numel() * t.element_size()) for (_, _, t), r in zip(slots, regions)]
+        else:
+            sizes = [t.numel() * t.element_size() for _, _, t in slots]
         offsets, total = [], 0
         for size in sizes:
             offsets.append(total)
@@ -131,14 +160,37 @@ class BlockStreamer:
         self._pinned.append(buffer)
         self.pinned_bytes += buffer.numel()
         masters = []
-        for (owner, attr, t), offset, size in zip(slots, offsets, sizes):
+        plan = []
+        for k, ((owner, attr, t), offset, size) in enumerate(zip(slots, offsets, sizes)):
+            region = regions[k] if regions is not None else None
+            if region is not None:
+                view = buffer[offset:offset + size].view(region.dtype).view(region.shape)
+                plan.append(((owner, attr), region, offset))
+                self._placeholders.append((owner, attr, t))
+            else:
+                src = t.detach()
+                if src.device.type != "cpu":
+                    src = src.cpu()
+                view = buffer[offset:offset + size].view(src.dtype).view(src.shape)
+                view.copy_(src.contiguous())
+            _set(owner, attr, view)          # 元の CPU テンソルはここで参照が切れる
+            masters.append((owner, attr, view))
+        if plan:
+            self._from_files[2].read_unit(buffer, plan, drop=False)   # ファイルから直接ピン留めバッファへ
+        return masters
+
+    def _pageable_block(self, block: torch.nn.Module):
+        """pin=False: 今の CPU テンソル(連続化だけする)をそのまま原本にする。ピン留めしないので H2D は同期的になるが、
+        RAM の少ない PC では二重持ち(fp16 の写し + ピン留め)を避けられる(`H3_GROUP_STREAM_HOST=file` の VAE 用)。"""
+        masters = []
+        for owner, attr, t in collect_slots(block):
             src = t.detach()
             if src.device.type != "cpu":
                 src = src.cpu()
-            view = buffer[offset:offset + size].view(src.dtype).view(src.shape)
-            view.copy_(src.contiguous())
-            _set(owner, attr, view)          # 元の CPU テンソルはここで参照が切れる
-            masters.append((owner, attr, view))
+            src = src.contiguous()
+            _set(owner, attr, src)
+            masters.append((owner, attr, src))
+            self.pageable_bytes += src.numel() * src.element_size()
         return masters
 
     def release(self) -> float:
@@ -146,6 +198,12 @@ class BlockStreamer:
         for h in self._handles:
             h.remove()
         self._handles.clear()
+        torch.cuda.synchronize(self.device)
+        for owner, attr, placeholder in self._placeholders:   # ファイルから読んだ分はプレースホルダに戻す(RAM を返す)
+            _set(owner, attr, placeholder)
+        self._placeholders.clear()
+        if self._from_files is not None:
+            self._from_files[2].close()
         cudart = torch.cuda.cudart()
         for buffer in self._pinned:
             cudart.cudaHostUnregister(buffer.data_ptr())
@@ -190,6 +248,9 @@ class BlockStreamer:
         return post
 
     def describe(self) -> dict:
+        if not self.pin:
+            return {"blocks": len(self.blocks), "window": self.window, "host": "pageable",
+                    "pageable_gib": round(self.pageable_bytes / 1024**3, 2)}
         return {"blocks": len(self.blocks), "window": self.window,
                 "pinned_gib": round(self.pinned_bytes / 1024**3, 2)}
 

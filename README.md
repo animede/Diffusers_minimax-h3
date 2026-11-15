@@ -92,7 +92,8 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 
 # 6GB 単体(768²×5 秒 4.6GB、1024²×5 秒は空きに応じて attention をヘッド分割して 4.8GB)/ 8GB 単体(1024² 6.4GB、分割なし)。
 # 2026-11-15 のストリーミングとメモリ節約版 forward(下の「低 VRAM の到達点」)。上の 16GB の行に
-# H3_TE_STREAM=1 H3_TE_DIET=1 を足すだけ(残りは既定で有効。さらに下げるなら H3_CACHE=none で 1024² 3.0GB)
+# H3_TE_STREAM=1 H3_TE_DIET=1 を足すだけ(残りは既定で有効。さらに下げるなら H3_CACHE=none で 1024² 3.0GB)。
+# ホスト RAM は 48GB 以上でピン留め(速い)、32GB / 16GB の PC では自動で量子化キャッシュから直接流す(H3_GROUP_STREAM_HOST)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 H3_TE_DIET=1 \
   H3_ATTN_BACKEND=default \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
@@ -365,7 +366,7 @@ venv/bin/python scripts/download_t2va.py
 | 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒(2026-11-15 の自作ストリーマで denoise は約 1.7 倍速、下の `H3_GROUP_STREAM`) |
 | 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
 | **16GB 単体**(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / 約25分※ |
-| **6GB 単体 / 8GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 768²: 4.62GB / 1024²: 6.41GB(MD5 一致の既定。48GB 機で 272 / 552 秒)。空きが足りないときは attention をヘッド分割して 1024² 4.79GB(別サンプル相当、+15%)、`H3_CACHE=none` なら 3.03GB。Gen3 x4 の箱では上の※と同じ転送律速 |
+| **6GB 単体 / 8GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 768²: 4.62GB / 1024²: 6.41GB(MD5 一致の既定。48GB 機で 272 / 552 秒)。空きが足りないときは attention をヘッド分割して 1024² 4.79GB(別サンプル相当、+15%)、`H3_CACHE=none` なら 3.03GB。ホスト RAM 32GB / 16GB は量子化キャッシュから直接流す(1K は同速、512² は約 2 倍)。Gen3 x4 の箱では上の※と同じ転送律速 |
 | **12GB 単体**(見込み・未実測) | 16GB 単体と同じ | 実ピーク11.4GBが12GiBに入る計算。参照系・768×1344は不可 |
 | **8GB×2**(バラスト実測) | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB / 約25.6分※ |
 
@@ -893,7 +894,7 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
     する)。30 ステップで増幅されて別のサンプル相当の動画になる(基準との PSNR は 1024² 34.4dB / 768² 38.7dB。FBC の
     有無の差が 34.2dB なので、既定で使っている FBC の近似と同程度の差で、品質低下ではない)。そのため **auto は G=1 で
     収まるときは必ず G=1** を選び、収まらないときだけ 4 → 7 → 8 → 14 → 28 の順に空き VRAM(`H3_VRAM_LIMIT_GB` の上限も
-    見る)に入る最小の G を使う。G=4 固定で 1024² 5.09GB(16.7 秒/step、+8%)、G=8 固定で 1024² **4.79GB**(17.9 秒/step)、768² **3.95GB**
+    見る)に入る最小の G を使う(生成の最初の forward で決めて、その生成の間は固定。FBC の残差 3 本と 1GiB の余裕を先に引く)。G=4 固定で 1024² 5.09GB(16.7 秒/step、+8%)、G=8 固定で 1024² **4.79GB**(17.9 秒/step)、768² **3.95GB**
     (8.8 秒/step)。5.8GB 上限で auto に任せると G=4 → 28 を選んで 4.79GB(26 秒/step)。ブロック単位の診断で一致した
     組み合わせ(1024² の G=4)でも 30 ステップの実機出力は MD5 が変わったので、G>1 は常に「別サンプル」と考える。
 12. **FBC を切る**(`H3_CACHE=none`)。FBC の残差 3 本が消え、全ブロック in-place になる。G=8 と合わせて 1024²×5 秒の
@@ -910,6 +911,74 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
 `group_stream_refiner` / `group_stream_vae` / `group_stream_units` / `ff_chunk` / `attn_q_chunk` / `lean_block` /
 `attn_head_groups` と、直近の forward が選んだ `lean_block_last`(トークン数・G・in-place の開始ブロック)で状態を
 確認できる(生成結果の JSON にも `lean_block_last` が入る)。
+
+### ホスト RAM 32GB / 16GB の PC: 重みをファイルから直接流す(`H3_GROUP_STREAM_HOST=file`、2026-11-15)
+
+ここまでの low VRAM 構成は int8 transformer 全体(30GiB)をピン留めしたホスト RAM に置くので、RAM 48GB 級が前提だった。
+`H3_GROUP_STREAM_HOST=file`(`core/filestream.py`。minimax-h3-image-server の `app/filestream.py` と同じ方式)は、
+量子化済みキャッシュ(safetensors、`from_pretrained` が mmap で読むので RAM に展開されない)から単位(ブロックの 1/3)ごとに
+8 スレッドで 32MB ずつ並列に読み、ピン留めした受け皿(3 本 × 0.24GiB、2 単位先読み)経由で GPU へ流す。必須のホスト RAM は
+その受け皿と token_refiner の受け皿(2 × 0.36GiB)だけで、残りは OS のページキャッシュに乗る分だけ速くなる。
+キャッシュに収まらない末尾の単位は読むたびに `posix_fadvise(DONTNEED)` で捨て、巡回アクセスで全部が LRU に押し出される
+のを防ぐ(捨てる数は auto: 「原本 + この後ピン留めする TE / VAE の分 − 使える RAM(cgroup の上限も見る)」)。
+file のときは VAE デコーダの流し元もピン留めしない(fp16 の写しをそのまま使う)。重みは同じ int8 なので出力は同じ。
+
+- `H3_GROUP_STREAM_HOST`: `auto`(既定。搭載 RAM が `H3_GROUP_STREAM_FILE_BELOW_GB` = 48GB 未満なら file)/ `pinned` / `file`。
+  bf16 原本から量子化した(キャッシュが無い)ときは pinned に落ちる。`H3_GROUP_STREAM_DROP_UNITS`(auto / 数)、
+  `H3_GROUP_STREAM_RING`(受け皿の本数、既定 3)。`/api/status` の `group_stream_host` / `group_stream_file`。
+- Windows は `fadvise` が無いので捨てる制御は効かない(読み自体は `FILE_FLAG_SEQUENTIAL_SCAN` で動く。画像サーバの
+  RTX 3050 / RAM 16GB 機で実証した方式)。
+
+実測(48GB 機の GPU0、RAM の上限を cgroup で模擬し、量子化キャッシュのページキャッシュを捨ててから開始。この機の
+NVMe は直読み 3.3GB/s。出力はすべて pinned と MD5 一致):
+
+| 原本の置き場所 | 必須ホスト RAM | 512²×5 秒 | 1024²×5 秒 | 備考 |
+|---|---:|---:|---:|---|
+| pinned(参考) | 約 38GiB(transformer 30 + refiner 1.4 + TE 1.9 + VAE 4.5) | 2.98 秒/step | 15.1 秒/step | VRAM 2.90 / 6.41GB |
+| file、RAM 制限なし(キャッシュ温) | 約 8GiB | 3.11 秒/step | — | VRAM 2.49GB(GPU の先読みが 1 単位少ない) |
+| file、RAM 28GB 上限(32GB 機相当) | 同上 | 6.1 秒/step | **14.7 秒/step** | 150 単位中 94 をディスク直読み。1K は読みが計算に隠れる |
+| file、RAM 16GB 上限 | 同上 | 8.0 秒/step | — | 全 150 単位をディスク直読み(30GiB/step)、MD5 一致 |
+| file、RAM 12GB 上限(16GB 機相当)、VAE・TE もファイルから(下記) | 約 2GiB | 8.0 秒/step | **15.4 秒/step** | MD5 一致。VAE は空き RAM があればデコードの間だけピン留め |
+
+1K では読み(最悪 30GiB/step ÷ 3.3GB/s ≈ 9 秒)が 15 秒の計算に隠れて pinned と同じ速さ、512² は読み律速で約 2 倍かかる。
+**RAM 32GB の PC で 1024²×5 秒が pinned と同速、RAM 16GB でも 1K まで通る**(速度はディスクの連続読み出し速度に依存)。
+最初の 12GB 上限の試験では、デコードの直前にプロセスの匿名メモリが約 12GB に達して落ちた(`proc_anon_gb` の内訳:
+VAE の fp16 の写し 4.8、受け皿 1.6、TE の層のピン留め 1.9〜2.4、基本 0.6、デコードのフレームバッファ)。残っていた 2 つも
+同じ方式に乗せて、RAM 16GB 相当で 1K を通した:
+
+- **VAE デコーダの fp16 キャッシュ**(`core/vaecache.py`、`models/prequant/vae_decoder_fp16/`、4.5GiB、初回に 2 秒で作る)。
+  file モードでは起動時にデコーダブロックを fp16 に写さず(写しが 4.8GiB の匿名メモリだった)、ブロックを 0 要素の
+  プレースホルダにしておく。デコードのときは空き RAM を見て、**4.5GiB + 2GiB あればキャッシュからピン留めに 1.4 秒で
+  読み込み、デコードの間だけ持つ**(pinned と同じ速さ)。無ければタイルごとにファイルから流す(1K のデコード 48 → 95 秒)。
+  終わったらピン留めを返す。値は `vae.to(float16)` と同じ丸めなので出力は同じ。
+- **投影 TE の量子化済みキャッシュ**(`H3_TE_PROJ_PREQUANT=1`、既定。`models/prequant/te_proj_<model>_bnb-4bit/`)。
+  bnb-4bit の TE を一度だけ保存し(2 秒)、次回から読む(ロードはこの機では bf16 からの量子化と同じ 9〜10 秒だが、読む量が
+  bf16 8GB から nf4 2.2GB になるのでディスクの遅い PC で効く)。
+  file モードでは LM 層 36 本(1.9GiB)をこのファイルから直接流し、ピン留めしない(受け皿 2 × 0.06GiB)。
+
+これで 12GB 上限(16GB 機相当)でも **1024²×5 秒が完走**(15.4 秒/step、デコードはファイル流しで 97 秒、MD5 一致)、
+768² も 8.3 秒/step(VAE をデコードの間だけピン留めしてデコード 30 秒、MD5 一致)。必須のホスト RAM は受け皿 3 本 + TE の受け皿 2 本の約 1GiB と
+プロセス本体で、約 2GiB。
+
+#### VRAM 級 × ホスト RAM 級の早見表(t2va 5 秒・30 ステップ、既定の低 VRAM 構成)
+
+速度はこの機(RTX PRO 5000)の秒/step。RTX 3050 などではその数倍かかる。○ = MD5 一致のまま入る、△ = ヘッド分割
+(別サンプル相当)か `H3_CACHE=none` で入る、✗ = 入らない。
+
+| VRAM \ ホスト RAM | 16GB(file、全単位をディスクから) | 32GB(file、一部をディスクから) | 48GB 以上(pinned) |
+|---|---|---|---|
+| **6GB** | 512² ○ 8.0 / 768² ○ 8.3。1K △ 約 17(ヘッド分割、デコードはファイル流しで 97 秒) | 512² ○ 6.1 / 768² ○ 7.1。1K △ 16.8(auto が G=4 を選び 4.4GB) | 512² ○ 3.0 / 768² ○ 7.1。1K △(ヘッド分割で 4.8GB、`H3_CACHE=none` で 3.0GB) |
+| **8GB** | 同上。1K ○ 15.4(5.8GB、デコード 97 秒) | 同上。1K ○ 14.7(5.8GB) | 同上。1K ○ 15.1(6.4GB) |
+| **12〜16GB** | 同上 | 同上。空き VRAM が 8GB 以上なら VAE を流さずデコードが速い(768² 31 → 11 秒級) | 同上 |
+| **24GB 以上** | 同上 | 従来の表(`H3_LOWVRAM=1` 系)も選べる | 同左 |
+
+- VRAM が決めるのは「何が入るか」: 512²(2.9GB)と 768²(4.6GB)は 6GB で入り、1K は 8GB なら MD5 一致のまま
+  (pinned 6.4GB / file 5.8GB)、6GB ではヘッド分割(auto が必要なときだけ使う)か `H3_CACHE=none`。
+- ホスト RAM が決めるのは「速さ」: 48GB 以上はピン留めで最速、32GB は 768² と 1K が同速で 512² が 2 倍、16GB は
+  512² が 2.7 倍・768² が 1.1 倍で、1K も通る(VAE と TE もファイルから流す)。
+- file モードは GPU の先読みが 1 単位少ないぶん VRAM ピークも下がる(512² 2.49 / 768² 3.71 / 1K 5.76GB)。
+  file で VAE デコーダをピン留めするかは `H3_GROUP_STREAM_VAE_PIN`(auto = RAM 24GB 以上。しないと 768² のデコードが
+  31 → 53 秒)。
 
 `H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、
 24〜32GB級カードでは transformer 単体でも収まらない。`H3_LOWVRAM=group` は

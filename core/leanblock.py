@@ -14,6 +14,7 @@ attention の K・V だけは全トークン分が要る(行ごとの attention 
   (attn_out、K と同じ大きさ)に書き、出力射影はそこから全ヘッドまとめて行う。同時に存在する大きなバッファは
   K・V の 2 本から attn_out + K/G + V/G になり、カーネル内部の K・V の写し(sage は int8 の写しを作る)も 1/G になる。
   G=1 のときは attn_out を作らず従来どおり。auto は空き VRAM に収まる最小の G を選ぶ(1 → 4 → 7 → 8 → 14 → 28)。
+  決めるのは生成の最初の forward だけで、その生成の間は固定する(FBC の残差 3 本を先に引いて見積もる)。
   正規化と変調を G 回やり直すぶん遅くなる(512² 相当で G=4 が +13%、G=8 が +35%、G=28 が +140% 程度)。
   数学的には同じ計算だが、ビット一致は保証しない: GEMM(行数 7168/G)と attention カーネルのカーネル選択・
   加算順序がヘッド数とトークン数で変わり、bf16 の最下位ビットが動くことがある(native では G≤14 で一致、
@@ -42,11 +43,13 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     _apply_rotary_emb,
 )
 
+from core.blockstream import _inner_names  # noqa: E402
+
 logger = logging.getLogger("minimax_h3.leanblock")
 
 # auto が試す順。2 は 1 と同じメモリで遅いだけ、56 は GEMM が小さすぎる(行 128 では一致もしない)ので外す。
 HEAD_GROUP_CHOICES = (1, 4, 7, 8, 14, 28)
-_AUTO_MARGIN = 512 << 20  # auto の見積もりに残す余裕(アロケータの断片化・小物)
+_AUTO_MARGIN = 1 << 30    # auto の見積もりに残す余裕(アロケータの断片化・小物。5.8GB 上限の実測で 768MB でも足りなかった)
 
 
 def _modulate(norm, x, scale, shift, idx):
@@ -90,6 +93,8 @@ class LeanState:
         self.groups = int(groups)          # 0 = auto
         self.ff_inner = int(ff_inner)
         self.groups_now = 1
+        self.fixed_groups: int | None = None   # auto の決定(生成の最初の forward で決めて、その生成の間は固定)
+        self.decided_allocated = 0
         self.inplace_all = False
         self.sliceable = True
         self.last: dict = {}
@@ -100,7 +105,19 @@ class LeanState:
         attn = block.attn
         registry = getattr(block, "_diffusers_hook", None)
         self.inplace_all = registry is None or not getattr(registry, "hooks", None)
-        groups = self.groups if self.groups > 0 else self._auto_groups(hidden_states, attn)
+        if self.groups > 0:
+            groups = self.groups
+        else:
+            # 生成の最初の forward で決めて固定する(後のステップは FBC の残差で空きが減って見えるため、毎回決め直すと
+            # 必要以上に大きい G に動く)。新しい生成は、トークン数が変わるか、ブロック 0 時点の使用量が決定時より
+            # 残差 2 本分以上少ない(前の生成の FBC の残差が消えた)ことで検出する
+            allocated = torch.cuda.memory_allocated(hidden_states.device) if hidden_states.is_cuda else 0
+            hidden_bytes = hidden_states.numel() * hidden_states.element_size()
+            if (self.fixed_groups is None or self.last.get("tokens") != int(hidden_states.shape[1])
+                    or allocated < self.decided_allocated - 2 * hidden_bytes):
+                self.fixed_groups = self._auto_groups(hidden_states, attn)
+                self.decided_allocated = allocated
+            groups = self.fixed_groups
         groups = _divisor_at_least(attn.heads, groups)
         if groups > 1 and not self._can_slice(attn):
             groups = 1
@@ -123,6 +140,10 @@ class LeanState:
             for module in (attn.to_q, attn.to_k, attn.to_v):
                 if type(module) is not torch.nn.Linear or module.bias is not None:
                     raise TypeError(f"{type(module).__name__} is not a plain nn.Linear")
+                inner = _inner_names(module.weight)
+                probe = getattr(module.weight, inner[0]) if inner else module.weight
+                if probe.numel() == 0:
+                    continue        # ファイルから流す構成: forward の外では中身が 0 要素のプレースホルダ(本物は attention の中で届く)
                 _slice_rows(module.weight, slice(0, attn.head_dim))
             return True
         except Exception as error:  # noqa: BLE001 - 分割できない重み型は従来の経路で動かす
@@ -149,7 +170,10 @@ class LeanState:
         if fraction < 1.0:
             free = min(free, int(total * fraction) - reserved)
         free += reserved - allocated
-        budget = free - hidden - _AUTO_MARGIN
+        # FBC(diffusers のフックあり)は残差 3 本(head_block_output / head_block_residual / tail_block_residuals)を
+        # ステップをまたいで持つ。ブロック 0 の時点ではまだ無いことがあるので先に引いておく(無ければ出力バッファ 1 本分)
+        held = hidden if self.inplace_all else 3 * hidden
+        budget = free - held - _AUTO_MARGIN
         choice = HEAD_GROUP_CHOICES[-1]
         for g in HEAD_GROUP_CHOICES:
             g = _divisor_at_least(attn.heads, g)
