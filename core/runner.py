@@ -1595,6 +1595,24 @@ H3_GROUP_STREAM_VAE_FREE_GB = float(os.environ.get("H3_GROUP_STREAM_VAE_FREE_GB"
 # トークンごとの演算なので結果は同じ(bf16 の丸めも同じ)。auto = group モードで 8192、他は 0(無効)。
 _H3_FF_CHUNK_RAW = os.environ.get("H3_FF_CHUNK", "auto").strip().lower()
 H3_FF_CHUNK = (8192 if H3_LOWVRAM_GROUP else 0) if _H3_FF_CHUNK_RAW == "auto" else int(_H3_FF_CHUNK_RAW)
+# attention のクエリ分割 (2026-11-15、core/attnchunk.py)。K・V は丸ごと、Q と出力をトークン `H3_ATTN_Q_CHUNK` 個ずつ。
+# 結果は同じ(MD5 一致)。効くのは 1K 以上だけ(1024²×5 秒でデノイズのピーク 9.34 → 8.53GB、768² では差なし)で
+# 2〜4% 遅くなるので既定は 0(無効)。1K を小さいカードで回すときに 8192 を指定する。128 の倍数(sage のブロック境界)。
+_H3_ATTN_Q_CHUNK_RAW = os.environ.get("H3_ATTN_Q_CHUNK", "0").strip().lower()
+H3_ATTN_Q_CHUNK = 0 if _H3_ATTN_Q_CHUNK_RAW in ("", "0", "auto") else int(_H3_ATTN_Q_CHUNK_RAW)
+if H3_ATTN_Q_CHUNK % 128:
+    raise ValueError(f"H3_ATTN_Q_CHUNK must be a multiple of 128, got {H3_ATTN_Q_CHUNK}")
+# メモリ節約版のブロック forward (2026-11-15、core/leanblock.py)。norm/変調/attention/FF/ゲート/残差加算を
+# トークン `H3_LEAN_BLOCK` 個ずつ通し、全トークン分の中間(1024² で各 1.35GB × 4 本)を作らない。結果は同じ。
+# H3_FF_CHUNK / H3_ATTN_Q_CHUNK を包含する(有効なら両方は不要)。auto = group モードで 8192、他は 0。128 の倍数。
+_H3_LEAN_BLOCK_RAW = os.environ.get("H3_LEAN_BLOCK", "auto").strip().lower()
+H3_LEAN_BLOCK = (8192 if H3_LOWVRAM_GROUP else 0) if _H3_LEAN_BLOCK_RAW == "auto" else int(_H3_LEAN_BLOCK_RAW)
+if H3_LEAN_BLOCK % 128:
+    raise ValueError(f"H3_LEAN_BLOCK must be a multiple of 128, got {H3_LEAN_BLOCK}")
+# own ストリーマの単位: block(1 ブロック 0.65GiB、常駐 2 つ)/ half(adaln_proj・attn・ff の 3 単位、常駐は小さい 2 つ)。
+H3_GROUP_STREAM_UNITS = os.environ.get("H3_GROUP_STREAM_UNITS", "half").strip().lower()
+if H3_GROUP_STREAM_UNITS not in ("block", "half"):
+    raise ValueError(f"H3_GROUP_STREAM_UNITS must be 'block' or 'half', got {H3_GROUP_STREAM_UNITS!r}")
 if H3_GROUP_OFFLOAD_LOW_CPU_MEM and "H3_GROUP_OFFLOAD_USE_STREAM" not in os.environ:
     H3_GROUP_OFFLOAD_USE_STREAM = False
 
@@ -5037,8 +5055,16 @@ class MiniMaxH3Runner:
             if H3_GROUP_STREAM_REFINER and hasattr(module, "token_refiner"):
                 skip.add("token_refiner")
             moved_gib = blockstream.move_non_block_children(module, skip, DEVICE)
-            streamers[name] = blockstream.BlockStreamer(
-                module.transformer_blocks, DEVICE, window=H3_GROUP_OFFLOAD_BLOCKS + 1, root=module)
+            if H3_GROUP_STREAM_UNITS == "half":
+                # ブロックを adaln_proj → attn → ff の 3 単位に分けて流す(forward の順)。norm1/norm2 は GPU へ
+                units = []
+                for block in module.transformer_blocks:
+                    units += [block.adaln_proj, block.attn, block.ff]
+                    moved_gib += blockstream.move_non_block_children(block, {"adaln_proj", "attn", "ff"}, DEVICE)
+                streamers[name] = blockstream.BlockStreamer(units, DEVICE, window=H3_GROUP_OFFLOAD_BLOCKS + 1, root=module)
+            else:
+                streamers[name] = blockstream.BlockStreamer(
+                    module.transformer_blocks, DEVICE, window=H3_GROUP_OFFLOAD_BLOCKS + 1, root=module)
             if "token_refiner" in skip:
                 # token_refiner の 2 ブロック(bf16 1.5GiB、int8 化対象外)も流す。final_norm だけ GPU に置く。
                 refiner = module.token_refiner
@@ -5197,6 +5223,16 @@ class MiniMaxH3Runner:
         if H3_FF_CHUNK:
             logger.info("transformer: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
                         H3_FF_CHUNK, self._apply_ff_chunk(self._pipe.transformer, H3_FF_CHUNK))
+        if H3_ATTN_Q_CHUNK:
+            from core import attnchunk
+
+            logger.info("transformer: attention query-chunked by %d tokens on %d blocks (H3_ATTN_Q_CHUNK)",
+                        H3_ATTN_Q_CHUNK, attnchunk.enable(self._pipe.transformer, H3_ATTN_Q_CHUNK))
+        if H3_LEAN_BLOCK:
+            from core import leanblock
+
+            logger.info("transformer: lean block forward, %d tokens per chunk, on %d blocks (H3_LEAN_BLOCK)",
+                        H3_LEAN_BLOCK, leanblock.enable(self._pipe.transformer, H3_LEAN_BLOCK))
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_ATTN_BACKEND:
@@ -5594,6 +5630,16 @@ class MiniMaxH3Runner:
         if H3_FF_CHUNK:
             logger.info("transformer_ref: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
                         H3_FF_CHUNK, self._apply_ff_chunk(self._pipe_ref.transformer_ref, H3_FF_CHUNK))
+        if H3_ATTN_Q_CHUNK:
+            from core import attnchunk
+
+            logger.info("transformer_ref: attention query-chunked by %d tokens on %d blocks (H3_ATTN_Q_CHUNK)",
+                        H3_ATTN_Q_CHUNK, attnchunk.enable(self._pipe_ref.transformer_ref, H3_ATTN_Q_CHUNK))
+        if H3_LEAN_BLOCK:
+            from core import leanblock
+
+            logger.info("transformer_ref: lean block forward, %d tokens per chunk, on %d blocks (H3_LEAN_BLOCK)",
+                        H3_LEAN_BLOCK, leanblock.enable(self._pipe_ref.transformer_ref, H3_LEAN_BLOCK))
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
         if H3_ATTN_BACKEND:
@@ -6675,6 +6721,10 @@ class MiniMaxH3Runner:
         )
         _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
         _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+        if H3_TE_DIET and not self._te_external:
+            # 2026-11-15: 投影 TE にも TE_DIET(lm_head 解放 + 埋め込み表を CPU ブリッジ、4B は埋め込み表 0.78GB)
+            _apply_te_diet(self._pipe.text_encoder)
+            logger.info("text_encoder (H3_TE_PROJ) after H3_TE_DIET. gpu=%s", gpu_mem_gb())
         if H3_TE_STREAM and not self._te_external:
             # 2026-11-15: 投影 TE(Qwen3-VL-4B)にも TE_STREAM を適用する。構造は 32B と同じ
             # (`model.language_model.layers`、bnb Params4bit)で、LM 層 ~2.7GiB をピン留めホストに置き
@@ -7339,6 +7389,9 @@ class MiniMaxH3Runner:
             "group_stream": H3_GROUP_STREAM if H3_LOWVRAM_GROUP else None,
             "group_stream_refiner": H3_GROUP_STREAM_REFINER if H3_LOWVRAM_GROUP else None,
             "ff_chunk": H3_FF_CHUNK,
+            "attn_q_chunk": H3_ATTN_Q_CHUNK,
+            "lean_block": H3_LEAN_BLOCK,
+            "group_stream_units": H3_GROUP_STREAM_UNITS if H3_LOWVRAM_GROUP else None,
             "group_stream_vae": (H3_GROUP_STREAM_VAE if getattr(self, "_vae_stream_decided", None) is None
                                  else ("on" if self._vae_stream_decided else "off")) if H3_LOWVRAM_GROUP else None,
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,

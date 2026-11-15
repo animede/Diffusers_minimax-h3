@@ -90,9 +90,9 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 # ※ sm_120 以外は H3_ATTN_BACKEND=default が必須(既定の sage は sm_120 専用ビルド)
 
-# 8GB 単体(768²×5 秒 ピーク 7.5GB)/ 6GB 単体(512²×5 秒 ピーク 4.7GB)。2026-11-15 の 3 段のストリーミング
-# (投影 TE の LM 層・token_refiner・VAE デコーダ、下の「低 VRAM の到達点」)。上の 16GB の行に H3_TE_STREAM=1 を足すだけ
-H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 \
+# 6GB 単体(768²×5 秒 デノイズ 4.9GB)/ 8GB 単体(1024²×5 秒 6.8GB)。2026-11-15 のストリーミングとメモリ節約版 forward
+# (下の「低 VRAM の到達点」)。上の 16GB の行に H3_TE_STREAM=1 H3_TE_DIET=1 を足すだけ(残りは既定で有効)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 H3_TE_DIET=1 \
   H3_ATTN_BACKEND=default \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 
@@ -364,7 +364,7 @@ venv/bin/python scripts/download_t2va.py
 | 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒(2026-11-15 の自作ストリーマで denoise は約 1.7 倍速、下の `H3_GROUP_STREAM`) |
 | 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
 | **16GB 単体**(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / 約25分※ |
-| **8GB 単体 / 6GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1` | 768²: peak 7.5GB / 512²: peak 4.7GB(48GB 機で 256 / 137 秒、Gen3 x4 の箱では上の※と同じ転送律速) |
+| **6GB 単体 / 8GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 768²: デノイズ 4.85GB / 1024²: 6.82GB(48GB 機で 257 / 509 秒。Gen3 x4 の箱では上の※と同じ転送律速) |
 | **12GB 単体**(見込み・未実測) | 16GB 単体と同じ | 実ピーク11.4GBが12GiBに入る計算。参照系・768×1344は不可 |
 | **8GB×2**(バラスト実測) | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB / 約25.6分※ |
 
@@ -847,9 +847,33 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
 | 768²×5 秒 | 7.45GB | **6.26GB** |
 | 1024²×5 秒(12.6 万トークン、13.9 秒/step) | 10.73GB | **9.34GB** |
 
-残るのは attention の Q・K・V・出力(1024² で各 1.35GB)と残差ストリームで、正確なままでは削れない下限に近い。
-これより下げるにはクエリ分割の attention(K・V は丸ごと、Q と出力だけチャンク)が次の手で、1024²×5 秒で 7GB 前後の見込み。
-`/api/status` の `group_stream_refiner` / `group_stream_vae` / `ff_chunk` で状態を確認できる。
+残るのは attention の K・V(1024² で各 1.8GB)と出力・残差ストリームで、正確なままでは削れない下限に近い。
+
+5. **attention のクエリ分割**(`H3_ATTN_Q_CHUNK`、既定 0 = 無効、`core/attnchunk.py`)。K・V は丸ごと作り、Q の射影・
+   QK ノルム・RoPE・カーネル・出力射影を 8192 トークンずつ回す(結果は MD5 一致)。効くのは 1K 以上で、
+   1024²×5 秒のデノイズのピークが 9.34 → **8.53GB**、768² では差なし(6.26 → 6.38)。2〜4% 遅くなる(1024² で
+   13.9 → 14.4 秒/step)ので既定では切ってあり、1K を小さいカードで回すときに `H3_ATTN_Q_CHUNK=8192` を足す。
+
+ここまでで 1024²×5 秒は 8.5GB。さらに 3 つで「後ちょっと」を詰めた(いずれも MD5 一致)。
+
+6. **メモリ節約版のブロック forward**(`H3_LEAN_BLOCK`、既定 `auto` = group モードで 8192 トークン、`core/leanblock.py`)。
+   元の forward は norm1 の出力・attention の出力・norm2 の出力・FF の出力を全トークン分(1024² で各 1.35GB)作ってから
+   足す。正規化 → 変調 → 射影/attention/FF → ゲート → 残差加算をチャンクで通し、全トークン分の中間は入力・出力・
+   K・V の 4 本だけにする。4(FF 分割)と 5(クエリ分割)を包含する。norm をチャンクごとに 2 回計算する分、1024² で約 7% 遅い。
+7. **流す単位をブロックの 1/3 に**(`H3_GROUP_STREAM_UNITS=half`、既定)。adaln_proj → attn → ff の順に 150 単位で流し、
+   常駐する先読み分が 2 ブロック(1.3GiB)から小さい 2 単位になる。
+8. **投影 TE にも `H3_TE_DIET=1`**(opt-in)。lm_head の解放と埋め込み表(151936 × 2560)の CPU ブリッジ化で 1.45GiB。
+
+| ピーク VRAM(同構成 + `H3_TE_DIET=1`、VAE を流した小カード相当の総合値) | 最初(自作ストリーマのみ) | 1〜3(ストリーミング 3 段) | 全部(4〜8) |
+|---|---:|---:|---:|
+| 512²×5 秒 | 8.59GB | 4.67GB | **3.27GB** |
+| 768²×5 秒 | 10.78GB | 7.45GB | **4.85GB** |
+| 1024²×5 秒 | 10.73GB(デノイズ) | — | **6.82GB** |
+
+残るのは attention の K・V(1024² で各 1.8GB)と入力・出力の残差ストリーム、チャンク分の一時メモリで、正確なままでは
+ここが下限。**768²×5 秒が 6GB カード、1024²×5 秒が 8GB カード**の範囲に入った(デコードは VAE を流せばデノイズより低い)。
+`/api/status` の `group_stream_refiner` / `group_stream_vae` / `group_stream_units` / `ff_chunk` / `attn_q_chunk` /
+`lean_block` で状態を確認できる。
 
 `H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、
 24〜32GB級カードでは transformer 単体でも収まらない。`H3_LOWVRAM=group` は
