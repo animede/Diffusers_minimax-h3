@@ -121,6 +121,12 @@ measured cases int8+SDPA improved prompt fidelity, and the reference (vision) pa
 visually confirmed to match the 32B ground truth in fidelity. **Cross-config quality cannot
 be judged by PSNR/MD5 — judge it by eye.**
 
+> **Addendum (2026-11-17)**: the text above reflects August 2026; three things have changed.
+> - "The support table above" now refers to the next section's "[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" after the split.
+> - **The turbo LoRA (4 steps) now works with `H3_LOWVRAM=group`** (in-house streamer + `H3_TURBO_LORA=1` at startup). Because the number of weight transfers scales with the step count, the transfer-bound "runs but slowly" caveat is largely gone. Measured on an A4000 16GB (Ampere sm_86, PCIe Gen4 x4, SDPA): t2va 5 s at 768² went from 790 s at 30 steps (peak 8.0GB) to 151 s at 4 steps (peak 7.0GB). With the 8GB-tier flags (`H3_TE_STREAM=1 H3_TE_DIET=1`, VAE decoder streamed, emulated with `H3_VRAM_LIMIT_GB=8`): 768² 209 s / 3.08GB, 1024² 376 s / 3.73GB, fl2va 225 s / 3.37GB, ref2va 299 s / 3.02GB (see the README's support table).
+> - "FirstBlockCache does not fire on the int8+SDPA trajectory" no longer holds: on the same A4000 (int8 + SDPA, 30 steps) t2i skipped 7 steps and t2va 6 (`cache_skipped_steps`).
+> The quality paragraph (crossing configurations changes the composition even at the same seed; that is a trajectory divergence, not degradation, and must be judged visually) is unchanged.
+
 ## VRAM configurations and residency
 
 ### VRAM × feature matrix (measured 2026-08-11)

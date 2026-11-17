@@ -76,6 +76,8 @@
 | 罠 | **`use_stream=True` + `low_cpu_mem_usage=True` の併用は torchao `Int8Tensor` の pin_memory でクラッシュ**(`cannot pin 'torch.cuda.CharTensor'`)。`low_cpu_mem_usage=False` で回避(onload も4〜5倍高速化)。→ diffusers 本体に報告する価値のある実バグ |
 | コミット | `26bf434` |
 
+**更新**: 2026-11-15 に diffusers の `enable_group_offload` から自作の窓付き先読みストリーマ(`core/blockstream.py`、`H3_GROUP_STREAM=own` 既定。diffusers 経路は `diffusers` で残置)へ置換し、token_refiner・投影 TE・VAE デコーダも同方式で流すようにした(16GB 構成 → 768² 4.6GB / 1024² 6.4GB)。2026-11-17 に turbo LoRA との併用を解禁(起動時に巻く)。
+
 ---
 
 ## B. 調査した結果、取り込まなかったもの
@@ -140,5 +142,5 @@ transformer と transformer_ref を同時常駐させて Ref2VA ⇔ T2VA の切�
 | + Turbo LoRA 8steps(opt-in) | **~88s** |
 | + Turbo 4steps(ドラフト用途) | ~40s |
 
-VRAM 下限: 96GB → **~18GB**(`H3_LOWVRAM=group H3_TE_PRUNE=1`)。
+VRAM 下限: 96GB → **~18GB**(`H3_LOWVRAM=group H3_TE_PRUNE=1`)→ 2026-11-15 以降 **4.6GB(768²)/ 6.4GB(1024²)**(投影 TE + ストリーミング、30 ステップ)、turbo 4 ステップなら 3.1〜3.7GB。
 各段はすべて同一 seed の MD5 一致または品質 A/B で等価性を確認済み。

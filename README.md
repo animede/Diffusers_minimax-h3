@@ -30,11 +30,11 @@ t2va 5 秒・768² の実測。詳細な行(80GB / 18GB / 12GB 級など)と測�
 | 48GB 級 | `H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_TE_DEVICE=cuda:1 H3_VIDEO_VAE_FP16=1 H3_KEEP_TRANSFORMER=1`(2 枚構成の推奨) | t2i 9.7 秒 / t2va 44.2 秒(turbo 4 ステップ) |
 | 24 / 32GB 単騎 | ck-w4a8 + AdaLN-pruned + pinned 退避の一式([詳細](docs/FEATURES.md#2026-10-更新-24gb32gb-単騎でリアルタイム会話生成)) | 320×448・141f が **5.57 秒 = 実時間の 0.95 倍**(32GB)/ 7.1 秒(24GB) |
 | 32GB 級 | `H3_LOWVRAM=group` | peak 28.7GB / 約 280 秒 |
-| 16GB 単体(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB ※ |
-| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 768²: 4.62GB / 1024²: 6.41GB(48GB 機で 272 / 552 秒) |
+| 16GB 単体(実 4060 Ti / A4000) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | 4060 Ti: peak 11.4GB(2026-08)。A4000(2026-11-17): 30 ステップ peak 8.0GB / 790 秒、turbo 4 ステップ(`H3_TURBO_LORA=1`)peak 7.0GB / 151 秒 ※ |
+| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に 8GB の上限、VAE デコーダをストリーミング): 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒。fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒(いずれも 768²・5 秒) |
 | 8GB×2 | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB ※ |
 
-※ 時間は測定した箱に強く依存するため表には載せない。実測(PCIe Gen3 x4 スロット + sm_89 の 4060 Ti、SDPA、30 ステップ)では 16GB 単体・8GB×2 とも t2va 5 秒に約 25 分かかったが、そのほとんどは毎ステップの重み転送(約 51 秒/ステップ)で、**Gen4 x16 なら転送は約 1/8 になり 4〜5 分程度に収まる見込み**(同じ低 VRAM 構成を 48GB 機の GPU0 で測ると 768²×5 秒が 272 秒)。sm_120 以外のカードは `H3_ATTN_BACKEND=default` も必要(既定の sage は sm_120 専用ビルド)。turbo(`H3_TURBO_LORA=1`)は group でも使え、A4000 16GB(Gen4 x4)で t2va 5 秒・768² が 30 ステップ 790 秒 → 4 ステップ 151 秒だった。8GB 級の指定(`H3_TE_STREAM=1 H3_TE_DIET=1`、VAE デコーダのストリーミング)に 8GB の上限を切った模擬では 768² が 209 秒・ピーク 3.08GB、1024² が 376 秒・ピーク 3.73GB で完走した(デノイズ中のピークは 3.1〜3.7GB で、6GB 級にも収まる値)。同じ構成で ref2va(画像参照 1 枚、768²・5 秒)も turbo 4 ステップで 299 秒・ピーク 3.0GB、fl2va(先頭フレーム指定、768²・5 秒)は 225 秒・ピーク 3.4GB。低 VRAM 構成は「動くが遅い」こと、構成をまたぐと同一 seed でも構図が変わる(劣化ではなく軌道の分岐)ことは [性能の概要](docs/FEATURES.md#性能の概要) に詳しい。
+※ 時間は PCIe 帯域に強く依存する(低 VRAM 構成は毎ステップの重み転送が律速)。4060 Ti(Gen3 x4、sm_89、30 ステップ)では 16GB 単体・8GB×2 とも t2va 5 秒に約 25 分かかったが、同じ構成が A4000(Gen4 x4)では 790 秒、48GB 機の GPU0 では 272 秒で、Gen4 x16 なら 4〜5 分の見込み。**turbo LoRA(`H3_TURBO_LORA=1`、4 ステップ)が group でも使えるようになったため、転送律速の「動くが遅い」はほぼ解消できる**: x4 接続の A4000 でも t2va 5 秒が 151 秒(16GB 級)、8GB 級の指定(VAE デコーダのストリーミング込み)でも 768² 209 秒 / 1024² 376 秒で完走する(転送回数がステップ数に比例して減るため)。8GB 級の値は A4000 に 8GB の上限(`H3_VRAM_LIMIT_GB`)を切った模擬で、デノイズ中のピーク 3.1〜3.7GB は 6GB 級にも収まる。sm_120 以外のカードは `H3_ATTN_BACKEND=default` も必要(既定の sage は sm_120 専用ビルド。未指定なら `H3_PROFILE=auto` が自動で入れる)。構成をまたぐと同一 seed でも構図が変わる(劣化ではなく軌道の分岐)ことは [性能の概要](docs/FEATURES.md#性能の概要) に詳しい。
 
 ## インストール
 

@@ -170,7 +170,7 @@ The two operate on independent layers and can be combined (sage + threshold 0.1 
 
 - **Applied scale** (`H3_TURBO_LORA_SCALE`) is **0.094**. The 0.75 listed by the LoRA distributor assumes ComfyUI's alpha folding; applying 0.75 directly to the raw B·A turns the output into complete noise even at 30 steps.
 - **Why it can be combined with an int8-quantized transformer**: the lightx2v format's keys are diffusers-native (to_q/to_k/to_v separated), so applying it does not require `fuse_projections()` (which requires `torch.cat`). The older-generation comfy format (Ostris version, fused `qkv_proj`) requires `torch.cat`, and since `aten.cat` kernels are not implemented for int8-quantized `Int8Tensor`, it remains unusable in int8/low-VRAM mode. The apply function auto-detects the key format.
-- **Combination restriction**: it cannot be combined with `H3_LOWVRAM=group`, regardless of format (because `enable_group_offload`'s `cpu_param_dict` is fixed at the time it is enabled).
+- **Combination restriction (updated 2026-11-17)**: under `H3_LOWVRAM=group` it works only with the in-house streamer (`H3_GROUP_STREAM=own`, the default) **and `H3_TURBO_LORA=1` at startup**. The streamer collects what it transfers from each block's `named_parameters` / `named_buffers` when it is built, so a LoRA applied before that point has its `lora_a` / `lora_b` (non-persistent buffers) streamed in the same window. Not available with diffusers' `enable_group_offload` path, with lazy per-request application (`turbo=1` alone), or with `file` streaming (hosts under 48GB RAM). On an A4000 16GB, t2va 5 s at 768² went from 790 s at 30 steps to 151 s at 4 steps (peak 7.0GB).
 - When turbo is enabled, FBC is automatically disabled.
 - **It also holds on the reference path (`transformer_ref`)** — verified visually on 2026-08-12; previously unverified. Even at 4 steps the reference subject's face, hairstyle, clothing color, and accessories stay faithful, and the person remains consistent from the first frame to the last. The same 0.094 scale as `transformer` works. Along with this, a mismatch was fixed: the three reference endpoints (`/api/ref2va`, `/api/ref2i_batch`, `/api/ref2va_batch`) were the only ones hardcoding `num_inference_steps` to 30, so they never picked up turbo's 4-step default — i.e. they ran 30 steps with the distillation LoRA attached.
 
@@ -179,6 +179,8 @@ The two operate on independent layers and can be combined (sage + threshold 0.1 
 `H3_LOWVRAM=group` (24–32GB class) uses diffusers' `enable_group_offload(offload_type="block_level", num_blocks_per_group=1, use_stream=...)`, keeping the int8-quantized transformer **resident in host RAM** while streaming only the blocks needed at each denoise step (1–2 of 50 layers, about 0.68GB each) to and from the GPU — block-level group offload. The transformer is loaded only once at process startup and stays resident across requests.
 
 Even when loaded onto the CPU with `device_map={"transformer": "cpu"}`, int8 quantization is applied correctly (confirmed on real hardware that 370/370 layers become `Int8Tensor`). Combining `use_stream=True` with `low_cpu_mem_usage=True` (both default to False in the API; the pairing one reaches for in a memory-constrained setup) has a bug that reliably crashes against torchao's `Int8Tensor` with `cannot pin 'torch.cuda.CharTensor'`; this is avoided by adopting `low_cpu_mem_usage=False` (`H3_GROUP_OFFLOAD_LOW_CPU_MEM`, default 0=False). This setting also has the side effect of making onload 4–5x faster (0.04–0.07s/block versus 0.1–0.26s/block).
+
+**Update 2026-11-15 — replaced by an in-house streamer**: diffusers' `enable_group_offload` above remains available as `H3_GROUP_STREAM=diffusers`, but the default is now an in-house windowed prefetch streamer (`core/blockstream.py`, `H3_GROUP_STREAM=own`). The blocks (150 units = 50 blocks × adaln/attn/ff) live in pinned host RAM and are streamed to the GPU through forward hooks on a dedicated CUDA stream with a 2-unit prefetch window (denoise about 1.7x faster). The same mechanism streams the token_refiner, the projected TE's LM layers (`H3_TE_STREAM`) and the video VAE decoder (`H3_GROUP_STREAM_VAE`, automatic below 8GB of free VRAM), and the block forward became a memory-lean variant (`H3_LEAN_BLOCK`: token-chunked FF, query-chunked and head-grouped attention, in-place residuals). Hosts with less than 48GB of RAM stream the weights straight from the quantized cache files (`H3_GROUP_STREAM_HOST=file`). This brought the 16GB configuration down to 768² 4.6GB / 1024² 6.4GB (30 steps), making single 6GB / 8GB cards viable. Details and measurements: [FEATURES "block transfer replaced by an in-house windowed prefetch streamer"](FEATURES.en.md#2026-11-15-block-transfer-replaced-by-an-in-house-windowed-prefetch-streamer-h3_group_stream-default-own), ["where low VRAM stands"](FEATURES.en.md#2026-11-15-where-low-vram-stands--from-the-16gb-configuration-to-8gb--6gb-three-streaming-stages), ["streaming the weights straight from the files"](FEATURES.en.md#pcs-with-32-gb--16-gb-of-host-ram-streaming-the-weights-straight-from-the-files-h3_group_stream_hostfile-2026-11-15). Combination with the turbo LoRA was enabled on 2026-11-17 (see "Distillation" above).
 
 ### Three-Stage Reduction of the Fixed Cost
 
@@ -250,6 +252,8 @@ Constraints and standing as of 2026-08-12:
 
 ### How to Derive a Configuration From Capacity
 
+> **Addendum 2026-11-17**: started with nothing set, `H3_PROFILE=auto` (`core/profile.py`) fills in the 96 / 80 / 48 / 32 / 16 / 8GB-tier defaults (the same flags as the README's launch examples) from the compute GPU's total VRAM. Setting any of the main profile variables switches to manual mode, where the derivation below is the guide.
+
 The mode can be derived as a function of VRAM capacity. When the GPU changes, re-derive from the following parts table and inequalities rather than looking up the table from memory.
 
 **Parts table (all measured)**
@@ -304,6 +308,8 @@ family (i2va/audio-reference) exceeds the 8GiB budget from the reference-token V
 (t2va 7.23GB → i2va 9.41GB), so it runs only on the single 16GB card. For the honest speed
 and quality characteristics, see §6.
 
+> **Addendum 2026-11-17 (single 8GB / 6GB)**: with the 2026-11-15 streaming (see the update under §4 "Offloading") the projected-TE route went lower still. Adding `H3_TE_STREAM=1 H3_TE_DIET=1` to the 16GB flags gives, at 30 steps, 768² 4.62GB / 1024² 6.41GB (272 / 552 s on the 48GB box). Turbo at 4 steps (A4000 under an `H3_VRAM_LIMIT_GB=8` cap, VAE decoder streamed): t2va 768² 3.08GB / 209 s, 1024² 3.73GB / 376 s, fl2va 3.37GB / 225 s, ref2va 3.02GB / 299 s. The denoise peak of 3.1-3.7GB also fits a 6GB card (not yet confirmed on a real 6GB card). The single-16GB row was also re-measured on an A4000 (Ampere sm_86, Gen4 x4): 30 steps peak 8.0GB / 790 s, turbo 4 steps 7.0GB / 151 s.
+
 ### Requirements for Placing TE on a Second GPU
 
 Specifying a GPU via `H3_TE_DEVICE` keeps TE resident on that GPU continuously; it is never freed (since staying resident is the point). The usable purposes depend on the effective budget of the TE GPU.
@@ -345,7 +351,7 @@ H3_TRANSFORMER_QUANT=int8 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 \
 
 This keeps the int8 transformer and the projected TE (NF4) resident together on one GPU and also stops the decode-window free. The 45.6GB peak fits inside the ~49.8GB effective budget of a 48GB-class card, but **this has not been confirmed on a real 48GB card** (only that a peak measured on the 96GB machine fits the 48GB budget). Note that the measurement prefixed `CUDA_VISIBLE_DEVICES=0` to expose just one card of the two-GPU 96GB machine; a genuinely single-GPU host does not need it.
 
-**Single 16GB / 8GiB×2 (projected TE + group offload)**: see "Quick start by VRAM class" in the README for launch examples. The core is `H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1`, and anything other than sm_120 additionally requires `H3_ATTN_BACKEND=default` (the default sage is an sm_120-only build).
+**Single 16GB / 8GiB×2 / single 6-8GB (projected TE + block streaming)**: see "Starting" in the README (launch examples per VRAM tier). The core is `H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1`, and anything other than sm_120 additionally requires `H3_ATTN_BACKEND=default` (the default sage is an sm_120-only build).
 
 For more detailed, per-phase patterns of what stays resident, see [docs/RESIDENCY.en.md](RESIDENCY.en.md).
 
@@ -461,6 +467,8 @@ Single 16GB and 8GiB×2 **are viable** (all features run to completion), but spe
 
 Note that single-16GB verification must run with `H3_ATTN_BACKEND=default` (SDPA) because sage is an sm_120-only build (the added card is sm_89).
 
+> **Addendum (2026-11-17)**: the table and bullets above are from 2026-08-11 (4060 Ti, Gen3 x4, 30 steps). Since then (1) the 2026-11-15 streaming lowered the 16GB configuration's peak to 768² 4.6GB / 1024² 6.4GB (30 steps); (2) on 2026-11-17 the turbo LoRA became usable in group mode, which largely removes the transfer-bound slowness (A4000, Gen4 x4: t2va 5 s in 151 s; with the 8GB-tier flags 768² 209 s / 1024² 376 s); (3) "FirstBlockCache doesn't work on the int8+SDPA trajectory" no longer holds (A4000, int8 + SDPA, 30 steps: t2i skipped 7 steps, t2va 6). The quality statements (crossing configurations changes the composition; a trajectory divergence, not degradation) are unchanged.
+
 ---
 
 ## 7. Ensuring Quality and Equivalence
@@ -489,6 +497,7 @@ All claims about quality or performance — VRAM, time required, PSNR, MD5, ASR 
 
 | Variable | Default | Effect |
 |---|---|---|
+| `H3_PROFILE` | `auto` | Automatic main profile (2026-11-17). When none of the main profile variables is set, fills in the 96/80/48/32/16/8GB-tier defaults from total VRAM. `96gb`..`8gb` forces a tier, `off` disables |
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder quantization method (`none` is bf16 at 66.7GB) |
 | `H3_TE_PRUNE` | `0` | Removes unused upper layers of TE (output unchanged, -3.6GB with nf4) |
 | `H3_TE_DEVICE` | (empty) | Keeps TE resident on the specified GPU, never freed (e.g. `cuda:1`) |
@@ -498,7 +507,13 @@ All claims about quality or performance — VRAM, time required, PSNR, MD5, ASR 
 | `H3_TE_PREQUANT_DIR` | `models/prequant` | Cache save location |
 | `H3_TE_PREQUANT_MIN_FREE_GB` | `25` | Skips saving if free disk space falls below this (generation continues) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` quantizes the transformer from 66.3GB→34GB |
-| `H3_LOWVRAM` | `0` | `1` = phase-cycling for 48GB class / `group` = block-level offload for 24-32GB class |
+| `H3_LOWVRAM` | `0` | `1` = phase-cycling for the 48GB class / `group` = block-level streaming for the 6-32GB class (in-house streamer since 2026-11-15, `H3_GROUP_STREAM`) |
+
+| `H3_GROUP_STREAM` | `own` | Block transfer scheme in group mode. `own` = in-house windowed prefetch (core/blockstream.py) / `diffusers` = enable_group_offload (legacy) |
+| `H3_GROUP_STREAM_HOST` | `auto` | Where the block masters live. `auto` = `file` (stream straight from the quantized cache) on hosts under 48GB RAM, else `pinned` |
+| `H3_GROUP_STREAM_VAE` | `auto` | Whether the video VAE decoder (36 blocks) is streamed too. `auto` = yes when free VRAM is under 8GB at the first decode |
+| `H3_TE_STREAM` / `H3_TE_DIET` | `0` / `0` | Stream the projected TE's LM layers / shrink embed_tokens and lm_head (the key to the 6-8GB tiers) |
+| `H3_LEAN_BLOCK` / `H3_FF_CHUNK` / `H3_ATTN_HEAD_GROUPS` | `auto` | Memory-lean block forward (token-chunked FF, head-grouped attention, in-place residuals); auto picks from free VRAM and token count |
 | `H3_KEEP_TRANSFORMER` | `0` | Keeps the transformer resident even during the decode phase. Requires all 3 of: `H3_LOWVRAM` not `group` (either `1` or `0`), either `H3_TE_DEVICE` or `H3_TE_PROJ`, and `H3_VIDEO_VAE_FP16=1` (see §5) |
 | `H3_VIDEO_VAE_FP16` | `0` | Converts the video VAE to fp16 (audio VAE is excluded) |
 | `H3_CACHE` | `fbc` | Enables FirstBlockCache (`none` disables it) |

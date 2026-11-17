@@ -77,6 +77,8 @@ down to mp4 MD5/byte match.
 | Gotcha | **`use_stream=True` combined with `low_cpu_mem_usage=True` crashes on torchao `Int8Tensor`'s pin_memory** (`cannot pin 'torch.cuda.CharTensor'`). Worked around with `low_cpu_mem_usage=False` (also speeds up onload 4–5x). → A real bug worth reporting upstream to diffusers |
 | Commit | `26bf434` |
 
+**Update**: on 2026-11-15 diffusers' `enable_group_offload` was replaced by an in-house windowed prefetch streamer (`core/blockstream.py`, `H3_GROUP_STREAM=own` by default; the diffusers path remains as `diffusers`), and the token_refiner, projected TE and VAE decoder are streamed the same way (16GB configuration → 768² 4.6GB / 1024² 6.4GB). On 2026-11-17 combination with the turbo LoRA was enabled (applied at startup).
+
 ---
 
 ## B. Investigated but not adopted
@@ -141,5 +143,5 @@ cost between Ref2VA and T2VA.
 | + Turbo LoRA 8 steps (opt-in) | **~88s** |
 | + Turbo 4 steps (for draft use) | ~40s |
 
-VRAM floor: 96GB → **~18GB** (`H3_LOWVRAM=group H3_TE_PRUNE=1`).
+VRAM floor: 96GB → **~18GB** (`H3_LOWVRAM=group H3_TE_PRUNE=1`) → since 2026-11-15 **4.6GB (768²) / 6.4GB (1024²)** (projected TE + streaming, 30 steps), 3.1-3.7GB at 4 turbo steps.
 Every step has been confirmed equivalent via either an MD5 match at the same seed or a quality A/B.

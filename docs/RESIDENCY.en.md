@@ -152,6 +152,8 @@ The transformer **stays resident in host RAM** and shuttles to the GPU block by 
 > avail recovers fully to **85.8GB** right after freeing. Details in addendum B8 of
 > [docs/internal/TECHNICAL_REPORT.en.md](internal/TECHNICAL_REPORT.en.md).
 
+> **Addendum 2026-11-15 / 11-17 (residency with the in-house streamer)**: the table above dates from the diffusers group-offload era. With the default in-house streamer (`H3_GROUP_STREAM=own`) the transformer's 150 units (50 blocks × adaln/attn/ff, about 30GiB in int8, 31.3GiB with the turbo LoRA) live in pinned host RAM and only the 2-unit prefetch window (~1.4GB) plus the non-block modules (0.2GB) sit on the GPU; the token_refiner (1.5GiB) is streamed the same way. The projected TE (NF4, 3.2GB) is loaded per request, with `H3_TE_STREAM=1` its 36 LM layers are parked in pinned host memory (0.25GB on the GPU), and it is force-freed before decode. The VAE decoder's 36 blocks are streamed (4.5GiB pinned) when free VRAM is under 8GB. Measured on an A4000 16GB (768², 5 s): denoise peak 3.1GB (turbo) to 8.0GB (30 steps with FBC); decode peak 6.0-7.0GB without decoder streaming, 3.5GB with it. ref2va streams transformer_ref the same way (the base streamer is released) and force-frees the TE before the reference encode, so its layout is built inside the `_pin_execution_device_to_compute()` window (fixed 2026-11-17). "FBC skips 0 steps on the int8+SDPA trajectory" no longer holds (6-7 steps skipped on the A4000). The single 6GB / 8GB configuration and its measurements: [FEATURES "where low VRAM stands"](FEATURES.en.md#2026-11-15-where-low-vram-stands--from-the-16gb-configuration-to-8gb--6gb-three-streaming-stages).
+
 ---
 
 ## 3. Additional guarantees when `H3_TE_DEVICE` is set

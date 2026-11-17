@@ -152,6 +152,8 @@ transformer は**ホストRAMに常駐**し、ブロック単位(1〜2個、~1.4
 > ガード付き)を追加し、解放直後に avail が **85.8GB** へ完全回復する。詳細は
 > [docs/internal/TECHNICAL_REPORT.md](internal/TECHNICAL_REPORT.md) の追補 B8。
 
+> **2026-11-15 / 11-17 追記(自作ストリーマ以降の常駐)**: 上の表は diffusers の group offload 時代のもの。既定の自作ストリーマ(`H3_GROUP_STREAM=own`)では、transformer の 150 単位(50 ブロック × adaln/attn/ff、int8 で約 30GiB。turbo LoRA 込みなら 31.3GiB)がピン留めしたホスト RAM に常駐し、GPU には先読み窓 2 単位(~1.4GB)と非ブロック部(0.2GB)だけが載る。token_refiner(1.5GiB)も同様に流す。投影 TE(NF4 3.2GB)はリクエストごとにロードし、`H3_TE_STREAM=1` なら LM 層 36 枚をピン留めホストへ退避(GPU 0.25GB)、デコード前に強制解放する。VAE デコーダは空き VRAM 8GB 未満で 36 ブロックをストリーミング(ピン留め 4.5GiB)。A4000 16GB の実測(768²・5 秒): デノイズ中のピーク 3.1GB(turbo)〜8.0GB(30 ステップ・FBC あり)、デコードのピークはデコーダ非ストリーミングで 6.0〜7.0GB、ストリーミングで 3.5GB。ref2va は transformer_ref を同じ方式で流し(base のストリーマは解放)、参照エンコード前に TE を強制解放するため、layout は `_pin_execution_device_to_compute()` の窓で組む(2026-11-17 修正)。「FBC は int8+SDPA 軌道では0スキップ」は現在は当てはまらない(A4000 で 6〜7 ステップ分スキップ)。6GB / 8GB 単体の構成と実測は [FEATURES「低 VRAM の到達点」](FEATURES.md#2026-11-15-低-vram-の到達点--16gb-構成を-8gb--6gb-へ3-段のストリーミング) を参照。
+
 ---
 
 ## 3. `H3_TE_DEVICE` を設定したときの追加の約束

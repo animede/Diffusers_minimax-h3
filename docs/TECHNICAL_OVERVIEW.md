@@ -170,7 +170,7 @@ FirstBlockCache は、ステップ間で transformer 最初のブロックの残
 
 - **適用係数**(`H3_TURBO_LORA_SCALE`)は **0.094**。LoRA 配布元記載の 0.75 は ComfyUI の alpha 折り込みを前提にした値で、生の B・A に 0.75 をそのまま掛けると 30steps でも完全ノイズ化する。
 - **int8 量子化 transformer との併用が可能な理由**: lightx2v 形式のキーは diffusers ネイティブ(to_q/to_k/to_v が分離)であり、適用に `fuse_projections()`(`torch.cat` を要求する)を必要としない。旧世代の comfy 形式(Ostris 版、`qkv_proj` 融合)は `torch.cat` を要求し、int8 量子化された `Int8Tensor` には `aten.cat` カーネルが未実装のため int8/低VRAMモードでは使用不可のまま。適用関数はキー形式を自動判別する。
-- **併用制限**: `H3_LOWVRAM=group` とは形式を問わず併用不可(`enable_group_offload` の `cpu_param_dict` が有効化時点で固定されるため)。
+- **併用制限(2026-11-17 更新)**: `H3_LOWVRAM=group` では、自作ストリーマ(`H3_GROUP_STREAM=own`、既定)かつ**起動時に `H3_TURBO_LORA=1`** のときだけ使える。ストリーマは転送対象をブロックの `named_parameters` / `named_buffers` から構築時に集めるので、構築前に LoRA を巻いておけば `lora_a` / `lora_b`(非永続バッファ)も同じ窓で GPU へ流れる。diffusers の `enable_group_offload` 経路、ロード後の遅延適用(リクエストの `turbo=1` だけ)、`file` ストリーミング(ホスト RAM 48GB 未満)とは不可。A4000 16GB で t2va 5 秒・768² が 30 ステップ 790 秒 → 4 ステップ 151 秒(ピーク 7.0GB)。
 - turbo 有効時は FBC を自動的に無効化する。
 - **参照経路(`transformer_ref`)でも成立**(2026-08-12 に目視確認、従来は未検証)。4ステップでも参照人物の顔・髪型・服の色・小物まで忠実さが保たれ、動画も先頭〜末尾で人物が一貫する。スケールは `transformer` と同じ 0.094 のままでよい。あわせて、参照系3エンドポイント(`/api/ref2va`・`/api/ref2i_batch`・`/api/ref2va_batch`)だけが `num_inference_steps` の既定を 30 にハードコードしており、turbo 時のステップ既定(4)を拾わない噛み合わせ不良を修正した(蒸留 LoRA を付けたまま30ステップ回していた)。
 
@@ -179,6 +179,8 @@ FirstBlockCache は、ステップ間で transformer 最初のブロックの残
 `H3_LOWVRAM=group`(24-32GB級)は、diffusers の `enable_group_offload(offload_type="block_level", num_blocks_per_group=1, use_stream=...)` を用い、int8 量子化した transformer を**ホスト RAM に常駐**させたまま、denoise の各ステップで必要なブロック(50層中1〜2層、約0.68GB/個)だけを都度 GPU へ出し入れする block-level group offload である。transformer はプロセス起動時に一度だけロードされ、リクエストをまたいで常駐し続ける。
 
 `device_map={"transformer": "cpu"}` で CPU 上にロードした場合でも int8 量子化は正しく適用される(370/370層が `Int8Tensor` 化されることを実機確認済み)。`use_stream=True` + `low_cpu_mem_usage=True` の組み合わせ(API の既定値はどちらも False。省メモリ目的で両方を有効にすると踏む)は torchao の `Int8Tensor` に対して `cannot pin 'torch.cuda.CharTensor'` で確実にクラッシュするバグがあり、`low_cpu_mem_usage=False`(`H3_GROUP_OFFLOAD_LOW_CPU_MEM`、既定0=False)を採用することで回避している。この設定は onload が4〜5倍速くなる副次効果もある(0.04〜0.07s/ブロック 対 0.1〜0.26s/ブロック)。
+
+**2026-11-15 更新 — 自作ストリーマへ置換**: 上の diffusers `enable_group_offload` は `H3_GROUP_STREAM=diffusers` として残し、既定は自作の窓付き先読みストリーマ(`core/blockstream.py`、`H3_GROUP_STREAM=own`)になった。ブロック(150 単位 = 50 ブロック × adaln/attn/ff)をピン留めしたホスト RAM に置き、専用 CUDA ストリームで 2 単位先読みしながら forward フックで GPU へ流す(denoise 約 1.7 倍速)。同じ仕組みで token_refiner、投影 TE の LM 層(`H3_TE_STREAM`)、video VAE デコーダ(`H3_GROUP_STREAM_VAE`、空き VRAM 8GB 未満で自動)も流し、ブロック forward はメモリ節約版(`H3_LEAN_BLOCK`: FF のトークン分割・クエリ分割・ヘッド分割 attention・残差の in-place 更新)になった。ホスト RAM が 48GB 未満なら量子化キャッシュのファイルから直接流す(`H3_GROUP_STREAM_HOST=file`)。これで 16GB 構成が 768² 4.6GB / 1024² 6.4GB(30 ステップ)まで下がり、6GB / 8GB 単体が成立する。詳細と実測は [FEATURES「ブロック転送を自作の窓付き先読みに置き換え」](FEATURES.md#2026-11-15-ブロック転送を自作の窓付き先読みに置き換えh3_group_stream既定-own)、[「低 VRAM の到達点」](FEATURES.md#2026-11-15-低-vram-の到達点--16gb-構成を-8gb--6gb-へ3-段のストリーミング)、[「重みをファイルから直接流す」](FEATURES.md#ホスト-ram-32gb--16gb-の-pc-重みをファイルから直接流すh3_group_stream_hostfile2026-11-15) を参照。turbo LoRA との併用は 2026-11-17 に解禁(上の「蒸留」節)。
 
 ### 固定費の削減3段
 
@@ -250,6 +252,8 @@ decode  : [vae ペア]      全場面をデコード → 保存(場面ごとに�
 
 ### 容量から構成を導出する方法
 
+> **2026-11-17 追記**: 何も指定せずに起動すると `H3_PROFILE=auto`(`core/profile.py`)が計算用 GPU の総 VRAM から 96 / 80 / 48 / 32 / 16 / 8GB 級の既定値一式(README の起動例と同じ)を入れる。主プロファイル系の変数をひとつでも指定すると手動扱いになり、以下の導出はそのときの指針になる。
+
 モードは VRAM 容量の関数として導出できる。GPU を替えたら、記憶で表を引くのではなく、次の部品表と不等式から再導出する。
 
 **部品表(すべて実測)**
@@ -301,6 +305,8 @@ decode  : [vae ペア]      全場面をデコード → 保存(場面ごとに�
 動画の参照系(i2va/音声参照)は参照トークンの VRAM 加算(t2va 7.23GB → i2va 9.41GB)で
 8GiB 予算を超えるため 16GB 単体でのみ動く。速度と品質の正直な特性は §6 を参照。
 
+> **2026-11-17 追記(8GB / 6GB 単体)**: 2026-11-15 のストリーミング(上の §4「オフロード」の更新)で、投影 TE 経路はさらに下がった。16GB の指定に `H3_TE_STREAM=1 H3_TE_DIET=1` を足すだけで、30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に `H3_VRAM_LIMIT_GB=8` の上限、VAE デコーダをストリーミング): t2va 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒、fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒。デノイズ中のピーク 3.1〜3.7GB は 6GB 級にも収まる(6GB 実カードでの確認は未実施)。16GB 単体も A4000(Ampere sm_86、Gen4 x4)で 30 ステップ peak 8.0GB / 790 秒、turbo 4 ステップ 7.0GB / 151 秒。
+
 ### 2枚目GPUに TE を置く場合の要件
 
 `H3_TE_DEVICE` に GPU を指定すると TE はそのGPUに常駐しつづけ、一切解放されない(常駐が目的のため)。TE用GPU側の実効予算に応じて用途が変わる。
@@ -342,7 +348,7 @@ H3_TRANSFORMER_QUANT=int8 H3_KEEP_TRANSFORMER=1 H3_VIDEO_VAE_FP16=1 \
 
 int8 transformer と投影TE(NF4)を1枚のGPUに同時常駐させ、デコード窓の解放も止める構成。ピーク 45.6GB は 48GB級の実効予算 ~49.8GB に収まるが、**48GB 実機での確認は未実施**(96GB機で測ったピークが48GB予算に収まることの確認まで)。なお実測時は2枚挿しの 96GB機で 1枚だけを見せるために `CUDA_VISIBLE_DEVICES=0` を前置している(GPUが元々1枚の機体では不要)。
 
-**16GB 単体 / 8GiB×2(投影TE + group offload)**: 起動例は README の「VRAM級別クイックスタート」を参照。`H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1` が中核で、sm_120 以外では `H3_ATTN_BACKEND=default` が必須(既定の sage は sm_120 専用ビルド)。
+**16GB 単体 / 8GiB×2 / 6〜8GB 単体(投影TE + ブロックストリーミング)**: 起動例は README の「起動」(VRAM 級別の起動例)を参照。`H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1` が中核で、sm_120 以外では `H3_ATTN_BACKEND=default` が必須(既定の sage は sm_120 専用ビルド)。
 
 より詳細な、フェーズごとの常駐物の全パターンは [docs/RESIDENCY.md](RESIDENCY.md) を参照。
 
@@ -458,6 +464,8 @@ turbo なし30ステップでは t2i 27.42s / t2va 155.0s(FBCなし)、21.41s / 
 
 なお 16GB 単体の検証は sage が sm_120 専用ビルドのため `H3_ATTN_BACKEND=default`(SDPA)で走らせる必要がある(増設カードは sm_89)。
 
+> **追記(2026-11-17)**: 上の表と箇条書きは 2026-08-11 時点(4060 Ti、Gen3 x4、30 ステップ)のもの。その後 (1) 2026-11-15 のストリーミングで 16GB 構成のピークが 768² 4.6GB / 1024² 6.4GB(30 ステップ)に下がり、(2) 2026-11-17 に turbo LoRA が group でも使えるようになって転送律速の遅さはほぼ解消できる(A4000 Gen4 x4 で t2va 5 秒が 151 秒、8GB 級の指定でも 768² 209 秒 / 1024² 376 秒)、(3) 「int8+SDPA では FBC が効かない」は現在は当てはまらない(A4000 の int8 + SDPA・30 ステップで t2i 7 ステップ、t2va 6 ステップ分スキップ)。品質の記述(構成をまたぐと構図が変わるのは軌道の分岐であって劣化ではない)は変わらない。
+
 ---
 
 ## 7. 品質と等価性の担保
@@ -486,6 +494,7 @@ VRAM・所要時間・PSNR・MD5・ASR判定など、品質や性能に関する
 
 | 変数 | 既定値 | 効果 |
 |---|---|---|
+| `H3_PROFILE` | `auto` | 主プロファイルの自動選択(2026-11-17)。主プロファイル系の変数が未指定なら総 VRAM から 96/80/48/32/16/8GB 級の既定値一式を入れる。`96gb`〜`8gb` で強制、`off` で無効 |
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoderの量子化方式(`none`はbf16で66.7GB) |
 | `H3_TE_PRUNE` | `0` | TEの未使用上位レイヤー削除(出力は不変、nf4で-3.6GB) |
 | `H3_TE_DEVICE` | (空) | TEを指定GPUに常駐させ、解放しない(例: `cuda:1`) |
@@ -495,7 +504,13 @@ VRAM・所要時間・PSNR・MD5・ASR判定など、品質や性能に関する
 | `H3_TE_PREQUANT_DIR` | `models/prequant` | キャッシュ保存先 |
 | `H3_TE_PREQUANT_MIN_FREE_GB` | `25` | この空きディスクを下回ると保存をスキップ(生成は継続) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8`でtransformerを66.3GB→34GBに量子化 |
-| `H3_LOWVRAM` | `0` | `1`=48GB級のフェーズ循環 / `group`=24-32GB級のブロック単位オフロード |
+| `H3_LOWVRAM` | `0` | `1`=48GB級のフェーズ循環 / `group`=6〜32GB級のブロック単位ストリーミング(2026-11-15 から自作ストリーマ、`H3_GROUP_STREAM`) |
+
+| `H3_GROUP_STREAM` | `own` | group のブロック転送方式。`own`=自作の窓付き先読み(core/blockstream.py)/ `diffusers`=enable_group_offload(従来) |
+| `H3_GROUP_STREAM_HOST` | `auto` | ブロックの原本の置き場所。`auto` は搭載 RAM 48GB 未満なら `file`(量子化キャッシュから直接流す)、それ以外 `pinned` |
+| `H3_GROUP_STREAM_VAE` | `auto` | video VAE デコーダ(36 ブロック)も流すか。`auto` は最初のデコードで空き VRAM 8GB 未満なら流す |
+| `H3_TE_STREAM` / `H3_TE_DIET` | `0` / `0` | 投影 TE の LM 層のストリーミング / embed_tokens・lm_head の削減(6〜8GB 級の鍵) |
+| `H3_LEAN_BLOCK` / `H3_FF_CHUNK` / `H3_ATTN_HEAD_GROUPS` | `auto` | メモリ節約版のブロック forward(トークン分割・ヘッド分割 attention・in-place 残差)。auto は空き VRAM とトークン数から決める |
 | `H3_KEEP_TRANSFORMER` | `0` | transformerをデコード位相でも解放しない。`H3_LOWVRAM` が `group` 以外(`1`/`0` どちらでも可)、`H3_TE_DEVICE` または `H3_TE_PROJ` のいずれか、`H3_VIDEO_VAE_FP16=1` の3条件が必須(§5参照) |
 | `H3_VIDEO_VAE_FP16` | `0` | video VAEをfp16化(audio VAEは対象外) |
 | `H3_CACHE` | `fbc` | FirstBlockCache有効化(`none`で無効) |

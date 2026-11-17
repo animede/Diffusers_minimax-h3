@@ -1,5 +1,7 @@
 # minimax-h3 venv 完全独立再構築手順(Phase 5 用メモ)
 
+> **2026-11-17**: 通常のインストールは README の手順(`scripts/install.sh` が `requirements.txt` から自己完結の venv を作る)を使うこと。このメモは diffusers-movie-server 統合時に旧 venv を再構築した記録で、パスは movie-server 側のもの。PyTorch の extra index は使わない(torchao まで `+cu128` 版が入り、量子化キャッシュの照合キーが PyPI 版と食い違う)。
+
 現状(Phase 0)の `venv` は **/home/animede/minimax-h3/venv への symlink** であり、
 再構築は行っていない。将来この backend を旧ディレクトリから完全に切り離す場合は
 以下の手順で venv を独立再構築する。実際の旧 venv の完全なパッケージ一覧は
@@ -12,7 +14,7 @@
 | Python | 3.12(旧 venv は cp312) | |
 | torch | **2.9.0+cu128** | torchao 0.17 の対応上限。2.11 系に上げてはいけない(torchao/SageAttention wheel が壊れる) |
 | torchvision / torchaudio | 0.24.0 / 2.9.0 | torch 2.9 対応版 |
-| diffusers | **git PR #14355 コミット固定 `f37ab93e621d5ce206c9662e8291ca8b67d9c555`** | MiniMax-H3 対応 PR。マージ前のため必ずコミットハッシュ固定でインストールすること |
+| diffusers | **git PR #14355 コミット固定 `f37ab93e621d5ce206c9662e8291ca8b67d9c555`** | MiniMax-H3 対応 PR(2026-08-05 にマージ済み。f37ab93 はマージ最終形)。必ずコミットハッシュ固定でインストールすること |
 | transformers | 5.14.1 | |
 | torchao | **0.17.0**(公式 wheel) | prequant キャッシュ(models/prequant、36GB)はこのバージョンで生成されたもの。バージョンを変えると再量子化が必要になる可能性あり |
 | bitsandbytes | 0.49.0 | TE NF4(既定 `H3_TE_QUANT=bnb-4bit`) |
