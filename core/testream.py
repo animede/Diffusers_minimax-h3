@@ -45,10 +45,18 @@ logger = logging.getLogger("minimax_h3.testream")
 
 
 def _read_mem_available_gib() -> float:
-    with open("/proc/meminfo") as f:
-        for line in f:
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) / 1024**2
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024**2
+    except OSError:  # /proc が無い OS(Windows)は psutil で代替
+        try:
+            import psutil
+
+            return psutil.virtual_memory().available / 1024**3
+        except Exception:  # noqa: BLE001
+            pass
     return float("inf")
 
 

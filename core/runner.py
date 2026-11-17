@@ -4116,15 +4116,24 @@ def gpu_mem_gb() -> dict:
 
 
 def ram_gb() -> dict:
-    meminfo = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            parts = line.split()
-            meminfo[parts[0].rstrip(":")] = int(parts[1])
-    total = meminfo["MemTotal"] / 1e6
-    avail = meminfo["MemAvailable"] / 1e6
-    swap_total = meminfo.get("SwapTotal", 0) / 1e6
-    swap_free = meminfo.get("SwapFree", 0) / 1e6
+    # 2026-11-17: Windows には /proc が無いので、その場合だけ psutil(requirements.txt に入っている)で代替する。
+    # Linux は従来どおり /proc/meminfo(kB を 1e6 で割る従来の値のまま。RAM 閾値の判定を変えないため)。
+    if not os.path.exists("/proc/meminfo"):
+        import psutil
+
+        vm, sm = psutil.virtual_memory(), psutil.swap_memory()
+        total, avail = vm.total / 1e9, vm.available / 1e9
+        swap_total, swap_free = sm.total / 1e9, sm.free / 1e9
+    else:
+        meminfo = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                meminfo[parts[0].rstrip(":")] = int(parts[1])
+        total = meminfo["MemTotal"] / 1e6
+        avail = meminfo["MemAvailable"] / 1e6
+        swap_total = meminfo.get("SwapTotal", 0) / 1e6
+        swap_free = meminfo.get("SwapFree", 0) / 1e6
     return {
         "avail_gb": round(avail, 1),
         "total_gb": round(total, 1),

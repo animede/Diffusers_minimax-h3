@@ -92,7 +92,65 @@ venv/bin/pip install torchao==0.17.0
 
 > **About upgrading diffusers**: installing it is just the one line above (pure Python, no build; it takes well under a minute with `git` available). Care is needed only **when upgrading diffusers later**: a newer version can change the compute path and therefore the output, so keep the commit pinned. The move to f37ab93 itself was made only after every path (t2i / t2va / batch / ref2va / reference batch) was verified equivalent to the old pin abc5e9b by identical-seed MD5. Any further upgrade should go through the same regression check (`scripts/run_regression.py` with the baselines in docs/internal). Not needed for ordinary use.
 
-### SageAttention (optional, enabled by default)
+### Windows
+
+All dependencies have Windows wheels (torch 2.9.0+cu128 from the PyTorch index, torchao as PyPI's pure-Python wheel, bitsandbytes / av / psutil as PyPI Windows wheels). No compiler or Visual Studio Build Tools is needed. SageAttention has no Windows build and is not used; `H3_PROFILE=auto` sets `H3_ATTN_BACKEND=default` (SDPA) at startup. The OS-specific code paths (RAM readout, file read-ahead hints, temp-file location, the built-in LLM child process) have Windows branches.
+
+Requirements: Python 3.12 (callable as `py -3.12`), git, an NVIDIA driver for CUDA 12.8. `ffmpeg` is optional (gallery concatenation). If git or Python is missing, install them with winget (then reopen PowerShell):
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Python.Python.3.12 -e
+winget install --id Gyan.FFmpeg -e
+```
+
+```powershell
+git clone https://github.com/animede/Diffusers_minimax-h3.git
+cd Diffusers_minimax-h3
+.\scripts\install.ps1
+```
+
+`install.ps1` creates the venv and installs torch (cu128) and `requirements.txt`; add `-LocalLLM` to also fetch the built-in LLM binary. Then fetch the model and start:
+
+```powershell
+.\venv\Scripts\python.exe scripts\download_t2va.py
+.\run.ps1
+```
+
+Open `http://127.0.0.1:8611/` in a browser. To install by hand, run these in order (PyPI's Windows torch is CPU-only, so torch must come first from the PyTorch index):
+
+```powershell
+py -3.12 -m venv venv
+.\venv\Scripts\python.exe -m pip install --upgrade pip
+.\venv\Scripts\python.exe -m pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Set environment variables with `$env:` before starting (`H3_PORT` / `H3_HOST` for the port and bind address):
+
+```powershell
+$env:H3_TURBO_LORA = "1"
+.\run.ps1
+```
+
+If PowerShell's execution policy blocks the script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+The built-in LLM (the fallback when the external LLM is unreachable) can be added later even if you installed without `-LocalLLM`. It is fetched automatically on the first fallback; to fetch it ahead of time run the following (line 1 = the prebuilt `llama-server.exe`, about 25MB; line 2 = the Gemma 4 E4B GGUF, about 4.4GB, optional):
+
+```powershell
+.\venv\Scripts\python.exe scripts\fetch_llama_server.py
+.\venv\Scripts\python.exe scripts\fetch_llama_server.py --model
+```
+
+Running `.\scripts\install.ps1 -LocalLLM` later does the same (already-installed packages are left as they are). Details: [Built-in LLM (optional)](#built-in-llm-optional) below.
+
+> The Windows branches were written on paper: **this video server has not yet been verified on a real Windows machine** (the image server built the same way, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server), is verified on Windows 11 + RTX 3050). Please report problems as issues.
+
+### SageAttention (optional, enabled by default; Linux only)
 
 The default `H3_ATTN_BACKEND=sage` needs a build for sm_120 (there is no prebuilt Linux wheel). **If you do not build it, start with `H3_ATTN_BACKEND=default`** (denoise is about 12% slower; no functional difference).
 
@@ -111,7 +169,7 @@ scripts/install.sh --local-llm            # pre-fetch llama-server into tools/ll
 venv/bin/python scripts/fetch_llama_server.py --model   # also pre-fetch the GGUF, about 4.4GB (optional)
 ```
 
-Both are optional: on the first fallback `llama-server` is fetched into `tools/llama/` and the model into `models/llm/` automatically. The child process stops with the server, and if the server is killed hard it is taken down with it (Windows: Job Object with KILL_ON_JOB_CLOSE; Linux: `PR_SET_PDEATHSIG`), so it never lingers as an orphan (verified with SIGKILL on Linux; Windows untested). To use existing files set `H3_LLAMA_SERVER=<path to llama-server>` and `H3_LLM_LOCAL_GGUF=<path to the GGUF>` (a llama-server you started yourself that answers on `H3_LLM_LOCAL_PORT` is used as-is).
+Both are optional and can be run later on an existing installation. On the first fallback `llama-server` is fetched into `tools/llama/` and the model into `models/llm/` automatically. The child process stops with the server, and if the server is killed hard it is taken down with it (Windows: Job Object with KILL_ON_JOB_CLOSE; Linux: `PR_SET_PDEATHSIG`), so it never lingers as an orphan (verified with SIGKILL on Linux; Windows untested). To use existing files set `H3_LLAMA_SERVER=<path to llama-server>` and `H3_LLM_LOCAL_GGUF=<path to the GGUF>` (a llama-server you started yourself that answers on `H3_LLM_LOCAL_PORT` is used as-is).
 
 
 ### Obtaining the model
@@ -132,7 +190,7 @@ venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 
 With nothing set, **`H3_PROFILE=auto`** picks the 96 / 80 / 48 / 32 / 16 / 8GB-tier defaults (the same flags as the launch examples below) from the compute GPU's total VRAM. Setting any of the main profile variables (`H3_LOWVRAM`, `H3_TE_PROJ`, ...) switches to manual mode and nothing is filled in automatically. When the default sage build cannot be used (a GPU other than sm_120, or sageattention not installed) `H3_ATTN_BACKEND=default` is also set automatically. The chosen tier is shown in `/api/status` under `profile` and in the startup log.
 
-Open `http://<host>:8611/` in a browser. The first start takes a few minutes to load the models (by default the TE is NF4-quantized and kept on the GPU). `run.sh` is the launcher used by the diffusers-movie-server integration: it starts the same server on internal port 8631 with the conversation-oriented defaults (turbo LoRA etc.).
+Open `http://<host>:8611/` in a browser. The first start takes a few minutes to load the models (by default the TE is NF4-quantized and kept on the GPU). On Windows use `.\run.ps1` (pass environment variables as `$env:H3_...`). `run.sh` is the launcher used by the diffusers-movie-server integration: it starts the same server on internal port 8631 with the conversation-oriented defaults (turbo LoRA etc.).
 
 Launch examples per VRAM tier:
 
@@ -243,6 +301,7 @@ For a conversational application built on this server see [Realtime_Narration_Vi
 minimax-h3/
 ├── app.py                 # FastAPI server (port 8611)
 ├── run.sh                 # launcher for the diffusers-movie-server integration (port 8631)
+├── run.ps1                # Windows launcher (port 8611)
 ├── core/
 │   ├── runner.py          # ModularPipeline loading / generation logic
 │   ├── blockstream.py     # windowed prefetch streamer for transformer blocks (H3_GROUP_STREAM=own)
@@ -256,7 +315,7 @@ minimax-h3/
 │   ├── llm.py, prompt_check.py   # LLM prompt enhancement and verification
 │   ├── settings.py, gallery.py
 ├── static/index.html      # single-page UI (ja / en)
-├── scripts/               # download, regression and probe scripts
+├── scripts/               # install.sh / install.ps1, download, regression and probe scripts
 ├── docs/                  # documentation (table above)
 ├── models/                # quantized caches etc. (git-ignored)
 ├── outputs/, logs/        # outputs and logs (git-ignored)

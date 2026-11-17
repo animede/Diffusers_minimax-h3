@@ -92,7 +92,65 @@ venv/bin/pip install torchao==0.17.0
 
 > **diffusers の更新について**: インストール自体は上の 1 行で済む(純 Python なのでビルドは無く、`git` があれば数十秒で入る)。注意が要るのは**あとから diffusers を上げるとき**で、計算経路が変わって出力が変わりうるため、コミット固定のまま使うこと。f37ab93 への追従も、全経路(t2i / t2va / バッチ / ref2va / 参照バッチ)が旧ピン abc5e9b と同一 seed の MD5 で等価であることを確認してから行った。さらに上げる場合は同じ回帰確認(`scripts/run_regression.py` と docs/internal の基準値)を踏む。普通に使うだけなら不要。
 
-### SageAttention(任意、既定で有効)
+### Windows
+
+依存パッケージは Windows 用の wheel がそろっています(torch 2.9.0+cu128 は PyTorch の index から、torchao は PyPI の純 Python wheel、bitsandbytes / av / psutil は PyPI の Windows wheel)。コンパイラや Visual Studio Build Tools は不要です。SageAttention は Windows 向けのビルドが無いため使わず、起動時に `H3_PROFILE=auto` が `H3_ATTN_BACKEND=default`(SDPA)を自動で入れます。コード側の OS 依存(RAM の取得、ファイルの先読み指示、一時ファイルの置き場所、内蔵 LLM の子プロセス)は Windows 用に分岐済みです。
+
+必要なもの: Python 3.12(`py -3.12` で呼べること)、git、CUDA 12.8 系に対応した NVIDIA ドライバ。`ffmpeg` は任意(ギャラリーの連結用)。git や Python が無い場合は winget で入れる(入れたあと PowerShell を開き直す):
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Python.Python.3.12 -e
+winget install --id Gyan.FFmpeg -e
+```
+
+```powershell
+git clone https://github.com/animede/Diffusers_minimax-h3.git
+cd Diffusers_minimax-h3
+.\scripts\install.ps1
+```
+
+`install.ps1` は venv を作り、torch(cu128)と `requirements.txt` を入れる。`-LocalLLM` を付けると内蔵 LLM のバイナリも取得する。続けてモデルを取得して起動する:
+
+```powershell
+.\venv\Scripts\python.exe scripts\download_t2va.py
+.\run.ps1
+```
+
+ブラウザで `http://127.0.0.1:8611/` を開く。手動で入れる場合は次の順に実行する(PyPI の Windows 版 torch は CPU 専用なので、torch を先に PyTorch の index から入れる順序が必要):
+
+```powershell
+py -3.12 -m venv venv
+.\venv\Scripts\python.exe -m pip install --upgrade pip
+.\venv\Scripts\python.exe -m pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+環境変数は起動前に `$env:` で設定する(`H3_PORT` / `H3_HOST` でポートと待ち受けアドレス):
+
+```powershell
+$env:H3_TURBO_LORA = "1"
+.\run.ps1
+```
+
+PowerShell の実行ポリシーで止まる場合は次のように起動する:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+内蔵 LLM(外部 LLM に接続できないときのフォールバック)は、インストール時に `-LocalLLM` を付けなくても後から入れられる。初回のフォールバック時に自動取得されるが、先に取っておく場合は次を実行する(1 行目がビルド済み `llama-server.exe`(約 25MB)、2 行目が Gemma 4 E4B の GGUF(約 4.4GB)。GGUF は省略可):
+
+```powershell
+.\venv\Scripts\python.exe scripts\fetch_llama_server.py
+.\venv\Scripts\python.exe scripts\fetch_llama_server.py --model
+```
+
+`.\scripts\install.ps1 -LocalLLM` を後から実行しても同じ(既に入っている依存はそのまま)。詳細は下の「[内蔵 LLM(任意)](#内蔵-llm任意)」。
+
+> Windows 用の分岐は机上で用意したもので、**この動画サーバ自体の Windows 実機確認はまだ行っていません**(同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で確認済み)。問題があれば issue で報告してください。
+
+### SageAttention(任意、既定で有効。Linux のみ)
 
 既定の `H3_ATTN_BACKEND=sage` を使うには sm_120 向けのビルドが要る(Linux 向けの事前ビルド wheel は無い)。**ビルドしない場合は `H3_ATTN_BACKEND=default` を指定して起動する**(デノイズが約 12% 遅くなるだけで機能に影響はない)。
 
@@ -111,7 +169,7 @@ scripts/install.sh --local-llm            # llama-server を tools/llama/ へ先
 venv/bin/python scripts/fetch_llama_server.py --model   # GGUF(約 4.4GB)も先に取得(任意)
 ```
 
-どちらも省略できる。初めてフォールバックしたときに `llama-server` は `tools/llama/` へ、モデルは `models/llm/` へ自動取得される。子プロセスはサーバ終了時に止まり、サーバが強制終了された場合も Windows は Job Object(KILL_ON_JOB_CLOSE)、Linux は `PR_SET_PDEATHSIG` で道連れにするので孤児にならない(Linux は SIGKILL で実測、Windows は未検証)。既にあるものを使うなら `H3_LLAMA_SERVER=<llama-server のパス>`、`H3_LLM_LOCAL_GGUF=<GGUF のパス>` で指定する(自分で起動した llama-server が `H3_LLM_LOCAL_PORT` で応答していればそれをそのまま使う)。
+どちらも省略でき、後から実行しても同じ(インストール済みの環境に足せる)。初めてフォールバックしたときに `llama-server` は `tools/llama/` へ、モデルは `models/llm/` へ自動取得される。子プロセスはサーバ終了時に止まり、サーバが強制終了された場合も Windows は Job Object(KILL_ON_JOB_CLOSE)、Linux は `PR_SET_PDEATHSIG` で道連れにするので孤児にならない(Linux は SIGKILL で実測、Windows は未検証)。既にあるものを使うなら `H3_LLAMA_SERVER=<llama-server のパス>`、`H3_LLM_LOCAL_GGUF=<GGUF のパス>` で指定する(自分で起動した llama-server が `H3_LLM_LOCAL_PORT` で応答していればそれをそのまま使う)。
 
 
 ### モデルの取得
@@ -132,7 +190,7 @@ venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 
 何も指定しなければ **`H3_PROFILE=auto`** が計算用 GPU の総 VRAM から 96 / 80 / 48 / 32 / 16 / 8GB 級の既定値一式(下の起動例と同じ内容)を選ぶ。`H3_LOWVRAM` や `H3_TE_PROJ` など主プロファイル系の変数をひとつでも指定すると手動扱いになり、自動では何も入れない。sage が使えない GPU(sm_120 以外)や未インストールのときは `H3_ATTN_BACKEND=default` も自動で入る。選ばれた級は `/api/status` の `profile` と起動ログで確認できる。
 
-ブラウザで `http://<host>:8611/` を開く。初回起動時はモデルのロード(既定では TE を NF4 量子化して GPU 常駐)に数分かかる。`run.sh` は diffusers-movie-server 統合用の起動スクリプトで、内部ポート 8631 と会話用途の既定値(turbo LoRA 等)を設定したうえで同じサーバを起動する。
+ブラウザで `http://<host>:8611/` を開く。初回起動時はモデルのロード(既定では TE を NF4 量子化して GPU 常駐)に数分かかる。Windows は `.\run.ps1`(環境変数は `$env:H3_...` で渡す)。`run.sh` は diffusers-movie-server 統合用の起動スクリプトで、内部ポート 8631 と会話用途の既定値(turbo LoRA 等)を設定したうえで同じサーバを起動する。
 
 VRAM 級別の起動例:
 
@@ -243,6 +301,7 @@ venv/bin/python scripts/probe_t2va.py
 minimax-h3/
 ├── app.py                 # FastAPI 本体(port 8611)
 ├── run.sh                 # diffusers-movie-server 統合用の起動スクリプト(port 8631)
+├── run.ps1                # Windows 用の起動スクリプト(port 8611)
 ├── core/
 │   ├── runner.py          # ModularPipeline のロード / 生成ロジック本体
 │   ├── blockstream.py     # transformer ブロックの窓付き先読みストリーマ(H3_GROUP_STREAM=own)
@@ -256,7 +315,7 @@ minimax-h3/
 │   ├── llm.py, prompt_check.py   # LLM プロンプト強化と検証
 │   ├── settings.py, gallery.py
 ├── static/index.html      # 単一ページ UI(日英)
-├── scripts/               # ダウンロード・回帰・各種プローブ
+├── scripts/               # install.sh / install.ps1、ダウンロード・回帰・各種プローブ
 ├── docs/                  # ドキュメント(上の表)
 ├── models/                # 量子化済みキャッシュ等(.gitignore 対象)
 ├── outputs/, logs/        # 生成物・ログ(.gitignore 対象)

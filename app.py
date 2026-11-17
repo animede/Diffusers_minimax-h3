@@ -809,7 +809,7 @@ def api_ref2va(
         for upload in references:
             kind = _detect_reference_kind(upload)
             suffix = Path(upload.filename or "").suffix or {"image": ".png", "video": ".mp4", "audio": ".wav"}[kind]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir="/tmp") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempfile.gettempdir()) as tmp:
                 tmp.write(upload.file.read())
                 tmp_path = Path(tmp.name)
             tmp_paths.append(tmp_path)
@@ -956,7 +956,7 @@ def _run_ref_batch(
         for upload in references:
             kind = _detect_reference_kind(upload)
             suffix = Path(upload.filename or "").suffix or {"image": ".png", "video": ".mp4", "audio": ".wav"}[kind]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir="/tmp") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempfile.gettempdir()) as tmp:
                 tmp.write(upload.file.read())
                 tmp_path = Path(tmp.name)
             tmp_paths.append(tmp_path)
