@@ -55,11 +55,51 @@ TIERS = (
 INFO: dict = {"mode": "unapplied"}
 
 
+# group の原本をファイルから流す(H3_GROUP_STREAM_HOST=file)判定と同じ閾値(core/runner.py の
+# H3_GROUP_STREAM_FILE_BELOW_GB の既定)。file は LoRA バッファを流せないので turbo と併用できない。
+FILE_STREAM_BELOW_GB = 48.0
+
+
+def _host_ram_gb() -> float | None:
+    try:
+        import psutil
+
+        return psutil.virtual_memory().total / 1e9
+    except Exception:  # noqa: BLE001
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1e6
+        except OSError:
+            pass
+    return None
+
+
+def tier_env(total_vram_gb: float, host_ram_gb: float | None, group_host: str = "auto") -> tuple[str, dict, str | None]:
+    """(級, 既定値一式, turbo を外した理由 or None)。純粋関数(テスト用)。"""
+    name, env = TIERS[-1][0], TIERS[-1][2]
+    for n, floor, e in TIERS:
+        if total_vram_gb >= floor:
+            name, env = n, e
+            break
+    env = dict(env)
+    note = None
+    if "H3_TURBO_LORA" in env:
+        below = float(os.environ.get("H3_GROUP_STREAM_FILE_BELOW_GB", "").strip() or FILE_STREAM_BELOW_GB)
+        uses_file = group_host == "file" or (group_host == "auto" and host_ram_gb is not None and host_ram_gb < below)
+        if uses_file:
+            for k in list(_TURBO):
+                env.pop(k, None)
+            why = ("H3_GROUP_STREAM_HOST=file が指定されている" if group_host == "file"
+                   else f"host RAM {host_ram_gb:.0f}GB が {below:.0f}GB 未満な")
+            note = (f"{why}ので重みをファイルから流す(file)構成になり、"
+                    "turbo LoRA は併用できないため入れない(GUI の turbo も無効)")
+    return name, env, note
+
+
 def _tier_for(total_gb: float) -> tuple[str, dict]:
-    for name, floor, env in TIERS:
-        if total_gb >= floor:
-            return name, env
-    return TIERS[-1][0], TIERS[-1][2]
+    name, env, _ = tier_env(total_gb, _host_ram_gb(), os.environ.get("H3_GROUP_STREAM_HOST", "auto").strip().lower() or "auto")
+    return name, env
 
 
 def apply() -> dict:
@@ -83,15 +123,21 @@ def apply() -> dict:
     elif requested == "auto" and explicit:
         info["mode"] = "manual"
     else:
+        host_ram = _host_ram_gb()
+        group_host = os.environ.get("H3_GROUP_STREAM_HOST", "auto").strip().lower() or "auto"
+        info["host_ram_gb"] = round(host_ram, 1) if host_ram else None
         if requested in names:
-            tier, env = next((n, e) for n, _, e in TIERS if n == requested)
+            floor = next(f for n, f, _ in TIERS if n == requested)
+            tier, env, note = tier_env(floor, host_ram, group_host)
             info["mode"] = "forced"
         else:
             if requested != "auto":
                 logger.warning("H3_PROFILE=%r は不明です(auto / off / %s)。auto として扱います",
                                requested, " / ".join(sorted(names)))
-            tier, env = _tier_for(total_gb)
+            tier, env, note = tier_env(total_gb, host_ram, group_host)
             info["mode"] = "auto"
+        if note:
+            info["note"] = note
         info["tier"] = tier
         for k, v in env.items():
             if k not in os.environ:
@@ -109,9 +155,10 @@ def apply() -> dict:
                                    else "sageattention 未インストール")
 
     if info["mode"] in ("auto", "forced"):
-        logger.info("H3_PROFILE=%s: 総 VRAM %.1fGB -> %s 級、設定 %s%s", requested, total_gb, info["tier"],
+        logger.info("H3_PROFILE=%s: 総 VRAM %.1fGB -> %s 級、設定 %s%s%s", requested, total_gb, info["tier"],
                     info["applied"] or "(なし = 既定)",
-                    f"(H3_ATTN_BACKEND=default: {info['attn_reason']})" if "attn_reason" in info else "")
+                    f"(H3_ATTN_BACKEND=default: {info['attn_reason']})" if "attn_reason" in info else "",
+                    f"。{info['note']}" if info.get("note") else "")
     elif info["mode"] == "manual":
         logger.info("H3_PROFILE=auto: %s が明示指定されているので手動扱い(自動設定なし)%s", explicit,
                     f"。H3_ATTN_BACKEND=default({info['attn_reason']})" if "attn_reason" in info else "")
