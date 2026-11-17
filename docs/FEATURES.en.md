@@ -185,6 +185,7 @@ only set these if you want to change them permanently):
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `H3_PROFILE` | `auto` | Added 2026-11-17. When none of the main profile variables is set, fills in the 96/80/48/32/16/8GB-tier defaults from total VRAM (`core/profile.py`). `96gb`..`8gb` forces a tier, `off` disables. Also sets `H3_ATTN_BACKEND=default` when sage cannot be used |
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder quantization (`none` = bf16, 66.7GB) |
 | `H3_TE_PRUNE` | `0` | Remove unused upper layers of TE (output unchanged, -3.6GB) |
 | `H3_TE_PROJ` | (off) | **Projected TE**: replaces the 32B TE with Qwen3-VL-4B + a linear map (repo id or .safetensors path; quality is an approximation, see the dated 2026-08-10 section) |

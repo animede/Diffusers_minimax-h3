@@ -185,6 +185,12 @@ MODEL_ID = "MiniMaxAI/MiniMax-H3"
 DEVICE = torch.device("cuda:0")
 CPU = torch.device("cpu")
 
+# H3_PROFILE: 主プロファイル(H3_LOWVRAM / H3_TE_PROJ / ... の一式)を総 VRAM から自動で選ぶ。明示指定が
+# ひとつでもあれば何もしない。この下の `os.environ.get("H3_...")` より**前**に走らせる(core/profile.py)。
+import core.profile as _h3_profile  # noqa: E402
+
+_H3_PROFILE_INFO = _h3_profile.apply()
+
 # ---------------------------------------------------------------------------
 # H3_VRAM_LIMIT_GB: このプロセスが計算用GPU上で確保できる VRAM の上限 (GB, 10進)。
 # 既定は空 = 無制限 (カード全部を使ってよい)。
@@ -7654,6 +7660,7 @@ class MiniMaxH3Runner:
             # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
             # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
             "vram_limit_gb": float(H3_VRAM_LIMIT_GB) if H3_VRAM_LIMIT_GB else None,
+            "profile": _H3_PROFILE_INFO,
             "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
             "group_stream": H3_GROUP_STREAM if H3_LOWVRAM_GROUP else None,
             "group_stream_refiner": H3_GROUP_STREAM_REFINER if H3_LOWVRAM_GROUP else None,

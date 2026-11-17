@@ -1231,6 +1231,8 @@ def api_outputs_concat(names: list[str] = Body(..., embed=True)):
 
 @app.on_event("startup")
 def on_startup():
+    # core/profile.py は runner の import 時(logging.basicConfig より前)に走るので、選択結果をここで出し直す
+    logger.info("H3_PROFILE: %s", runner_mod._H3_PROFILE_INFO)
     logger.info("startup: preloading transformer/vae/audio_vae (text_encoder loaded/freed per request)")
     try:
         runner.preload_all()

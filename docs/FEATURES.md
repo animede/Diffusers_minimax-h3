@@ -173,6 +173,7 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
+| `H3_PROFILE` | `auto` | 2026-11-17 追加。主プロファイル系の変数が未指定なら総 VRAM から 96/80/48/32/16/8GB 級の既定値一式を入れる(`core/profile.py`)。`96gb`〜`8gb` で強制、`off` で無効。sage が使えなければ `H3_ATTN_BACKEND=default` も入れる |
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder の量子化(`none` は bf16 で 66.7GB) |
 | `H3_TE_PRUNE` | `0` | TE の未使用上位レイヤー削除(出力は不変、-3.6GB) |
 | `H3_TE_PROJ` | (無効) | **投影TE**: 32B TE を Qwen3-VL-4B+線形写像で代替(repo id か .safetensors パス。品質は近似、日付節 2026-08-10 参照) |
