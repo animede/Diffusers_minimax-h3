@@ -67,20 +67,7 @@ fi
 
 echo
 echo "==> 確認"
-venv/bin/python - <<'PY'
-import torch, diffusers, transformers
-print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
-print("diffusers", diffusers.__version__, "transformers", transformers.__version__)
-try:
-    import sageattention  # noqa: F401
-    print("sageattention: installed (H3_ATTN_BACKEND=sage, sm_120 only)")
-except ImportError:
-    print("sageattention: not installed -> start with H3_ATTN_BACKEND=default")
-import sys; sys.path.insert(0, ".")
-from core import local_llm
-exe = local_llm.find_binary()
-print("built-in LLM (llama-server):", exe if exe else "not fetched yet -> fetched automatically on first fallback, or scripts/install.sh --local-llm")
-PY
+venv/bin/python scripts/check_install.py
 
 echo
 echo "完了。次はモデルの取得:  venv/bin/python scripts/download_t2va.py"

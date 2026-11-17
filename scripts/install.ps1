@@ -54,17 +54,7 @@ if ($LocalLLM) {
 
 Write-Host ""
 Write-Host "==> check"
-$check = @'
-import sys
-sys.path.insert(0, ".")
-import torch, diffusers, transformers, torchao
-print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
-print("diffusers", diffusers.__version__, "transformers", transformers.__version__, "torchao", torchao.__version__)
-from core import local_llm
-exe = local_llm.find_binary()
-print("built-in LLM (llama-server):", exe if exe else "not fetched yet -> fetched automatically on first fallback, or install.bat -LocalLLM")
-'@
-& $python -c $check
+& $python scripts\check_install.py
 Write-Host ""
 Write-Host "Done. Next, fetch the model:  .\venv\Scripts\python.exe scripts\download_t2va.py"
 Write-Host "Start the server:             .\run.bat   (http://127.0.0.1:8611/)"
