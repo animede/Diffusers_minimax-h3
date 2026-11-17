@@ -1,0 +1,41 @@
+# minimax-h3 の依存パッケージ(検証済みのピン)。
+#   venv/bin/pip install -r requirements.txt      または scripts/install.sh
+#
+# torch 系は CUDA 12.8 ビルド。Linux x86_64 の PyPI wheel(torch 2.9.0)は cu128 ビルドなので index の指定は不要。
+# PyTorch の extra index(download.pytorch.org/whl/cu128)は付けないこと: torchao まで `0.17.0+cu128` が入り、
+# 量子化キャッシュの照合キー(torchao のバージョン文字列)が PyPI 版 `0.17.0` と食い違ってキャッシュが無効になる。
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0
+
+# ============================================================================
+# 【重要】diffusers は検証済みコミット f37ab93(PR #14355 のマージ最終形)に固定。
+#        PyPI 版や最新 main に差し替えないこと(README の「diffusers の更新について」参照)
+# ============================================================================
+diffusers @ git+https://github.com/huggingface/diffusers.git@f37ab93e621d5ce206c9662e8291ca8b67d9c555
+
+# transformers は 5.14.1 以上が必須(5.1.0 には Qwen3VLProcessor.create_mm_token_type_ids が無い)
+transformers==5.14.1
+tokenizers==0.22.1
+accelerate==1.12.0
+safetensors==0.8.0
+huggingface_hub==1.26.0
+peft==0.18.0            # turbo LoRA の読み込み
+
+# 量子化
+bitsandbytes==0.49.0    # text_encoder の 4bit(既定の H3_TE_QUANT=bnb-4bit)
+torchao==0.17.0         # transformer の int8(H3_TRANSFORMER_QUANT=int8 / H3_LOWVRAM)。0.18 以降は torch>=2.11 を要求
+
+# 動画/音声の多重化と Web API
+av==16.0.1
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+pillow==10.4.0
+numpy==2.2.6
+psutil==7.1.3           # ホスト RAM の空き監視(H3_GROUP_STREAM_HOST=file)
+
+# ---- 任意(必要なときだけ手で入れる) --------------------------------------
+# comfy-kitchen          # ck-w4a8 量子化(H3_TRANSFORMER_QUANT=ck-w4a8 / H3_PRUNED_QUANT=ck-w4a8)
+# sageattention          # sm_120 専用の自前ビルド(scripts/install.sh --sage / scripts/build_sageattention.sh)
+# hyperflow_h3           # HyperFlow(ref2va 専用の 8 NFE 蒸留)。公式パッケージを別途入れる

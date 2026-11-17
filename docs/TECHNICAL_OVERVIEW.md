@@ -541,4 +541,4 @@ VRAM・所要時間・PSNR・MD5・ASR判定など、品質や性能に関する
 
 ---
 
-設計判断の背景・実装時に踏んだ罠の詳細は内部資料 [docs/internal/TECHNICAL_REPORT.md](internal/TECHNICAL_REPORT.md) を参照。運用手順・実測値の一次情報は [README.md](../README.md)、VRAM常駐設計の詳細は [docs/RESIDENCY.md](RESIDENCY.md) を参照。
+設計判断の背景・実装時に踏んだ罠の詳細は内部資料 [docs/internal/TECHNICAL_REPORT.md](internal/TECHNICAL_REPORT.md) を参照。使い方は [README.md](../README.md)、各機能の詳細と実測値の一次情報は [docs/FEATURES.md](FEATURES.md)、時系列の作業記録は [docs/HISTORY.md](HISTORY.md)、VRAM常駐設計の詳細は [docs/RESIDENCY.md](RESIDENCY.md) を参照。

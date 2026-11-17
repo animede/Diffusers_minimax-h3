@@ -544,4 +544,4 @@ There are other environment variables for diagnostics/debugging as well, but the
 
 ---
 
-For the background of design decisions and details of pitfalls encountered during implementation, see the internal document [docs/internal/TECHNICAL_REPORT.en.md](internal/TECHNICAL_REPORT.en.md). For operational procedures and primary-source measured values, see [README.en.md](../README.en.md); for details of the VRAM residency design, see [docs/RESIDENCY.en.md](RESIDENCY.en.md).
+For the background of design decisions and details of pitfalls encountered during implementation, see the internal document [docs/internal/TECHNICAL_REPORT.en.md](internal/TECHNICAL_REPORT.en.md). For how to use the app see [README.en.md](../README.en.md), for feature details and primary-source measurements see [docs/FEATURES.en.md](FEATURES.en.md), for the chronological work log see [docs/HISTORY.en.md](HISTORY.en.md); for details of the VRAM residency design, see [docs/RESIDENCY.en.md](RESIDENCY.en.md).
