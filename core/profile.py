@@ -10,7 +10,7 @@ DEVICE 定義の直後)。入れ方は `os.environ.setdefault` なので、明�
   `H3_VRAM_LIMIT_GB` で小さいカードを模擬するときは総 VRAM が変わらないので、こちらで級を指定する。
 - `H3_PROFILE=off`: 何もしない。
 
-級の中身は README の「VRAM 級別の起動例」と同じ。別途、`H3_ATTN_BACKEND` が未指定で既定の sage が
+級の中身は README の「VRAM 級別の起動例」と同じ(group 級は turbo LoRA も既定で ON、下の _TURBO 参照)。別途、`H3_ATTN_BACKEND` が未指定で既定の sage が
 使えない(sm_120 以外、または sageattention 未インストール)ときは `default`(SDPA)に落とす
 (これはプロファイルの手動/自動に関わらず、未指定のときだけ)。
 """
@@ -30,14 +30,24 @@ MAIN_KNOBS = (
     "H3_VIDEO_VAE_FP16", "H3_TE_STREAM", "H3_TE_DIET", "H3_TE_DEVICE", "H3_PRUNED", "H3_KEEP_TRANSFORMER",
 )
 
-_16GB = {"H3_LOWVRAM": "group", "H3_TE_PROJ": "NicoLab28/ClipProj-MiniMax-H3", "H3_VIDEO_VAE_FP16": "1"}
+# group 級(32GB 以下)は turbo LoRA(4 ステップ蒸留)を既定で ON にする。group では起動時に巻かないと
+# リクエスト単位では巻けず(ブロックストリーマの転送対象が構築時に固定される)、GUI のチェックからも使えないため。
+# 不要なら H3_TURBO_LORA=0 を明示する(GUI で turbo を外せば 30 ステップで走る)。ファイルは ref2va 用(ref2v)と
+# t2va / fl2va 用(fl2v)を分ける(2026-11-17 に A4000 で実測した組み合わせ)。48GB 以上は起動後にリクエスト単位で
+# 巻けるので、GUI の turbo チェックに任せる。
+_TURBO = {
+    "H3_TURBO_LORA": "1",
+    "H3_TURBO_LORA_FILE": "minimax_h3_ref2v_turbo_4step_v1.0_768p_bf16.safetensors",
+    "H3_TURBO_LORA_FILE_BASE": "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+}
+_16GB = {"H3_LOWVRAM": "group", "H3_TE_PROJ": "NicoLab28/ClipProj-MiniMax-H3", "H3_VIDEO_VAE_FP16": "1", **_TURBO}
 
 # (名前, 総 VRAM の下限 GB(10 進), 既定値一式)。上から順に最初に当てはまった級を使う。
 TIERS = (
     ("96gb", 90.0, {}),
     ("80gb", 70.0, {"H3_TRANSFORMER_QUANT": "int8"}),
     ("48gb", 40.0, {"H3_LOWVRAM": "1", "H3_TE_PRUNE": "1", "H3_VIDEO_VAE_FP16": "1"}),
-    ("32gb", 20.0, {"H3_LOWVRAM": "group", "H3_TE_PRUNE": "1"}),
+    ("32gb", 20.0, {"H3_LOWVRAM": "group", "H3_TE_PRUNE": "1", **_TURBO}),
     ("16gb", 11.0, dict(_16GB)),
     ("8gb", 0.0, {**_16GB, "H3_TE_STREAM": "1", "H3_TE_DIET": "1"}),
 )
