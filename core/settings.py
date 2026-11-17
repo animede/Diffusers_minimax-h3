@@ -276,7 +276,9 @@ def current_settings_snapshot() -> dict:
         },
         "choices": {
             "cache": list(INSTANT_CACHE_CHOICES),
-            "transformer_quant": list(RELOAD_TRANSFORMER_QUANT_CHOICES),
+            # ck-w4a8 は起動時専用 (apply_reload_settings 参照) だが、現在値として表示できるように含める
+            "transformer_quant": list(RELOAD_TRANSFORMER_QUANT_CHOICES)
+            + (["ck-w4a8"] if runner.H3_TRANSFORMER_QUANT == "ck-w4a8" else []),
             "te_quant": list(RELOAD_TE_QUANT_CHOICES),
             "te_proj_quant": list(RELOAD_TE_PROJ_QUANT_CHOICES),
             "lowvram": list(RELOAD_LOWVRAM_CHOICES),
@@ -292,8 +294,10 @@ def current_settings_snapshot() -> dict:
             # 既定の diffusers ネイティブ LoRA (lightx2v) では False になり、UI は
             # 低VRAMモードでも turbo を有効にできる。
             "turbo_incompatible_with_lowvram": runner.turbo_lora_expected_format() == "comfy",
-            # group offload は LoRA 形式を問わず不可 (validate_instant_settings 参照)
-            "turbo_incompatible_with_lowvram_group": True,
+            # 2026-11-17: 自作ストリーマ (H3_GROUP_STREAM=own) で起動時 (H3_TURBO_LORA=1) に巻いてあれば
+            # group でも turbo を使える。それ以外 (diffusers の group offload、または起動時に巻いて
+            # いない) はロード後に巻けないので不可 (validate_instant_settings 参照)。
+            "turbo_incompatible_with_lowvram_group": not (runner.H3_GROUP_STREAM == "own" and runner.H3_TURBO_LORA),
             "turbo_incompatible_with_transformer_both_resident": runner.turbo_lora_expected_format() == "comfy",
             "turbo_incompatible_with_upscale": False,
             # H3_ADALN_PRECOMP (process-wide env flag, not a reload-group field -- see
@@ -398,7 +402,16 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
         new_te_prune = bool(new_te_prune)
         new_video_vae_fp16 = bool(new_video_vae_fp16)
 
-        if new_transformer_quant not in RELOAD_TRANSFORMER_QUANT_CHOICES:
+        if new_transformer_quant == "ck-w4a8" or runner.H3_TRANSFORMER_QUANT == "ck-w4a8":
+            # ck-w4a8 は H3_PRUNED=1 / comfy-kitchen / pinned 退避と結び付いた起動時設定 (runner.py の
+            # import 時ガード参照) で、再ロード API からの切替は未対応。現在値のままなら通す (他の項目だけ
+            # 変えられるように)、ck-w4a8 への / からの変更は拒否する。
+            if new_transformer_quant != runner.H3_TRANSFORMER_QUANT:
+                raise ValueError(
+                    "transformer_quant の ck-w4a8 への/からの切替は再ロード設定からはできません "
+                    "(H3_PRUNED=1 と comfy-kitchen を前提にした起動時の環境変数で指定してください)。"
+                )
+        elif new_transformer_quant not in RELOAD_TRANSFORMER_QUANT_CHOICES:
             raise ValueError(
                 f"transformer_quant must be one of {RELOAD_TRANSFORMER_QUANT_CHOICES}, "
                 f"got {new_transformer_quant!r}"
@@ -460,7 +473,8 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                     "transformer_quant from the request (it will default to int8 under "
                     "lowvram) or set transformer_quant=int8 explicitly."
                 )
-            new_transformer_quant = "int8"
+            if new_transformer_quant != "ck-w4a8":   # ck-w4a8 (24/32GB 単騎構成) はそのまま
+                new_transformer_quant = "int8"
             if new_te_quant != "bnb-4bit":
                 raise ValueError(
                     f"lowvram={new_lowvram_raw!r} requires te_quant=bnb-4bit, got "
@@ -468,7 +482,7 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                     "anything else on a 24-48GB-class card."
                 )
 
-        new_transformer_both_resident = new_transformer_quant == "int8" and not new_lowvram_any
+        new_transformer_both_resident = new_transformer_quant in ("int8", "ck-w4a8") and not new_lowvram_any
 
         # turbo (instant-group) compatibility with the *new* reload config: reject the
         # apply outright if turbo is currently on and would become a confirmed-broken

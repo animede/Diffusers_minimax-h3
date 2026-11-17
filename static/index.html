@@ -820,6 +820,7 @@
           <select id="reload-transformer-quant">
             <option value="none">none (bf16)</option>
             <option value="int8">int8</option>
+            <option value="ck-w4a8" disabled data-i18n="option.tqCkW4a8">ck-w4a8 (起動時のみ)</option>
           </select>
         </div>
         <div class="reload-field" id="row-reload-te-quant">
@@ -854,7 +855,7 @@
           <select id="reload-lowvram">
             <option value="0" data-i18n="option.lowvram0">0 (無効・48GB超級)</option>
             <option value="1" data-i18n="option.lowvram1">1 (48GB級・per-request reload)</option>
-            <option value="group" data-i18n="option.lowvramGroup">group (24-32GB級・group offload常駐)</option>
+            <option value="group" data-i18n="option.lowvramGroup">group (6〜32GB級・ブロックストリーミング常駐)</option>
           </select>
         </div>
         <div class="reload-checkbox">
@@ -999,7 +1000,8 @@ const I18N = {
     'label.lowvram': '低VRAMモード',
     'option.lowvram0': '0 (無効・48GB超級)',
     'option.lowvram1': '1 (48GB級・per-request reload)',
-    'option.lowvramGroup': 'group (24-32GB級・group offload常駐)',
+    'option.lowvramGroup': 'group (6〜32GB級・ブロックストリーミング常駐)',
+    'option.tqCkW4a8': 'ck-w4a8 (起動時のみ)',
     'label.videoVaeFp16': 'video VAE を fp16 化(実験的)',
     'btn.reloadApply': '適用(再ロード)',
     'btn.reloadApplying': '適用中(再ロード)...',
@@ -1089,7 +1091,7 @@ const I18N = {
     'result.methodLossless': '無劣化連結(-c copy)',
     'result.methodReencode': '再エンコード連結',
     'result.inputsOrder': '入力(連結順)',
-    'turbo.incompatible.lowvramGroup': 'group offload と turbo の併用は未検証のため無効化しています(LoRAバッファがoffload辞書から欠落するリスク。lowvram=1ならturboを使えます)',
+    'turbo.incompatible.lowvramGroup': 'group モードでは、起動時に H3_TURBO_LORA=1 で turbo LoRA を巻いたサーバだけ turbo を使えます(ブロックストリーマの転送対象が構築時に固定されるため、ロード後には巻けません)。このサーバは起動時に巻いていないので無効化しています。',
     'turbo.incompatible.lowvram': '低VRAMモード(lowvram={lowvram})と comfy形式 turbo LoRA の組み合わせは実測で不可(Int8Tensorがaten.cat未対応)のため無効化しています',
     'turbo.incompatible.bothResident': 'transformer/transformer_ref 両方常駐(int8)と comfy形式 turbo LoRA の組み合わせは実測で不可のため無効化しています',
     'hint.turboDisablesCache': 'turbo有効時はFirstBlockCacheが自動的に無効化されます',
@@ -1193,7 +1195,8 @@ const I18N = {
     'label.lowvram': 'Low-VRAM mode',
     'option.lowvram0': '0 (disabled, 48GB+ class)',
     'option.lowvram1': '1 (48GB class, per-request reload)',
-    'option.lowvramGroup': 'group (24-32GB class, group offload resident)',
+    'option.lowvramGroup': 'group (6-32GB class, block streaming resident)',
+    'option.tqCkW4a8': 'ck-w4a8 (startup only)',
     'label.videoVaeFp16': 'Use fp16 for video VAE (experimental)',
     'btn.reloadApply': 'Apply (reload)',
     'btn.reloadApplying': 'Applying (reload)...',
@@ -1283,7 +1286,7 @@ const I18N = {
     'result.methodLossless': 'Lossless concatenation (-c copy)',
     'result.methodReencode': 'Re-encoded concatenation',
     'result.inputsOrder': 'Inputs (concatenation order)',
-    'turbo.incompatible.lowvramGroup': 'Disabled because group offload + turbo is unverified (risk of the LoRA buffer being missing from the offload dict; you can use turbo with lowvram=1)',
+    'turbo.incompatible.lowvramGroup': 'In group mode turbo is only available when the server was started with H3_TURBO_LORA=1 (the block streamer fixes what it transfers at build time, so the LoRA cannot be applied after loading). This server was started without it, so turbo is disabled.',
     'turbo.incompatible.lowvram': 'Disabled because low-VRAM mode (lowvram={lowvram}) combined with the comfy-format turbo LoRA is known not to work (Int8Tensor does not support aten.cat)',
     'turbo.incompatible.bothResident': 'Disabled because having both transformer/transformer_ref resident (int8) combined with the comfy-format turbo LoRA is known not to work',
     'hint.turboDisablesCache': 'FirstBlockCache is automatically disabled while turbo is enabled',
@@ -1946,6 +1949,13 @@ function startPolling() {
   }, 1200);
 }
 
+// /api/status の runner.profile (core/profile.py の選択結果) を 1 語にする
+function formatProfile(p) {
+  if (!p || !p.mode) return '-';
+  if (p.mode === 'auto' || p.mode === 'forced') return `${p.mode} → ${p.tier}`;
+  return p.mode;
+}
+
 async function refreshServerStatus() {
   try {
     const res = await fetch('/api/status');
@@ -1968,7 +1978,12 @@ async function refreshServerStatus() {
       (r.te_quant === 'bnb-4bit' ? ` (on_gpu: ${r.vae_on_gpu})` : ``) +
       ` | text_encoder: ${r.text_encoder_loaded}<br>` +
       `GPU alloc: ${r.gpu.allocated_gb ?? '-'}GB / peak: ${r.gpu.peak_gb ?? '-'}GB | ` +
-      `RAM avail: ${r.ram.avail_gb}GB / swap used: ${r.ram.swap_used_gb}GB`;
+      `RAM avail: ${r.ram.avail_gb}GB / swap used: ${r.ram.swap_used_gb}GB<br>` +
+      `profile: ${formatProfile(r.profile)} | lowvram: ${r.lowvram ?? '0'} | quant: ${r.transformer_quant ?? 'none'} | ` +
+      `attn: ${r.attn_backend ?? 'default'} | turbo: ${r.turbo_lora ? 'on (' + (r.turbo_steps_default ?? '?') + ' steps)' : 'off'} | ` +
+      `TE: ${r.te_proj ? 'proj ' + (r.te_proj_quant ?? '') : (r.te_quant ?? '')}${r.te_stream ? ' +stream' : ''}${r.te_diet ? ' +diet' : ''}` +
+      (r.lowvram === 'group' ? ` | stream host: ${r.group_stream_host ?? '-'}` : ``) +
+      (r.video_vae_fp16 ? ` | vae: fp16` : ``);
   } catch (e) {
     serverStatusEl.textContent = t('status.serverFetchError');
   }
