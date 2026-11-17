@@ -1799,7 +1799,11 @@ H3_TURBO_LORA_SCALE_RAW = os.environ.get("H3_TURBO_LORA_SCALE", "").strip()
 # バッファを追加すると offload/onload サイクルで辞書に無いバッファを引いて壊れる
 # (KeyError または GPU 残留) 可能性が高い -- 未実測のまま解禁しない (レビュー指摘。
 # hooks/group_offloading.py の `_init_cpu_param_dict()` が構築時1回きりであることを確認)。
-if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
+# 2026-11-17: 自作ストリーマ(H3_GROUP_STREAM=own)は転送対象をブロックの named_parameters /
+# named_buffers から自分で集めるので、ストリーマ構築より前に LoRA で巻いておけば lora_a / lora_b
+# (非永続バッファ)も同じ窓で GPU へ流れる(A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒、
+# ピーク 7.0GB を実測)。拒否は diffusers の enable_group_offload 経路に限定する。
+if H3_TURBO_LORA and H3_LOWVRAM_GROUP and H3_GROUP_STREAM != "own":
     raise RuntimeError(
         "H3_TURBO_LORA=1 と H3_LOWVRAM=group は併用できません (enable_group_offload の "
         "cpu_param_dict は有効化時点で固定されるため、後から追加される LoRA バッファが "
@@ -5393,6 +5397,16 @@ class MiniMaxH3Runner:
             "transformer loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
+        if H3_TURBO_LORA:
+            # ストリーマ構築より前に巻く(lora_a / lora_b をストリーマの転送対象に入れるため)。
+            # file ストリーミングは safetensors の原本から読むため LoRA バッファを持てない。
+            if self._group_stream_host_hint() == "file":
+                raise RuntimeError("H3_TURBO_LORA=1 は H3_GROUP_STREAM_HOST=file と併用できません(LoRA バッファを"
+                                   "ファイルから流せない)。H3_GROUP_STREAM_HOST=pinned を指定してください。")
+            n = self._apply_turbo_lora_checkpoint(self._pipe.transformer, is_ref=False)
+            self._turbo_lora_wrapped = True
+            logger.info("H3_TURBO_LORA=1 (group): applied turbo LoRA on CPU before the block streamer "
+                        "(%d layers wrapped), FBC force-disabled", n)
         self._attach_group_offload(self._pipe.transformer, "transformer")
         if H3_FF_CHUNK:
             logger.info("transformer: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
@@ -5415,7 +5429,7 @@ class MiniMaxH3Runner:
         if H3_ATTN_BACKEND:
             self._pipe.transformer.set_attention_backend(H3_ATTN_BACKEND)
             logger.info("transformer attention backend set to %r", H3_ATTN_BACKEND)
-        if H3_CACHE == "fbc":
+        if H3_CACHE == "fbc" and not H3_TURBO_LORA:
             self._enable_fbc()
         logger.info(
             "transformer group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
@@ -5803,6 +5817,15 @@ class MiniMaxH3Runner:
             "transformer_ref loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
+        if H3_TURBO_LORA:
+            # base 側と同じ: ストリーマ構築より前に巻いて lora_a / lora_b を転送対象に入れる
+            if self._group_stream_host_hint() == "file":
+                raise RuntimeError("H3_TURBO_LORA=1 は H3_GROUP_STREAM_HOST=file と併用できません(LoRA バッファを"
+                                   "ファイルから流せない)。H3_GROUP_STREAM_HOST=pinned を指定してください。")
+            n = self._apply_turbo_lora_checkpoint(self._pipe_ref.transformer_ref, is_ref=True)
+            self._turbo_lora_wrapped_ref = True
+            logger.info("H3_TURBO_LORA=1 (group): applied turbo LoRA on CPU before the block streamer "
+                        "(transformer_ref, %d layers wrapped), FBC force-disabled", n)
         self._attach_group_offload(self._pipe_ref.transformer_ref, "transformer_ref")
         if H3_FF_CHUNK:
             logger.info("transformer_ref: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
@@ -5825,7 +5848,7 @@ class MiniMaxH3Runner:
         if H3_ATTN_BACKEND:
             self._pipe_ref.transformer_ref.set_attention_backend(H3_ATTN_BACKEND)
             logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
-        if H3_CACHE == "fbc":
+        if H3_CACHE == "fbc" and not H3_TURBO_LORA:
             self._enable_fbc_ref()
         logger.info(
             "transformer_ref group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
@@ -6028,6 +6051,10 @@ class MiniMaxH3Runner:
         wrapped_attr = "_turbo_lora_wrapped_ref" if is_ref else "_turbo_lora_wrapped"
         label = "transformer_ref" if is_ref else "transformer"
         if turbo and not getattr(self, wrapped_attr):
+            if H3_LOWVRAM_GROUP:
+                raise ValueError(
+                    "group モードではロード後に turbo LoRA を巻けません(ブロックストリーマの転送対象が"
+                    "構築時に固定されるため)。H3_TURBO_LORA=1 を付けて起動してください。")
             if progress:
                 progress.update(message=f"turbo LoRA を {label} へ適用中...")
             n = self._apply_turbo_lora_checkpoint(transformer, is_ref=is_ref)
@@ -9855,20 +9882,27 @@ class MiniMaxH3Runner:
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
 
-            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
-            _, state = layout_step(pipe, state)
-            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
-            _, state = condition_latents_step(pipe, state)
-            latents_step = MiniMaxH3PrepareLatentsStep()
-            _, state = latents_step(pipe, state)
-            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
-            _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = _make_set_timesteps_step()
-            if vocal_lock_effective and vocal_lock_latents is not None:
-                vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
-                    state, state.get("num_audio_latents"), pipe.audio_channels
-                )
-            _, state = timesteps_step(pipe, state)
+            # 2026-11-17: ここでは TE を force-free 済みで vae も CPU へ戻しているため、自作ストリーマ
+            # (H3_GROUP_STREAM=own、diffusers の group offload フックが無い) では `_execution_device` が
+            # CPU 上の vae に落ち、layout の position_ids が CPU に作られて rope() で `cuda:0 and cpu` に
+            # なる (A4000 16GB・8GB 上限構成で実機再現、turbo の有無に無関係)。diffusers の group offload
+            # ではフック経由で transformer_ref の GPU を拾えていたため顕在化しなかった。transformer_ref の
+            # 先頭パラメータ (proj_in) は GPU に置かれるので、TE 外部常駐と同じピン窓で囲む。
+            with self._pin_execution_device_to_compute():
+                layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                _, state = condition_latents_step(pipe, state)
+                latents_step = MiniMaxH3PrepareLatentsStep()
+                _, state = latents_step(pipe, state)
+                ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+                _, state = ref2va_latents_step(pipe, state)
+                timesteps_step = _make_set_timesteps_step()
+                if vocal_lock_effective and vocal_lock_latents is not None:
+                    vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
+                        state, state.get("num_audio_latents"), pipe.audio_channels
+                    )
+                _, state = timesteps_step(pipe, state)
         elif H3_LOWVRAM:
             self._vae_to_gpu("encode")  # H3_VAE_SPLIT 時は encode 側だけ (それ以外は従来どおり全体)
             # Same `_execution_device` resolution trap as generate()'s own H3_LOWVRAM

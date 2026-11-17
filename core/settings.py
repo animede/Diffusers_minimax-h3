@@ -170,8 +170,13 @@ def validate_instant_settings(resolved: dict) -> None:
     # cpu_param_dict は有効化時点で固定され、後から追加される _TurboLoRALinear の
     # lora_a/lora_b バッファが offload サイクルから欠落するリスクがある (未実測の
     # まま解禁しない。runner.py の import 時ガードと同じ理由 -- レビュー指摘)。
-    if resolved["turbo"] and runner.H3_LOWVRAM_GROUP:
+    # 2026-11-17: 自作ストリーマ(H3_GROUP_STREAM=own)で、起動時(H3_TURBO_LORA=1)にストリーマ構築前へ
+    # LoRA を巻いてある場合は、lora_a / lora_b もストリーマの転送対象に入っているので通す。
+    if resolved["turbo"] and runner.H3_LOWVRAM_GROUP and not (runner.H3_GROUP_STREAM == "own" and runner.H3_TURBO_LORA):
         raise ValueError(
+            "turbo=1 と lowvram=group は H3_GROUP_STREAM=own かつ起動時 H3_TURBO_LORA=1 のときだけ使えます "
+            "(ブロックストリーマの転送対象は構築時に固定されるため、ロード後に LoRA を巻けない)。"
+            "diffusers の group offload 経路は従来どおり拒否: "
             "turbo=1 と lowvram=group は併用できません (group offload の cpu_param_dict "
             "は有効化時点で固定されるため、後から追加される LoRA バッファが offload "
             "サイクルから欠落するリスクがある -- 未検証)。lowvram=1 なら turbo を使えます。"
