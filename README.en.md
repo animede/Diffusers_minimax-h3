@@ -110,14 +110,13 @@ cd Diffusers_minimax-h3
 .\scripts\install.ps1
 ```
 
-`install.ps1` creates the venv and installs torch (cu128) and `requirements.txt`; add `-LocalLLM` to also fetch the built-in LLM binary. Then fetch the model and start:
+`install.ps1` creates the venv and installs torch (cu128) and `requirements.txt`; add `-LocalLLM` to also fetch the built-in LLM binary. Then fetch the model:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\download_t2va.py
-.\run.ps1
 ```
 
-Open `http://127.0.0.1:8611/` in a browser. To install by hand, run these in order (PyPI's Windows torch is CPU-only, so torch must come first from the PyTorch index):
+To install by hand, run these in order (PyPI's Windows torch is CPU-only, so torch must come first from the PyTorch index):
 
 ```powershell
 py -3.12 -m venv venv
@@ -126,18 +125,7 @@ py -3.12 -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Set environment variables with `$env:` before starting (`H3_PORT` / `H3_HOST` for the port and bind address):
-
-```powershell
-$env:H3_TURBO_LORA = "1"
-.\run.ps1
-```
-
-If PowerShell's execution policy blocks the script:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run.ps1
-```
+For starting the server (passing environment variables, per-tier examples, the execution-policy workaround) see the Windows part of [Starting](#starting).
 
 The built-in LLM (the fallback when the external LLM is unreachable) can be added later even if you installed without `-LocalLLM`. It is fetched automatically on the first fallback; to fetch it ahead of time run the following (line 1 = the prebuilt `llama-server.exe`, about 25MB; line 2 = the Gemma 4 E4B GGUF, about 4.4GB, optional):
 
@@ -184,13 +172,15 @@ It uses `allow_patterns` internally to fetch only the needed subfolders; `logs/d
 
 ## Starting
 
+### Linux
+
 ```bash
 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
 With nothing set, **`H3_PROFILE=auto`** picks the 96 / 80 / 48 / 32 / 16 / 8GB-tier defaults (the same flags as the launch examples below) from the compute GPU's total VRAM. Setting any of the main profile variables (`H3_LOWVRAM`, `H3_TE_PROJ`, ...) switches to manual mode and nothing is filled in automatically. When the default sage build cannot be used (a GPU other than sm_120, or sageattention not installed) `H3_ATTN_BACKEND=default` is also set automatically. The chosen tier is shown in `/api/status` under `profile` and in the startup log.
 
-Open `http://<host>:8611/` in a browser. The first start takes a few minutes to load the models (by default the TE is NF4-quantized and kept on the GPU). On Windows use `.\run.ps1` (pass environment variables as `$env:H3_...`). `run.sh` is the launcher used by the diffusers-movie-server integration: it starts the same server on internal port 8631 with the conversation-oriented defaults (turbo LoRA etc.).
+Open `http://<host>:8611/` in a browser. The first start takes a few minutes to load the models (by default the TE is NF4-quantized and kept on the GPU). `run.sh` is the launcher used by the diffusers-movie-server integration: it starts the same server on internal port 8631 with the conversation-oriented defaults (turbo LoRA etc.).
 
 Launch examples per VRAM tier:
 
@@ -227,6 +217,38 @@ To verify operation before using the UI, run the regression probe (writes `outpu
 
 ```bash
 venv/bin/python scripts/probe_t2va.py
+```
+
+### Windows
+
+`run.ps1` starts the same server (default 127.0.0.1:8611; `H3_HOST` / `H3_PORT` change the bind address and port):
+
+```powershell
+.\run.ps1
+```
+
+Set environment variables one per line with `$env:` before starting. The Linux launch examples above carry over directly: turn each `H3_X=value` into `$env:H3_X = "value"` and then call `.\run.ps1`. Single-16GB example (cards other than sm_120 need `H3_ATTN_BACKEND=default`; `H3_PROFILE=auto` sets it when unset):
+
+```powershell
+$env:H3_LOWVRAM = "group"
+$env:H3_TE_PROJ = "NicoLab28/ClipProj-MiniMax-H3"
+$env:H3_VIDEO_VAE_FP16 = "1"
+$env:H3_ATTN_BACKEND = "default"
+.\run.ps1
+```
+
+With nothing set, `H3_PROFILE=auto` picks the tier from the GPU's total VRAM, so plain `.\run.ps1` is a fine first start. Add `$env:H3_TURBO_LORA = "1"` for turbo. Variables stay set until that PowerShell window is closed (to start again with a different configuration, remove them with e.g. `Remove-Item Env:H3_LOWVRAM` or open a new window).
+
+If PowerShell's execution policy blocks the script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+The regression probe:
+
+```powershell
+.\venv\Scripts\python.exe scripts\probe_t2va.py
 ```
 
 ## Usage

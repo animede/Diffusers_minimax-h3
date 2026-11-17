@@ -110,14 +110,13 @@ cd Diffusers_minimax-h3
 .\scripts\install.ps1
 ```
 
-`install.ps1` は venv を作り、torch(cu128)と `requirements.txt` を入れる。`-LocalLLM` を付けると内蔵 LLM のバイナリも取得する。続けてモデルを取得して起動する:
+`install.ps1` は venv を作り、torch(cu128)と `requirements.txt` を入れる。`-LocalLLM` を付けると内蔵 LLM のバイナリも取得する。続けてモデルを取得する:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\download_t2va.py
-.\run.ps1
 ```
 
-ブラウザで `http://127.0.0.1:8611/` を開く。手動で入れる場合は次の順に実行する(PyPI の Windows 版 torch は CPU 専用なので、torch を先に PyTorch の index から入れる順序が必要):
+手動で入れる場合は次の順に実行する(PyPI の Windows 版 torch は CPU 専用なので、torch を先に PyTorch の index から入れる順序が必要):
 
 ```powershell
 py -3.12 -m venv venv
@@ -126,18 +125,7 @@ py -3.12 -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-環境変数は起動前に `$env:` で設定する(`H3_PORT` / `H3_HOST` でポートと待ち受けアドレス):
-
-```powershell
-$env:H3_TURBO_LORA = "1"
-.\run.ps1
-```
-
-PowerShell の実行ポリシーで止まる場合は次のように起動する:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run.ps1
-```
+起動方法(環境変数の渡し方、VRAM 級別の例、実行ポリシーの回避)は「[起動](#起動)」の Windows 節を参照。
 
 内蔵 LLM(外部 LLM に接続できないときのフォールバック)は、インストール時に `-LocalLLM` を付けなくても後から入れられる。初回のフォールバック時に自動取得されるが、先に取っておく場合は次を実行する(1 行目がビルド済み `llama-server.exe`(約 25MB)、2 行目が Gemma 4 E4B の GGUF(約 4.4GB)。GGUF は省略可):
 
@@ -184,13 +172,15 @@ venv/bin/python scripts/download_t2va.py
 
 ## 起動
 
+### Linux
+
 ```bash
 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
 何も指定しなければ **`H3_PROFILE=auto`** が計算用 GPU の総 VRAM から 96 / 80 / 48 / 32 / 16 / 8GB 級の既定値一式(下の起動例と同じ内容)を選ぶ。`H3_LOWVRAM` や `H3_TE_PROJ` など主プロファイル系の変数をひとつでも指定すると手動扱いになり、自動では何も入れない。sage が使えない GPU(sm_120 以外)や未インストールのときは `H3_ATTN_BACKEND=default` も自動で入る。選ばれた級は `/api/status` の `profile` と起動ログで確認できる。
 
-ブラウザで `http://<host>:8611/` を開く。初回起動時はモデルのロード(既定では TE を NF4 量子化して GPU 常駐)に数分かかる。Windows は `.\run.ps1`(環境変数は `$env:H3_...` で渡す)。`run.sh` は diffusers-movie-server 統合用の起動スクリプトで、内部ポート 8631 と会話用途の既定値(turbo LoRA 等)を設定したうえで同じサーバを起動する。
+ブラウザで `http://<host>:8611/` を開く。初回起動時はモデルのロード(既定では TE を NF4 量子化して GPU 常駐)に数分かかる。`run.sh` は diffusers-movie-server 統合用の起動スクリプトで、内部ポート 8631 と会話用途の既定値(turbo LoRA 等)を設定したうえで同じサーバを起動する。
 
 VRAM 級別の起動例:
 
@@ -227,6 +217,38 @@ UI より先に動作確認したいときは回帰プローブを使う(`output
 
 ```bash
 venv/bin/python scripts/probe_t2va.py
+```
+
+### Windows
+
+`run.ps1` が同じサーバを起動する(既定は 127.0.0.1:8611。`H3_HOST` / `H3_PORT` で待ち受けアドレスとポートを変更):
+
+```powershell
+.\run.ps1
+```
+
+環境変数は起動前に `$env:` で 1 行ずつ設定する。上の Linux の起動例は、`H3_X=値` をそれぞれ `$env:H3_X = "値"` に読み替えて `.\run.ps1` を呼べばそのまま使える。16GB 単体の例(sm_120 以外は `H3_ATTN_BACKEND=default` が必須だが、未指定なら `H3_PROFILE=auto` が自動で入れる):
+
+```powershell
+$env:H3_LOWVRAM = "group"
+$env:H3_TE_PROJ = "NicoLab28/ClipProj-MiniMax-H3"
+$env:H3_VIDEO_VAE_FP16 = "1"
+$env:H3_ATTN_BACKEND = "default"
+.\run.ps1
+```
+
+何も設定しなければ `H3_PROFILE=auto` が GPU の総 VRAM から級を選ぶので、まずは `.\run.ps1` だけで起動してよい。turbo を使うなら `$env:H3_TURBO_LORA = "1"` を足す。設定した環境変数はその PowerShell を閉じるまで残る(別の構成で起動し直すときは `Remove-Item Env:H3_LOWVRAM` のように消すか、PowerShell を開き直す)。
+
+PowerShell の実行ポリシーで止まる場合は次のように起動する:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+回帰プローブは次のとおり:
+
+```powershell
+.\venv\Scripts\python.exe scripts\probe_t2va.py
 ```
 
 ## 使い方
