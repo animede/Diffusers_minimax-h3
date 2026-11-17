@@ -16,8 +16,8 @@ It is built on the diffusers Modular Pipeline (PR #14355, pinned to commit **f37
 - **Runs on consumer GPUs**: block-wise streaming of the int8 transformer (`H3_LOWVRAM=group`), a projected TE (Qwen3-VL-4B + a linear map standing in for the 32B TE), an fp16 video VAE and streaming of the TE / token_refiner / VAE decoder bring 768² x 5 s down to **4.6GB** and 1024² x 5 s to **6.4GB**. With 32GB or 16GB of host RAM the weights are streamed straight from the quantized cache.
 - **Fixed costs removed**: the bottleneck was never the denoise but the model load/free. A resident transformer, quantized caches, pinned parking and a KV cache for the reference prefix give t2i 9.7 s / t2va (5 s) 44 s on the 48GB tier and t2i 7.4 s on the 96GB tier.
 - **Speed options**: FirstBlockCache, SageAttention (sm_120), the lightx2v turbo LoRA (4 / 8-step distillation), ck-w4a8 quantization and the AdaLN-pruned transformer_ref.
-- **Five generation modes plus batches**: T2VA / FL2VA / Ref2VA (ordered references: up to 9 images, 3 videos and 3 audio clips; lip sync from an audio reference) / T2I / Ref2I. Still images and reference-conditioned videos batch up to 24 scenes.
-- **LLM prompt enhancement**: a local LLM (OpenAI-compatible API) rewrites the input into the format of the official `h3-prompt-writing` skill, with a verify + repair loop before generation.
+- **Five generation modes plus batches**: T2VA / FL2VA / Ref2VA (ordered references: up to 9 images, 3 videos and 3 audio clips; lip sync from an audio reference) / T2I / Ref2I. Still images and reference-conditioned videos batch up to 24 scenes. **The still-image modes (T2I / Ref2I) do not use the dedicated image model MiniMax-H3-Image: they generate a 22-frame ultra-short video with this video model (MiniMax-H3) and save the center frame as a PNG.** Slower than a dedicated image model, but the look matches exactly when the result is used as an FL2VA first frame or a Ref2VA reference. MiniMax-H3-Image lives in a separate repository, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server).
+- **LLM prompt enhancement**: an external LLM (OpenAI-compatible API, `H3_LLM_URL`) rewrites the input into the format of the official `h3-prompt-writing` skill, with a verify + repair loop before generation. When the external LLM is unreachable it falls back automatically to a built-in CPU LLM (Gemma 4 E4B, GGUF Q4_0, about 4.4GB, downloaded on first use, thinking off), the same idea as ACE-Step-1.5-fast's easy-music; the built-in LLM is llama.cpp's prebuilt `llama-server` started as a child process, so no compiler is needed and it works as-is on Windows.
 - **Quality guarded**: diffusers upgrades and quantized caches are regression-checked by identical-seed MD5.
 
 ## Supported GPUs (at a glance)
@@ -57,7 +57,7 @@ cd Diffusers_minimax-h3
 scripts/install.sh
 ```
 
-`scripts/install.sh` creates `venv/`, installs [requirements.txt](requirements.txt) and finally prints the torch / diffusers / transformers versions. It needs only Python 3.12 and `git`; nothing is compiled against CUDA, so it finishes in a few minutes. Add `--sage` to also install SageAttention (below).
+`scripts/install.sh` creates `venv/`, installs [requirements.txt](requirements.txt) and finally prints the torch / diffusers / transformers versions. It needs only Python 3.12 and `git`; nothing is compiled against CUDA, so it finishes in a few minutes. Add `--sage` to also install SageAttention (below), and `--local-llm` to pre-fetch the prebuilt `llama-server` for the built-in LLM (Gemma 4 E4B; below. Even without it, the binary is fetched automatically on the first fallback).
 
 <details>
 <summary>Installing by hand (same contents as requirements.txt)</summary>
@@ -102,7 +102,17 @@ CUDA_HOME=/usr/local/cuda-12.8 scripts/install.sh --sage     # or scripts/build_
 
 `--sage` installs a prebuilt wheel from `third_party/wheels/` if one is there, and otherwise builds from source.
 
-> **Always limit the build parallelism** (the script runs with `MAX_JOBS=4 NVCC_THREADS=2` under a systemd-run memory cap). Unbounded parallel nvcc exhausts host RAM and OOMs the whole system.
+### Built-in LLM (optional)
+
+LLM enhancement uses an external OpenAI-compatible API (`H3_LLM_URL`) by default and falls back automatically to a built-in CPU LLM (Gemma 4 E4B, GGUF Q4_0, thinking off) when it is unreachable. The built-in LLM is llama.cpp's prebuilt `llama-server` from the [GitHub Releases](https://github.com/ggml-org/llama.cpp/releases) (CPU build, about 25MB, pinned tag `b12475`, override with `H3_LLAMA_CPP_TAG`): the server starts it as a child process and talks to it over the OpenAI-compatible API (default `127.0.0.1:64661`, `H3_LLM_LOCAL_PORT`). **No compiler is needed**; the Linux x64 / Windows x64 / macOS binary is chosen automatically.
+
+```bash
+scripts/install.sh --local-llm            # pre-fetch llama-server into tools/llama/ (optional)
+venv/bin/python scripts/fetch_llama_server.py --model   # also pre-fetch the GGUF, about 4.4GB (optional)
+```
+
+Both are optional: on the first fallback `llama-server` is fetched into `tools/llama/` and the model into `models/llm/` automatically. The child process stops with the server, and if the server is killed hard it is taken down with it (Windows: Job Object with KILL_ON_JOB_CLOSE; Linux: `PR_SET_PDEATHSIG`), so it never lingers as an orphan (verified with SIGKILL on Linux; Windows untested). To use existing files set `H3_LLAMA_SERVER=<path to llama-server>` and `H3_LLM_LOCAL_GGUF=<path to the GGUF>` (a llama-server you started yourself that answers on `H3_LLM_LOCAL_PORT` is used as-is).
+
 
 ### Obtaining the model
 
@@ -165,9 +175,9 @@ venv/bin/python scripts/probe_t2va.py
 
 ### UI
 
-- The upper tab row switches between the video modes (T2VA / FL2VA / Ref2VA), the lower row between the still-image modes (T2I / Ref2I). Ref2VA takes multiple files; selection order = reference order.
+- The upper tab row switches between the video modes (T2VA / FL2VA / Ref2VA), the lower row between the still-image modes (T2I / Ref2I). Ref2VA takes multiple files; selection order = reference order. The still-image tabs do not use MiniMax-H3-Image; they run an ultra-short generation with the video model (center frame saved as PNG, mp4 kept alongside).
 - The checkboxes directly above the generate button (FirstBlockCache, Sage, Turbo) apply per request. Quantization, low-VRAM mode, TE placement and the like live in the collapsible header and take effect with "Apply (reload)".
-- The "LLM enhance" button reformats the prompt in `storyboard` / `brief` / `h3-official` / `translate` mode (needs a local LLM).
+- The "LLM enhance" button reformats the prompt in `storyboard` / `brief` / `h3-official` / `translate` mode (external LLM, or the built-in E4B when it is unreachable; the completion message and the server status line say which one was used).
 - The gallery at the bottom lists outputs, deletes them and concatenates the checked videos.
 
 ### API
@@ -210,7 +220,8 @@ Defaults shown. Most **can also be toggled from the UI**, so set them only to ch
 | `H3_ATTN_BACKEND` | `sage` | The sage build is sm_120-only. **Any other GPU must use `default` (SDPA)** |
 | `H3_TURBO_LORA` | `0` | lightx2v 4 / 8-step distilled LoRA (downloads about 780MB on first use). Works in `group` too (needs the in-house streamer `H3_GROUP_STREAM=own` and the flag at startup; not with `file` streaming on hosts under 48GB RAM) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | Download the bf16 weights (~66GB each) from HF only when `1` if they are not cached |
-| `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / none | Local LLM for prompt enhancement and its API key (the key is also read from the git-ignored `config.local.env`) |
+| `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / none | External LLM for prompt enhancement and its API key (the key is also read from the git-ignored `config.local.env`) |
+| `H3_LLM_LOCAL` / `H3_LLM_LOCAL_GGUF` | `auto` / none | Built-in LLM (Gemma 4 E4B, CPU, a prebuilt `llama-server` child process). `auto` = only when the external LLM is unreachable / `1` = built-in only / `0` = never. The GGUF is downloaded to `models/llm/`; point `H3_LLM_LOCAL_GGUF` at an existing file instead. Also `H3_LLAMA_SERVER` (binary path), `H3_LLAMA_CPP_TAG` (llama.cpp tag to fetch), `H3_LLM_LOCAL_PORT` (default 64661) |
 
 ## Documentation
 

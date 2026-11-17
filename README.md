@@ -16,8 +16,8 @@
 - **普及帯 GPU で動く**: transformer int8 のブロック単位ストリーミング(`H3_LOWVRAM=group`)、投影 TE(Qwen3-VL-4B + 線形写像で 32B TE を代替)、video VAE の fp16 化、TE / token_refiner / VAE デコーダのストリーミングにより、768²×5 秒が **4.6GB**、1024²×5 秒が **6.4GB** で完走する。ホスト RAM が 32GB / 16GB でも量子化キャッシュから直接流せる。
 - **固定費の削減**: 律速はデノイズではなく「モデルの load/free」だった。transformer 常駐・量子化済みキャッシュ・pinned 退避・参照 prefix の KV キャッシュで、48GB 級で t2i 9.7 秒 / t2va 5 秒 44 秒、96GB 級で t2i 7.4 秒。
 - **高速化オプション**: FirstBlockCache、SageAttention(sm_120)、lightx2v turbo LoRA(4 / 8 ステップ蒸留)、ck-w4a8 量子化、AdaLN-pruned 版 transformer_ref。
-- **5 つの生成モードとバッチ**: T2VA / FL2VA / Ref2VA(画像最大 9・動画最大 3・音声最大 3 の順序付き参照、音声参照でリップシンク)/ T2I / Ref2I。静止画・参照付き動画は最大 24 場面のバッチ生成に対応。
-- **LLM プロンプト強化**: ローカル LLM(OpenAI 互換 API)で入力を H3 公式スキル `h3-prompt-writing` の形式へ整形。生成前の検証 + 修復ループつき。
+- **5 つの生成モードとバッチ**: T2VA / FL2VA / Ref2VA(画像最大 9・動画最大 3・音声最大 3 の順序付き参照、音声参照でリップシンク)/ T2I / Ref2I。静止画・参照付き動画は最大 24 場面のバッチ生成に対応。**静止画(T2I / Ref2I)は画像専用モデルの MiniMax-H3-Image ではなく、この動画モデル(MiniMax-H3)で 22 フレームの超短尺動画を生成して中央フレームを PNG にしたもの**。専用モデルより遅いが、FL2VA の先頭フレームや Ref2VA の参照に使うと画風が完全に一致する。MiniMax-H3-Image は別リポジトリ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) で扱う。
+- **LLM プロンプト強化**: 外部 LLM(OpenAI 互換 API、`H3_LLM_URL`)で入力を H3 公式スキル `h3-prompt-writing` の形式へ整形。生成前の検証 + 修復ループつき。外部 LLM に接続できないときは CPU 上の内蔵 LLM(Gemma 4 E4B、GGUF Q4_0、約 4.4GB、初回に自動 DL、thinking OFF)へ自動フォールバックする(ACE-Step-1.5-fast の easy-music と同じ考え方。実体は llama.cpp のビルド済み `llama-server` を子プロセスで起動するので、コンパイラ不要で Windows でもそのまま動く)。
 - **品質の担保**: diffusers の更新や量子化キャッシュの導入は、同一 seed の MD5 一致で回帰確認している。
 
 ## 対応 GPU(早見表)
@@ -57,7 +57,7 @@ cd Diffusers_minimax-h3
 scripts/install.sh
 ```
 
-`scripts/install.sh` は `venv/` を作って [requirements.txt](requirements.txt) を入れ、最後に torch / diffusers / transformers のバージョンを表示する。必要なのは Python 3.12 と `git` だけで、CUDA のビルドは発生しない(数分で終わる)。`--sage` を付けると SageAttention も入れる(下記)。
+`scripts/install.sh` は `venv/` を作って [requirements.txt](requirements.txt) を入れ、最後に torch / diffusers / transformers のバージョンを表示する。必要なのは Python 3.12 と `git` だけで、CUDA のビルドは発生しない(数分で終わる)。`--sage` を付けると SageAttention も入れる(下記)。`--local-llm` を付けると内蔵 LLM(Gemma 4 E4B)用のビルド済み `llama-server` も先に取得する(下記。付けなくても初回のフォールバック時に自動取得される)。
 
 <details>
 <summary>手動で入れる場合(requirements.txt と同じ内容)</summary>
@@ -102,7 +102,17 @@ CUDA_HOME=/usr/local/cuda-12.8 scripts/install.sh --sage     # または scripts
 
 `--sage` は `third_party/wheels/` にビルド済み wheel があればそれを入れ、無ければソースビルドする。
 
-> ビルドは**必ず並列数を制限する**(スクリプトは `MAX_JOBS=4 NVCC_THREADS=2` + systemd-run のメモリ上限付きで実行する)。無制限の並列 nvcc はホスト RAM を食い潰してシステム全体を OOM させる。
+### 内蔵 LLM(任意)
+
+LLM 強化は既定で外部の OpenAI 互換 API(`H3_LLM_URL`)を使い、接続できないときは CPU 上の内蔵 LLM(Gemma 4 E4B、GGUF Q4_0、thinking OFF)へ自動フォールバックする。内蔵 LLM の実体は llama.cpp の [GitHub Releases](https://github.com/ggml-org/llama.cpp/releases) にあるビルド済み `llama-server`(CPU 版、約 25MB。固定タグ `b12475`、`H3_LLAMA_CPP_TAG` で変更可)で、サーバがこれを子プロセスとして起動し、OpenAI 互換 API(既定 `127.0.0.1:64661`、`H3_LLM_LOCAL_PORT`)で話す。**コンパイラは不要**で、Linux x64 / Windows x64 / macOS のバイナリが自動で選ばれる。
+
+```bash
+scripts/install.sh --local-llm            # llama-server を tools/llama/ へ先に取得(任意)
+venv/bin/python scripts/fetch_llama_server.py --model   # GGUF(約 4.4GB)も先に取得(任意)
+```
+
+どちらも省略できる。初めてフォールバックしたときに `llama-server` は `tools/llama/` へ、モデルは `models/llm/` へ自動取得される。子プロセスはサーバ終了時に止まり、サーバが強制終了された場合も Windows は Job Object(KILL_ON_JOB_CLOSE)、Linux は `PR_SET_PDEATHSIG` で道連れにするので孤児にならない(Linux は SIGKILL で実測、Windows は未検証)。既にあるものを使うなら `H3_LLAMA_SERVER=<llama-server のパス>`、`H3_LLM_LOCAL_GGUF=<GGUF のパス>` で指定する(自分で起動した llama-server が `H3_LLM_LOCAL_PORT` で応答していればそれをそのまま使う)。
+
 
 ### モデルの取得
 
@@ -165,9 +175,9 @@ venv/bin/python scripts/probe_t2va.py
 
 ### UI
 
-- 上段のタブで動画(T2VA / FL2VA / Ref2VA)、下段のタブで静止画(T2I / Ref2I)を切り替える。Ref2VA は複数ファイル選択で、選択順 = 参照順。
+- 上段のタブで動画(T2VA / FL2VA / Ref2VA)、下段のタブで静止画(T2I / Ref2I)を切り替える。Ref2VA は複数ファイル選択で、選択順 = 参照順。静止画タブは MiniMax-H3-Image ではなく動画モデルの超短尺生成(中央フレームを PNG 化)で、mp4 も一緒に保存される。
 - 生成ボタン直上のチェックボックス(FirstBlockCache・Sage・Turbo)はリクエストごとに即反映。ヘッダの折りたたみにある量子化・低 VRAM モード・TE 配置などは「適用(再ロード)」で切り替える。
-- 「LLM 強化」ボタンでプロンプトを `storyboard` / `brief` / `h3-official` / `translate` の各モードで整形できる(ローカル LLM が必要)。
+- 「LLM 強化」ボタンでプロンプトを `storyboard` / `brief` / `h3-official` / `translate` の各モードで整形できる(外部 LLM、無ければ内蔵 E4B。どちらを使ったかは完了メッセージとサーバ状態行に出る)。
 - 下段のギャラリーで生成物の閲覧・削除・チェックした動画の連結ができる。
 
 ### API
@@ -210,7 +220,8 @@ venv/bin/python scripts/probe_t2va.py
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外の GPU は `default`(SDPA)必須** |
 | `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。ホスト RAM 48GB 未満の `file` ストリーミングとは併用不可) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得 |
-| `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使うローカル LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |
+| `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使う外部 LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |
+| `H3_LLM_LOCAL` / `H3_LLM_LOCAL_GGUF` | `auto` / なし | 内蔵 LLM(Gemma 4 E4B、CPU、ビルド済み `llama-server` を子プロセスで起動)。`auto` = 外部 LLM に接続できないときだけ使う / `1` = 内蔵のみ / `0` = 使わない。GGUF は `models/llm/` へ自動 DL、既にあるファイルは `H3_LLM_LOCAL_GGUF` で指定。`H3_LLAMA_SERVER`(バイナリのパス)、`H3_LLAMA_CPP_TAG`(取得する llama.cpp のタグ)、`H3_LLM_LOCAL_PORT`(既定 64661)も可 |
 
 ## ドキュメント
 

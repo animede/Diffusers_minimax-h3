@@ -38,7 +38,7 @@ diffusers is operated as a **commit pin**. All paths (t2i/t2va/batch/ref2va/ref 
 | T2I (still image) | Text prompt | Still image (PNG) + ultra-short mp4 | `POST /api/t2i` |
 | Ref2I (still image with reference) | Text + reference | Still image (PNG) | `POST /api/ref2va` (`still=1`) |
 
-T2I and Ref2I are modes that substitute for image generation by "generating an ultra-short video and extracting the center frame." Their value is not speed relative to a dedicated T2I model, but that they can produce **still images whose style exactly matches H3**, for use as the first frame of FL2VA or as a reference for Ref2VA.
+T2I and Ref2I are modes that substitute for image generation by "generating an ultra-short video and extracting the center frame" (the dedicated image model MiniMax-H3-Image is not used; it lives in a separate repository, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server)). Their value is not speed relative to a dedicated T2I model, but that they can produce **still images whose style exactly matches H3**, for use as the first frame of FL2VA or as a reference for Ref2VA.
 
 ### Batch Generation
 
