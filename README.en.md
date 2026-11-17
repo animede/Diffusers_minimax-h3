@@ -178,7 +178,7 @@ It uses `allow_patterns` internally to fetch only the needed subfolders; `logs/d
 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
-With nothing set, **`H3_PROFILE=auto`** picks the 96 / 80 / 48 / 32 / 16 / 8GB-tier defaults (the same flags as the launch examples below) from the compute GPU's total VRAM. Setting any of the main profile variables (`H3_LOWVRAM`, `H3_TE_PROJ`, ...) switches to manual mode and nothing is filled in automatically. When the default sage build cannot be used (a GPU other than sm_120, or sageattention not installed) `H3_ATTN_BACKEND=default` is also set automatically. The chosen tier is shown in `/api/status` under `profile` and in the startup log.
+With nothing set, **`H3_PROFILE=auto`** picks the 96 / 80 / 48 / 32 / 16 / 8GB-tier defaults (the same flags as the launch examples below) from the compute GPU's total VRAM. On the 32GB-and-below tiers (group) the turbo LoRA (4 steps) is on by default as well, because in group mode it must be applied at startup to be usable from the GUI at all (untick turbo in the GUI for 30 steps, or set `H3_TURBO_LORA=0` to disable it at startup). On 48GB and above, use the GUI's turbo checkbox per request. Setting any of the main profile variables (`H3_LOWVRAM`, `H3_TE_PROJ`, ...) switches to manual mode and nothing is filled in automatically. When the default sage build cannot be used (a GPU other than sm_120, or sageattention not installed) `H3_ATTN_BACKEND=default` is also set automatically. The chosen tier is shown in `/api/status` under `profile` and in the startup log.
 
 Open `http://<host>:8611/` in a browser. The first start takes a few minutes to load the models (by default the TE is NF4-quantized and kept on the GPU). `run.sh` is the launcher used by the diffusers-movie-server integration: it starts the same server on internal port 8631 with the conversation-oriented defaults (turbo LoRA etc.).
 
@@ -237,7 +237,7 @@ $env:H3_ATTN_BACKEND = "default"
 .\run.ps1
 ```
 
-With nothing set, `H3_PROFILE=auto` picks the tier from the GPU's total VRAM, so plain `.\run.ps1` is a fine first start. Add `$env:H3_TURBO_LORA = "1"` for turbo. Variables stay set until that PowerShell window is closed (to start again with a different configuration, remove them with e.g. `Remove-Item Env:H3_LOWVRAM` or open a new window).
+With nothing set, `H3_PROFILE=auto` picks the tier from the GPU's total VRAM, so plain `.\run.ps1` is a fine first start (on the 32GB-and-below tiers the turbo LoRA is enabled automatically; add `$env:H3_TURBO_LORA = "1"` only if you want turbo as the default on 48GB and above). Variables stay set until that PowerShell window is closed (to start again with a different configuration, remove them with e.g. `Remove-Item Env:H3_LOWVRAM` or open a new window).
 
 If PowerShell's execution policy blocks the script:
 
@@ -255,10 +255,55 @@ The regression probe:
 
 ### UI
 
-- The upper tab row switches between the video modes (T2VA / FL2VA / Ref2VA), the lower row between the still-image modes (T2I / Ref2I). Ref2VA takes multiple files; selection order = reference order. The still-image tabs do not use MiniMax-H3-Image; they run an ultra-short generation with the video model (center frame saved as PNG, mp4 kept alongside).
-- The checkboxes directly above the generate button (FirstBlockCache, Sage, Turbo) apply per request. Quantization, low-VRAM mode, TE placement and the like live in the collapsible header and take effect with "Apply (reload)".
-- The "LLM enhance" button reformats the prompt in `storyboard` / `brief` / `h3-official` / `translate` mode (external LLM, or the built-in E4B when it is unreachable; the completion message and the server status line say which one was used).
-- The gallery at the bottom lists outputs, deletes them and concatenates the checked videos.
+A single-page browser UI: inputs and settings on the left, results and the gallery on the right. The "日本語 / English" buttons at the top right switch the display language.
+
+**Mode tabs**
+
+- The upper row is video (**T2VA** = text, **FL2VA** = first / last frame, **Ref2VA** = reference material), the lower row is stills (**T2I**, **Ref2I**). Switching tabs shows only the inputs that mode needs.
+- The still-image tabs do not use MiniMax-H3-Image: the video model generates a 22-frame (or 5-frame) ultra-short clip and the center frame is saved as a PNG, with the mp4 kept alongside.
+
+**Prompt and LLM enhancement**
+
+- Prompts work in Japanese as well as English. "Prompt guide" opens a cheat sheet for hand-written prompts: the official brief structure (scene → subject → action → camera → sound → ending), the `CUT n [X-Y s]:` notation and the dialogue tag `<d>`.
+- "LLM enhance" rewrites the prompt with the external LLM (or the built-in Gemma 4 E4B when it is unreachable) and replaces the prompt field. Four modes: `storyboard` (expands into multi-cut timecodes), `brief` (single-shot detailing in the official brief format), `h3-official` (strict adherence to MiniMax's `h3-prompt-writing` skill; the current tab is sent as the task, output language English or Japanese, and a verify + auto-repair pass runs before generation with warnings for unresolved issues), `translate` (English translation only). "Undo" restores the previous prompt once.
+- The projected TE (the default on the low-VRAM tiers) cannot handle the `<d>` dialogue tag, so prompts containing it are flagged before generation (use an audio reference for dialogue instead).
+
+**Inputs per mode**
+
+- FL2VA: drag and drop the first / last frame image (either one is enough; with both, the clip is generated between them).
+- Ref2VA / Ref2I: add multiple reference files (up to 9 images, 3 videos, 3 audio clips, 12 in total). **The order you add them is the reference order**, and each can be referred to in the prompt by the label shown on its tile, such as `<Picture 1>`. With exactly one audio reference the duration can be left blank and follows the audio. Ref2I picks a frame count (22 / 5) and saves the center frame as a PNG.
+- T2I: frame count (22 = the quality-verified default, 5 = experimental).
+- Batch generation (T2I / Ref2I / Ref2VA): ticking it turns the prompt field into "one line = one scene" (up to 24 scenes); references, seed, resolution and steps are shared across scenes. Model loading and reference encoding are shared between scenes, which pays off especially in low-VRAM mode and with references. Ref2VA batches require the duration.
+
+**Size, duration, steps, seed**
+
+- Resolution: the presets 768² / 1344×768 (landscape) / 768×1344 (portrait), "custom" for an explicit width × height (rounded to a multiple of 32, 256-2048, with a warning beyond the native range), or "auto" for the server default (16:9 for Ref2VA).
+- Duration 5-15 s. The actual frame count is rounded up to 17n + 5 and shown as "actual length" (e.g. 5 s → 124 frames, 5.17 s).
+- Steps switch automatically to the recommended value (4 / 30) when Turbo LoRA is toggled; a hand-edited value is used as-is. Leave seed blank for random.
+
+**Instant settings (no reload, sent per request)**
+
+- FirstBlockCache (+ threshold), Sage Attention (sm_120 only), Turbo LoRA (4 steps recommended), mute (no audio track).
+- Combinations the server's configuration cannot run are greyed out with the reason in a tooltip (for example turbo cannot be selected in group mode unless it was applied at startup). Enabling turbo switches FirstBlockCache off automatically.
+
+**Generation and results**
+
+- "Generate" shows a progress bar with the phase (TE encode / denoise n/N / decode) and elapsed seconds. On completion the right side shows the video (or PNG plus mp4) with mode, resolution, length, steps, seed, denoise / decode times, peak VRAM, audio presence, the instant settings and the full prompt used (collapsible).
+- The LLM-enhancement message says whether the external or the built-in LLM handled it.
+
+**Settings that need a reload (collapsible header)**
+
+- transformer quantization (none / int8; ck-w4a8 is startup-only), text_encoder quantization, TE layer pruning, projected TE and its quantization, low-VRAM mode (0 / 1 / group), fp16 video VAE. Changing any of them enables "Apply (reload)" with an estimated time; applying frees and reloads the models without restarting the process.
+- Controls are greyed out to match the server's constraints, e.g. text_encoder quantization and TE pruning are disabled while the projected TE is on (the 32B TE is not loaded at all).
+
+**Server status**
+
+- A status block under the inputs refreshes every 4 seconds: load state (transformer / transformer_ref / VAE / TE), GPU allocation and peak, host RAM, `profile` (what the automatic profile chose), the lowvram / quantization / attention / turbo / TE configuration, where the streamed weights live, and the LLM endpoint plus built-in LLM state.
+
+**Gallery**
+
+- Generated videos and stills, newest first. Click a thumbnail for the lightbox view; each item can be downloaded.
+- Tick items and use "Delete selected" or "Concatenate selected". Concatenation joins **in the order ticked** (stills are excluded) and saves `outputs/concat_<timestamp>.mp4`.
 
 ### API
 
@@ -283,7 +328,7 @@ Defaults shown. Most **can also be toggled from the UI**, so set them only to ch
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `H3_PROFILE` | `auto` | Automatic main profile. `auto` picks a tier from total VRAM only when none of the main profile variables is set / `96gb`..`8gb` forces a tier (use this when emulating a smaller card with `H3_VRAM_LIMIT_GB`) / `off` |
+| `H3_PROFILE` | `auto` | Automatic main profile. `auto` picks a tier from total VRAM only when none of the main profile variables is set (the turbo LoRA is also enabled on the 32GB-and-below tiers) / `96gb`..`8gb` forces a tier (use this when emulating a smaller card with `H3_VRAM_LIMIT_GB`) / `off` |
 | `H3_LOWVRAM` | `0` | `1` = 48GB-tier phase cycling / `group` = block offload for the 32GB tier and below (streams the int8 weights block by block) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` shrinks the transformer from 66.3GB to 34GB. `ck-w4a8` uses ComfyUI's W4A8 kernel (needs `comfy-kitchen`) |
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder quantization (`none` = bf16, 66.7GB) |
