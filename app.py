@@ -36,6 +36,8 @@ from core.llm import (
     enhance_prompt,
     enhance_prompt_checked,
     get_llm_url,
+    last_backend,
+    llm_status,
 )
 from core.runner import (
     FPS,
@@ -149,6 +151,7 @@ def api_status():
         "busy": busy,
         "progress": progress,
         "runner": runner.status(),
+        "llm": llm_status(),
         "min_seconds": MIN_SECONDS,
         "max_seconds": MAX_SECONDS,
         "resolutions": list(RESOLUTION_PRESETS.keys()),
@@ -1161,7 +1164,7 @@ def api_prompt_enhance(
             detail = enhance_prompt_checked(text.strip(), seconds=seconds, task=task, lang=lang)
             return {
                 "result": detail["result"], "mode": mode, "task": task, "lang": lang,
-                "elapsed_s": time.time() - t0,
+                "elapsed_s": time.time() - t0, "llm_backend": last_backend(),
                 "violations": detail["check"]["violations"],
                 "warnings": detail["check"]["warnings"],
                 "check_report": detail["check"]["report"],
@@ -1173,12 +1176,13 @@ def api_prompt_enhance(
         # 台詞が尺に収まらない = どのモデルでも解決不能。書き換えを試みずに助言を返す。
         raise HTTPException(400, str(e))
     except LLMConnectionError as e:
-        raise HTTPException(502, f"LLMサーバに接続できません(H3_LLM_URL={get_llm_url()}): {e}")
+        raise HTTPException(502, f"LLM が使えません(H3_LLM_URL={get_llm_url()}、内蔵 E4B: {llm_status()['local']['reason'] or 'ok'}): {e}")
     except H3SkillNotFetchedError as e:
         raise HTTPException(400, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"result": result, "mode": mode, "task": task, "lang": lang, "elapsed_s": time.time() - t0}
+    return {"result": result, "mode": mode, "task": task, "lang": lang, "elapsed_s": time.time() - t0,
+            "llm_backend": last_backend()}
 
 
 @app.get("/api/outputs")

@@ -39,3 +39,5 @@ psutil==7.1.3           # ホスト RAM の空き監視(H3_GROUP_STREAM_HOST=fil
 # comfy-kitchen          # ck-w4a8 量子化(H3_TRANSFORMER_QUANT=ck-w4a8 / H3_PRUNED_QUANT=ck-w4a8)
 # sageattention          # sm_120 専用の自前ビルド(scripts/install.sh --sage / scripts/build_sageattention.sh)
 # hyperflow_h3           # HyperFlow(ref2va 専用の 8 NFE 蒸留)。公式パッケージを別途入れる
+# 内蔵 LLM(Gemma 4 E4B、CPU)は pip パッケージではなく llama.cpp のビルド済み llama-server を使う(core/local_llm.py が
+# 自動取得。先に取るなら scripts/install.sh --local-llm)。コンパイラ不要

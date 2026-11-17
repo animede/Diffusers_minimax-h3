@@ -3,6 +3,9 @@
 #
 #   scripts/install.sh            # venv を作って requirements.txt を入れる
 #   scripts/install.sh --sage     # さらに SageAttention(sm_120 向け)を入れる
+#   scripts/install.sh --local-llm # 内蔵 LLM(フォールバック)用に、llama.cpp のビルド済み llama-server(約 25MB、
+#                                  # コンパイラ不要)を tools/llama/ へ取得する。GGUF(約 4.4GB)は初回フォールバック時に
+#                                  # 自動取得(先に取るなら scripts/fetch_llama_server.py --model)
 #
 # - venv はリポジトリ直下の venv/ に作る(既にあればそのまま使う)。
 # - torch は cu128 wheel を使う(requirements.txt の --extra-index-url)。
@@ -17,9 +20,11 @@ cd "$(dirname "$0")/.."
 
 PYTHON="${PYTHON:-python3.12}"
 WANT_SAGE=0
+WANT_LOCAL_LLM=0
 for a in "$@"; do
   case "$a" in
     --sage) WANT_SAGE=1 ;;
+    --local-llm) WANT_LOCAL_LLM=1 ;;
     -h|--help) sed -n 2,14p "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
@@ -55,6 +60,11 @@ if [ "$WANT_SAGE" = 1 ]; then
   fi
 fi
 
+if [ "$WANT_LOCAL_LLM" = 1 ]; then
+  echo "==> 内蔵 LLM: ビルド済み llama-server を取得"
+  venv/bin/python scripts/fetch_llama_server.py
+fi
+
 echo
 echo "==> 確認"
 venv/bin/python - <<'PY'
@@ -66,6 +76,10 @@ try:
     print("sageattention: installed (H3_ATTN_BACKEND=sage, sm_120 only)")
 except ImportError:
     print("sageattention: not installed -> start with H3_ATTN_BACKEND=default")
+import sys; sys.path.insert(0, ".")
+from core import local_llm
+exe = local_llm.find_binary()
+print("built-in LLM (llama-server):", exe if exe else "not fetched yet -> fetched automatically on first fallback, or scripts/install.sh --local-llm")
 PY
 
 echo

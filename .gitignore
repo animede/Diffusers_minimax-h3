@@ -14,3 +14,6 @@ skills_cache/
 
 # LLM の API キー等のローカル設定(core/llm.py が読む)。秘匿値のため追跡しない
 config.local.env
+
+# 内蔵 LLM 用のビルド済み llama-server(core/local_llm.py が取得)
+tools/

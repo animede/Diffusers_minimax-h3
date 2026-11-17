@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -65,8 +66,60 @@ def llm_auth_headers() -> dict:
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
+def local_llm_mode() -> str:
+    """H3_LLM_LOCAL(環境変数 → config.local.env → 既定 auto)。
+    auto = 外部 LLM に接続できないときだけ内蔵 E4B へフォールバック / 1 = 内蔵 LLM のみ / 0 = フォールバックしない。"""
+    v = (os.environ.get("H3_LLM_LOCAL") or _local_setting("H3_LLM_LOCAL") or "auto").strip().lower()
+    return v if v in ("auto", "1", "0") else "auto"
+
+
+_backend_state = threading.local()
+
+
+def last_backend() -> str | None:
+    """このスレッドで最後に chat_completion() が使った LLM: "external" / "local-e4b"。"""
+    return getattr(_backend_state, "backend", None)
+
+
+def llm_status() -> dict:
+    """/api/status 用: 外部 LLM の接続先と内蔵 LLM の状態。"""
+    from core.local_llm import local_llm
+
+    return {"url": get_llm_url(), "local_mode": local_llm_mode(), "local": local_llm.status()}
+
+
 def chat_completion(system_prompt: str, user_text: str, *, temperature: float = 0.6) -> str:
-    url = f"{get_llm_url()}/v1/chat/completions"
+    """外部 LLM(H3_LLM_URL)→ 接続できなければ内蔵 E4B(core/local_llm.py)の順で 1 回の chat を行う。
+    ACE-Step-1.5-fast の easy-music と同じ方式(外部失敗 → ローカル、ローカルも不可なら接続エラー)。"""
+    from core.local_llm import local_llm
+
+    mode = local_llm_mode()
+    if mode != "1":
+        try:
+            out = _chat_completion_external(system_prompt, user_text, temperature=temperature)
+            _backend_state.backend = "external"
+            return out
+        except LLMConnectionError as e:
+            if mode == "0" or not local_llm.is_available():
+                raise
+            logger.warning("外部 LLM に接続できないため内蔵 LLM(Gemma 4 E4B)へフォールバックします: %s", e)
+    else:
+        logger.info("H3_LLM_LOCAL=1: 外部 LLM を使わず内蔵 LLM(Gemma 4 E4B)で処理します")
+    try:
+        base_url = local_llm.ensure_running()
+    except Exception as e:  # noqa: BLE001
+        raise LLMConnectionError(f"内蔵 LLM(E4B)も使えません: {e}") from e
+    out = _chat_completion_external(system_prompt, user_text, temperature=temperature, base_url=base_url, auth=False)
+    from core.local_llm import THOUGHT_RE
+
+    _backend_state.backend = "local-e4b"
+    return THOUGHT_RE.sub("", out).strip()
+
+
+def _chat_completion_external(system_prompt: str, user_text: str, *, temperature: float = 0.6,
+                              base_url: str | None = None, auth: bool = True) -> str:
+    base = (base_url or get_llm_url()).rstrip("/")
+    url = f"{base}/v1/chat/completions"
     payload = {
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -78,14 +131,14 @@ def chat_completion(system_prompt: str, user_text: str, *, temperature: float = 
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", **llm_auth_headers()},
+        headers={"Content-Type": "application/json", **(llm_auth_headers() if auth else {})},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
-        raise LLMConnectionError(f"LLMサーバ({get_llm_url()})に接続できません: {e}") from e
+        raise LLMConnectionError(f"LLMサーバ({base})に接続できません: {e}") from e
     except json.JSONDecodeError as e:
         raise LLMConnectionError(f"LLMサーバの応答を解釈できません: {e}") from e
     try:

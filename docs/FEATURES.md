@@ -200,6 +200,7 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_VIDEO_VAE_FP16` | `0` | video VAE を fp16 化(デコードのピークを削減。16GB 以下では必須) |
 | `H3_LLM_URL` | `http://127.0.0.1:64660` | プロンプト強化に使うローカルLLM(任意機能) |
 | `H3_LLM_API_KEY` | なし | LLMサーバのAPIキー(`Authorization: Bearer` で送る)。環境変数が無ければリポジトリ直下の `config.local.env`(git管理外)の同名行を読む |
+| `H3_LLM_LOCAL` / `H3_LLM_LOCAL_GGUF` | `auto` / なし | 2026-11-17 追加。外部 LLM に接続できないとき CPU 上の内蔵 LLM(Gemma 4 E4B、GGUF Q4_0)へフォールバック。実体は llama.cpp のビルド済み `llama-server` の子プロセス(`core/local_llm.py` が自動取得・起動、コンパイラ不要)。`1` で内蔵のみ、`0` で無効 |
 
 ### 2026-10 更新: 24GB/32GB 単騎でリアルタイム会話生成
 

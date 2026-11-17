@@ -951,7 +951,7 @@ const I18N = {
     'option.frames5': '5フレーム (0.21秒・実験的)',
     'label.t2iBatch': 'バッチ連続生成(プロンプト<b>1行=1場面</b>、最大24場面)',
     'hint.t2i': 'H3と<b>画風が完全に一致する静止画</b>を、FL2VAの先頭フレームやRef2VAの参照画像用に' +
-      '作るモード。生成時間は固定費支配のため専用T2Iモデルより遅い。超短尺mp4も一緒に' +
+      '作るモード(画像専用モデルの MiniMax-H3-Image ではなく、動画モデルで超短尺動画を生成して中央フレームを取り出す)。生成時間は固定費支配のため専用T2Iモデルより遅い。超短尺mp4も一緒に' +
       '保存され、PNGは中央フレーム(別フレームが欲しい場合はmp4から取り出せる)。' +
       'バッチはモデルロードを全場面で1回に償却する(低VRAMモードで特に有効。' +
       'seed・解像度・ステップは全場面共通)。',
@@ -1045,6 +1045,7 @@ const I18N = {
     'err.generic': 'エラー: {msg}',
     'status.enhanceUndone': '強化前のプロンプトに戻しました',
     'status.enhanceDone': 'LLM強化完了 ({mode}, {sec}s',
+    'status.enhanceLocal': '、外部LLMに接続できず内蔵LLM(Gemma 4 E4B、CPU)で処理',
     'status.enhanceRepaired': ', 自動修復 {n}回目',
     'status.enhanceIssue': ' — 未解決の指摘があります:\n{report}',
     'status.enhanceReview': ' — 内容を確認・編集してから生成してください',
@@ -1145,7 +1146,8 @@ const I18N = {
     'option.frames22ref': '22 frames (0.92s, verified)',
     'option.frames5': '5 frames (0.21s, experimental)',
     'label.t2iBatch': 'Batch generation (prompt: <b>1 line = 1 scene</b>, up to 24 scenes)',
-    'hint.t2i': 'A mode for producing <b>stills that match H3\'s look exactly</b>, for use as FL2VA first frames or Ref2VA reference images. ' +
+    'hint.t2i': 'A mode for producing <b>stills that match H3\'s look exactly</b>, for use as FL2VA first frames or Ref2VA reference images ' +
+      '(it does not use the dedicated image model MiniMax-H3-Image: the video model generates an ultra-short clip and the center frame is extracted). ' +
       'Generation time is dominated by fixed costs, so it\'s slower than a dedicated T2I model. An ultra-short mp4 is saved alongside it, ' +
       'and the PNG is the center frame (you can extract a different frame from the mp4 if needed). ' +
       'Batch mode amortizes model loading across all scenes (especially effective in low-VRAM mode; ' +
@@ -1240,6 +1242,7 @@ const I18N = {
     'err.generic': 'Error: {msg}',
     'status.enhanceUndone': 'Reverted to the prompt before enhancement',
     'status.enhanceDone': 'LLM enhancement complete ({mode}, {sec}s',
+    'status.enhanceLocal': ', external LLM unreachable, used the built-in LLM (Gemma 4 E4B, CPU)',
     'status.enhanceRepaired': ', auto-repaired attempt {n}',
     'status.enhanceIssue': ' — there are unresolved issues:\n{report}',
     'status.enhanceReview': ' — review and edit the content before generating',
@@ -1893,6 +1896,7 @@ enhanceBtn.addEventListener('click', async () => {
     // h3-official は検証+修復ループ付き (core/prompt_check.py)。残った違反・警告は
     // ここで見せる。生成はブロックしない — プロンプトは編集可能なので人間が最終ゲート。
     let msg = t('status.enhanceDone', { mode: data.mode, sec: data.elapsed_s.toFixed(1) });
+    if (data.llm_backend === 'local-e4b') msg += t('status.enhanceLocal');
     if (data.repaired) msg += t('status.enhanceRepaired', { n: data.attempts });
     msg += ')';
     const hasIssue = (data.violations && data.violations.length) || (data.warnings && data.warnings.length);
@@ -1983,7 +1987,8 @@ async function refreshServerStatus() {
       `attn: ${r.attn_backend ?? 'default'} | turbo: ${r.turbo_lora ? 'on (' + (r.turbo_steps_default ?? '?') + ' steps)' : 'off'} | ` +
       `TE: ${r.te_proj ? 'proj ' + (r.te_proj_quant ?? '') : (r.te_quant ?? '')}${r.te_stream ? ' +stream' : ''}${r.te_diet ? ' +diet' : ''}` +
       (r.lowvram === 'group' ? ` | stream host: ${r.group_stream_host ?? '-'}` : ``) +
-      (r.video_vae_fp16 ? ` | vae: fp16` : ``);
+      (r.video_vae_fp16 ? ` | vae: fp16` : ``) +
+      (data.llm ? `<br>LLM: ${data.llm.url} | built-in E4B: ${data.llm.local_mode === '0' ? 'off' : (data.llm.local.available ? (data.llm.local.running ? 'running' : 'ready') : 'unavailable')}` : ``);
   } catch (e) {
     serverStatusEl.textContent = t('status.serverFetchError');
   }
