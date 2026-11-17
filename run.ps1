@@ -7,7 +7,21 @@
 #   .\run.ps1
 # 実行ポリシーで止まる場合: powershell -ExecutionPolicy Bypass -File .\run.ps1
 Set-Location -Path $PSScriptRoot
+
+# venv は scripts\install.ps1 が作る venv\ を使う(uv などで .venv\ を作った場合も拾う)
+$python = $null
+foreach ($cand in @(".\venv\Scripts\python.exe", ".\.venv\Scripts\python.exe")) {
+    if (Test-Path $cand) { $python = $cand; break }
+}
+if ($null -eq $python) {
+    Write-Host "venv が見つかりません(venv\Scripts\python.exe も .venv\Scripts\python.exe も無い)。" -ForegroundColor Yellow
+    Write-Host "先にインストールを実行してください:"
+    Write-Host "    powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1"
+    Write-Host "(install.ps1 がエラーで止まった場合は、その出力を確認してください。Python 3.12 と git が必要です)"
+    exit 1
+}
+
 $port = if ($env:H3_PORT) { $env:H3_PORT } else { "8611" }
 $bind = if ($env:H3_HOST) { $env:H3_HOST } else { "127.0.0.1" }
 if (-not $env:PYTORCH_CUDA_ALLOC_CONF) { $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True" }
-& ".\venv\Scripts\python.exe" -u -m uvicorn app:app --host $bind --port $port
+& $python -u -m uvicorn app:app --host $bind --port $port

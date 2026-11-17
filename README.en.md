@@ -107,10 +107,10 @@ winget install --id Gyan.FFmpeg -e
 ```powershell
 git clone https://github.com/animede/Diffusers_minimax-h3.git
 cd Diffusers_minimax-h3
-.\scripts\install.ps1
+.\scripts\install.bat
 ```
 
-`install.ps1` creates the venv and installs torch (cu128) and `requirements.txt`; add `-LocalLLM` to also fetch the built-in LLM binary. Then fetch the model:
+`install.bat` runs `scripts\install.ps1` regardless of PowerShell's execution policy (Windows does not run unsigned `.ps1` files directly by default). It creates the venv and installs torch (cu128) and `requirements.txt`; add `-LocalLLM` to also fetch the built-in LLM binary. Then fetch the model:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\download_t2va.py
@@ -125,7 +125,7 @@ py -3.12 -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-For starting the server (passing environment variables, per-tier examples, the execution-policy workaround) see the Windows part of [Starting](#starting).
+For starting the server (passing environment variables, per-tier examples) see the Windows part of [Starting](#starting). To run the `.ps1` files directly, either add Bypass (`powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1`) or run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
 
 The built-in LLM (the fallback when the external LLM is unreachable) can be added later even if you installed without `-LocalLLM`. It is fetched automatically on the first fallback; to fetch it ahead of time run the following (line 1 = the prebuilt `llama-server.exe`, about 25MB; line 2 = the Gemma 4 E4B GGUF, about 4.4GB, optional):
 
@@ -134,7 +134,7 @@ The built-in LLM (the fallback when the external LLM is unreachable) can be adde
 .\venv\Scripts\python.exe scripts\fetch_llama_server.py --model
 ```
 
-Running `.\scripts\install.ps1 -LocalLLM` later does the same (already-installed packages are left as they are). Details: [Built-in LLM (optional)](#built-in-llm-optional) below.
+Running `.\scripts\install.bat -LocalLLM` later does the same (already-installed packages are left as they are). Details: [Built-in LLM (optional)](#built-in-llm-optional) below.
 
 > The Windows branches were written on paper: **this video server has not yet been verified on a real Windows machine** (the image server built the same way, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server), is verified on Windows 11 + RTX 3050). Please report problems as issues.
 
@@ -221,10 +221,10 @@ venv/bin/python scripts/probe_t2va.py
 
 ### Windows
 
-`run.ps1` starts the same server (default 127.0.0.1:8611; `H3_HOST` / `H3_PORT` change the bind address and port):
+`run.bat` starts the same server (it just runs `run.ps1` regardless of the execution policy; default 127.0.0.1:8611; `H3_HOST` / `H3_PORT` change the bind address and port):
 
 ```powershell
-.\run.ps1
+.\run.bat
 ```
 
 Set environment variables one per line with `$env:` before starting. The Linux launch examples above carry over directly: turn each `H3_X=value` into `$env:H3_X = "value"` and then call `.\run.ps1`. Single-16GB example (cards other than sm_120 need `H3_ATTN_BACKEND=default`; `H3_PROFILE=auto` sets it when unset):
@@ -234,12 +234,12 @@ $env:H3_LOWVRAM = "group"
 $env:H3_TE_PROJ = "NicoLab28/ClipProj-MiniMax-H3"
 $env:H3_VIDEO_VAE_FP16 = "1"
 $env:H3_ATTN_BACKEND = "default"
-.\run.ps1
+.\run.bat
 ```
 
-With nothing set, `H3_PROFILE=auto` picks the tier from the GPU's total VRAM, so plain `.\run.ps1` is a fine first start (on the 32GB-and-below tiers the turbo LoRA is enabled automatically; add `$env:H3_TURBO_LORA = "1"` only if you want turbo as the default on 48GB and above). Variables stay set until that PowerShell window is closed (to start again with a different configuration, remove them with e.g. `Remove-Item Env:H3_LOWVRAM` or open a new window).
+With nothing set, `H3_PROFILE=auto` picks the tier from the GPU's total VRAM, so plain `.\run.bat` is a fine first start (on the 32GB-and-below tiers the turbo LoRA is enabled automatically; add `$env:H3_TURBO_LORA = "1"` only if you want turbo as the default on 48GB and above). Variables stay set until that PowerShell window is closed (to start again with a different configuration, remove them with e.g. `Remove-Item Env:H3_LOWVRAM` or open a new window).
 
-If PowerShell's execution policy blocks the script:
+If you run `run.ps1` directly and the execution policy blocks it (`run.bat` does this internally):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run.ps1
@@ -368,7 +368,7 @@ For a conversational application built on this server see [Realtime_Narration_Vi
 minimax-h3/
 ├── app.py                 # FastAPI server (port 8611)
 ├── run.sh                 # launcher for the diffusers-movie-server integration (port 8631)
-├── run.ps1                # Windows launcher (port 8611)
+├── run.ps1, run.bat       # Windows launcher (port 8611; the .bat runs the .ps1 bypassing the execution policy)
 ├── core/
 │   ├── runner.py          # ModularPipeline loading / generation logic
 │   ├── blockstream.py     # windowed prefetch streamer for transformer blocks (H3_GROUP_STREAM=own)
@@ -382,7 +382,7 @@ minimax-h3/
 │   ├── llm.py, prompt_check.py   # LLM prompt enhancement and verification
 │   ├── settings.py, gallery.py
 ├── static/index.html      # single-page UI (ja / en)
-├── scripts/               # install.sh / install.ps1, download, regression and probe scripts
+├── scripts/               # install.sh / install.ps1 / install.bat, download, regression and probe scripts
 ├── docs/                  # documentation (table above)
 ├── models/                # quantized caches etc. (git-ignored)
 ├── outputs/, logs/        # outputs and logs (git-ignored)

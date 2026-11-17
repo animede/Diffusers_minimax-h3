@@ -35,6 +35,7 @@ if (-not (Test-Path ".\venv\Scripts\python.exe")) {
     }
 }
 $python = ".\venv\Scripts\python.exe"
+if (-not (Test-Path $python)) { throw "venv の作成に失敗しました($python が無い)。py -3.12 -m venv venv を手で実行して出力を確認してください" }
 
 & $python -m pip install --upgrade pip wheel setuptools
 if ($LASTEXITCODE -ne 0) { throw "pip の更新に失敗" }

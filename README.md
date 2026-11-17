@@ -107,10 +107,10 @@ winget install --id Gyan.FFmpeg -e
 ```powershell
 git clone https://github.com/animede/Diffusers_minimax-h3.git
 cd Diffusers_minimax-h3
-.\scripts\install.ps1
+.\scripts\install.bat
 ```
 
-`install.ps1` は venv を作り、torch(cu128)と `requirements.txt` を入れる。`-LocalLLM` を付けると内蔵 LLM のバイナリも取得する。続けてモデルを取得する:
+`install.bat` は PowerShell の実行ポリシーに関係なく `scripts\install.ps1` を実行する(Windows の既定では未署名の `.ps1` を直接実行できないため)。venv を作り、torch(cu128)と `requirements.txt` を入れる。`-LocalLLM` を付けると内蔵 LLM のバイナリも取得する。続けてモデルを取得する:
 
 ```powershell
 .\venv\Scripts\python.exe scripts\download_t2va.py
@@ -125,7 +125,7 @@ py -3.12 -m venv venv
 .\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-起動方法(環境変数の渡し方、VRAM 級別の例、実行ポリシーの回避)は「[起動](#起動)」の Windows 節を参照。
+起動方法(環境変数の渡し方、VRAM 級別の例)は「[起動](#起動)」の Windows 節を参照。`.ps1` を直接実行したい場合は `powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1` のように Bypass を付けるか、一度だけ `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` を実行しておく。
 
 内蔵 LLM(外部 LLM に接続できないときのフォールバック)は、インストール時に `-LocalLLM` を付けなくても後から入れられる。初回のフォールバック時に自動取得されるが、先に取っておく場合は次を実行する(1 行目がビルド済み `llama-server.exe`(約 25MB)、2 行目が Gemma 4 E4B の GGUF(約 4.4GB)。GGUF は省略可):
 
@@ -134,7 +134,7 @@ py -3.12 -m venv venv
 .\venv\Scripts\python.exe scripts\fetch_llama_server.py --model
 ```
 
-`.\scripts\install.ps1 -LocalLLM` を後から実行しても同じ(既に入っている依存はそのまま)。詳細は下の「[内蔵 LLM(任意)](#内蔵-llm任意)」。
+`.\scripts\install.bat -LocalLLM` を後から実行しても同じ(既に入っている依存はそのまま)。詳細は下の「[内蔵 LLM(任意)](#内蔵-llm任意)」。
 
 > Windows 用の分岐は机上で用意したもので、**この動画サーバ自体の Windows 実機確認はまだ行っていません**(同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で確認済み)。問題があれば issue で報告してください。
 
@@ -221,10 +221,10 @@ venv/bin/python scripts/probe_t2va.py
 
 ### Windows
 
-`run.ps1` が同じサーバを起動する(既定は 127.0.0.1:8611。`H3_HOST` / `H3_PORT` で待ち受けアドレスとポートを変更):
+`run.bat` が同じサーバを起動する(中身は `run.ps1` を実行ポリシーに関係なく呼ぶだけ。既定は 127.0.0.1:8611。`H3_HOST` / `H3_PORT` で待ち受けアドレスとポートを変更):
 
 ```powershell
-.\run.ps1
+.\run.bat
 ```
 
 環境変数は起動前に `$env:` で 1 行ずつ設定する。上の Linux の起動例は、`H3_X=値` をそれぞれ `$env:H3_X = "値"` に読み替えて `.\run.ps1` を呼べばそのまま使える。16GB 単体の例(sm_120 以外は `H3_ATTN_BACKEND=default` が必須だが、未指定なら `H3_PROFILE=auto` が自動で入れる):
@@ -234,12 +234,12 @@ $env:H3_LOWVRAM = "group"
 $env:H3_TE_PROJ = "NicoLab28/ClipProj-MiniMax-H3"
 $env:H3_VIDEO_VAE_FP16 = "1"
 $env:H3_ATTN_BACKEND = "default"
-.\run.ps1
+.\run.bat
 ```
 
-何も設定しなければ `H3_PROFILE=auto` が GPU の総 VRAM から級を選ぶので、まずは `.\run.ps1` だけで起動してよい(32GB 以下の級では turbo LoRA も自動で ON。48GB 以上で turbo を既定にしたいときだけ `$env:H3_TURBO_LORA = "1"` を足す)。設定した環境変数はその PowerShell を閉じるまで残る(別の構成で起動し直すときは `Remove-Item Env:H3_LOWVRAM` のように消すか、PowerShell を開き直す)。
+何も設定しなければ `H3_PROFILE=auto` が GPU の総 VRAM から級を選ぶので、まずは `.\run.bat` だけで起動してよい(32GB 以下の級では turbo LoRA も自動で ON。48GB 以上で turbo を既定にしたいときだけ `$env:H3_TURBO_LORA = "1"` を足す)。設定した環境変数はその PowerShell を閉じるまで残る(別の構成で起動し直すときは `Remove-Item Env:H3_LOWVRAM` のように消すか、PowerShell を開き直す)。
 
-PowerShell の実行ポリシーで止まる場合は次のように起動する:
+`run.ps1` を直接実行して実行ポリシーで止まる場合は次のように起動する(`run.bat` はこれを内部で行う):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run.ps1
@@ -368,7 +368,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 minimax-h3/
 ├── app.py                 # FastAPI 本体(port 8611)
 ├── run.sh                 # diffusers-movie-server 統合用の起動スクリプト(port 8631)
-├── run.ps1                # Windows 用の起動スクリプト(port 8611)
+├── run.ps1, run.bat       # Windows 用の起動スクリプト(port 8611。.bat は実行ポリシーを回避して .ps1 を呼ぶ)
 ├── core/
 │   ├── runner.py          # ModularPipeline のロード / 生成ロジック本体
 │   ├── blockstream.py     # transformer ブロックの窓付き先読みストリーマ(H3_GROUP_STREAM=own)
@@ -382,7 +382,7 @@ minimax-h3/
 │   ├── llm.py, prompt_check.py   # LLM プロンプト強化と検証
 │   ├── settings.py, gallery.py
 ├── static/index.html      # 単一ページ UI(日英)
-├── scripts/               # install.sh / install.ps1、ダウンロード・回帰・各種プローブ
+├── scripts/               # install.sh / install.ps1 / install.bat、ダウンロード・回帰・各種プローブ
 ├── docs/                  # ドキュメント(上の表)
 ├── models/                # 量子化済みキャッシュ等(.gitignore 対象)
 ├── outputs/, logs/        # 生成物・ログ(.gitignore 対象)
