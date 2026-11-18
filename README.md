@@ -94,7 +94,7 @@ venv/bin/pip install torchao==0.17.0
 
 ### Windows
 
-依存パッケージは Windows 用の wheel がそろっています(torch 2.9.0+cu128 は PyTorch の index から、torchao は PyPI の純 Python wheel、bitsandbytes / av / psutil は PyPI の Windows wheel)。コンパイラや Visual Studio Build Tools は不要です。SageAttention は Windows 向けのビルドが無いため使わず、起動時に `H3_PROFILE=auto` が `H3_ATTN_BACKEND=default`(SDPA)を自動で入れます。コード側の OS 依存(RAM の取得、ファイルの先読み指示、一時ファイルの置き場所、内蔵 LLM の子プロセス)は Windows 用に分岐済みです。
+依存パッケージは Windows 用の wheel がそろっています(torch 2.9.0+cu128 は PyTorch の index から、torchao は PyPI の純 Python wheel、bitsandbytes / av / psutil は PyPI の Windows wheel)。コンパイラや Visual Studio Build Tools は不要です。SageAttention は Windows 向けのビルドが無いため使わず、起動時に `H3_PROFILE=auto` が `H3_ATTN_BACKEND=default`(SDPA)を自動で入れます。コード側の OS 依存(RAM の取得、ファイルの先読み指示、一時ファイルの置き場所、内蔵 LLM の子プロセス)は Windows 用に分岐済みです。Hugging Face のキャッシュは Windows では symlink を使わない設定(`HF_HUB_DISABLE_SYMLINKS=1`)を自動で入れます(開発者モードが OFF の PC で初回ダウンロード中に `WinError 1314` で止まる huggingface_hub の競合を避けるため。ディスク使用量は変わりません)。
 
 必要なもの: Python 3.12(`py -3.12` で呼べること)、git、CUDA 12.8 系に対応した NVIDIA ドライバ。`ffmpeg` は任意(ギャラリーの連結用)。git や Python が無い場合は winget で入れる(入れたあと PowerShell を開き直す):
 

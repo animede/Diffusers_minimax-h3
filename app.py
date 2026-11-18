@@ -7,6 +7,7 @@ diffusers-server (port 8601) とは完全に独立したワークスペース。
 
 起動: venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 """
+import core.hubenv  # noqa: F401  huggingface_hub を import する前に Windows の symlink 設定を整える
 import logging
 import tempfile
 import threading

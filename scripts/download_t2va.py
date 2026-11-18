@@ -1,5 +1,9 @@
 import sys, time
-from huggingface_hub import snapshot_download
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import core.hubenv  # noqa: E402,F401  Windows: HF キャッシュの symlink を使わない(WinError 1314 回避)
+from huggingface_hub import snapshot_download  # noqa: E402
 
 t0 = time.time()
 patterns = [

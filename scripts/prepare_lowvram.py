@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import core.hubenv  # noqa: E402,F401  Windows: HF キャッシュの symlink を使わない(WinError 1314 回避)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("minimax_h3.prepare_lowvram")
 

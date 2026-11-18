@@ -37,6 +37,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import core.hubenv  # noqa: F401  Windows: HF キャッシュの symlink を使わない
+
 logger = logging.getLogger("minimax_h3.local_llm")
 
 MODEL_REPO = "ggml-org/gemma-4-E4B-it-GGUF"

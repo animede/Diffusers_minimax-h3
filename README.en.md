@@ -94,7 +94,7 @@ venv/bin/pip install torchao==0.17.0
 
 ### Windows
 
-All dependencies have Windows wheels (torch 2.9.0+cu128 from the PyTorch index, torchao as PyPI's pure-Python wheel, bitsandbytes / av / psutil as PyPI Windows wheels). No compiler or Visual Studio Build Tools is needed. SageAttention has no Windows build and is not used; `H3_PROFILE=auto` sets `H3_ATTN_BACKEND=default` (SDPA) at startup. The OS-specific code paths (RAM readout, file read-ahead hints, temp-file location, the built-in LLM child process) have Windows branches.
+All dependencies have Windows wheels (torch 2.9.0+cu128 from the PyTorch index, torchao as PyPI's pure-Python wheel, bitsandbytes / av / psutil as PyPI Windows wheels). No compiler or Visual Studio Build Tools is needed. SageAttention has no Windows build and is not used; `H3_PROFILE=auto` sets `H3_ATTN_BACKEND=default` (SDPA) at startup. The OS-specific code paths (RAM readout, file read-ahead hints, temp-file location, the built-in LLM child process) have Windows branches. On Windows the Hugging Face cache is set not to use symlinks (`HF_HUB_DISABLE_SYMLINKS=1`) automatically, to avoid a huggingface_hub race that aborts the first download with `WinError 1314` on PCs without Developer Mode (disk usage is unchanged).
 
 Requirements: Python 3.12 (callable as `py -3.12`), git, an NVIDIA driver for CUDA 12.8. `ffmpeg` is optional (gallery concatenation). If git or Python is missing, install them with winget (then reopen PowerShell):
 
