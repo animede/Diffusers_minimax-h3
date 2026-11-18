@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-18 12:29 JST** — Ref2VA / Ref2I on low-RAM hosts: `prepare_lowvram.py --ref` now builds the transformer_ref cache too, and the startup RAM-guard stop is fixed. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-18 12:34 JST** — `prepare_lowvram.py`: fixed the `WinError 5` crash when deleting a source shard on Windows / `--ref` builds the transformer_ref cache for Ref2VA / Ref2I. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).

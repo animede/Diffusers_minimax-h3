@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 12:29 JST** — 低 RAM 機の Ref2VA / Ref2I: `prepare_lowvram.py --ref` で transformer_ref のキャッシュも作れるようにし、起動時の RAM ガードで止まる不具合を修正。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 12:34 JST** — `prepare_lowvram.py`: Windows で原本シャードの削除が `WinError 5` で落ちる問題を修正 / `--ref` で Ref2VA / Ref2I 用の transformer_ref キャッシュも作れるように。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。

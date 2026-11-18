@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -65,14 +66,28 @@ SMALL_PATTERNS = ["*.json", "vae/*", "audio_vae/*", "scheduler/*", "audio_schedu
 
 
 def _release(path: Path) -> float:
-    """HF キャッシュのシャード(symlink + blob)を消して空けた GB を返す。"""
+    """HF キャッシュのシャード(symlink + blob)を消して空けた GB を返す。
+
+    Windows では safetensors の mmap がまだ生きている(読んだテンソルの参照が GC されていない)と、
+    削除が `PermissionError: [WinError 5] アクセスが拒否されました` になる(RTX 3050 機で実測)。
+    GC してから少し待って数回やり直し、それでも消せなければ警告だけ出して続ける(ディスクが
+    シャード 1 つ分 4.7GB 増えるだけで、キャッシュ作成は完走する)。
+    """
     real = Path(os.path.realpath(path))
     size = real.stat().st_size if real.exists() else 0
     for q in (path, real):
-        try:
-            q.unlink()
-        except FileNotFoundError:
-            pass
+        for attempt in range(6):
+            try:
+                q.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError:
+                if attempt == 5:
+                    logger.warning("原本を削除できません(他プロセスが開いているか mmap が残っています)。残したまま続けます: %s", q)
+                    return 0.0
+                gc.collect()
+                time.sleep(1.0 + attempt)
     return size / 1e9
 
 
@@ -185,7 +200,8 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
         for k, v in flat.items():
             weight_map[k] = shard
             total += v.numel() * v.element_size()
-        del tensors, flat
+        del tensors, flat, t  # mmap を掴むテンソルの参照を全部手放してから原本を消す(Windows は開いたままだと消せない)
+        gc.collect()
         freed = 0.0 if keep_source else _release(src)
         logger.info("[%d/%d] %s/%s: %d 層を int8 化、%.1fs%s", n, len(shards), subfolder, shard, n_q, time.time() - t0,
                     f"(原本 {freed:.1f}GB を削除)" if freed else "")
