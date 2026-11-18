@@ -191,7 +191,7 @@ only set these if you want to change them permanently):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `H3_PROFILE` | `auto` | Added 2026-11-17. When none of the main profile variables is set, fills in the 96/80/48/32/16/8GB-tier defaults from total VRAM (`core/profile.py`). On the 32GB-and-below tiers it also enables the turbo LoRA (ref2v / fl2v 4-step files), since in group mode it must be applied at startup; not on hosts under 48GB RAM (`file` streaming). `96gb`..`8gb` forces a tier, `off` disables. Also sets `H3_ATTN_BACKEND=default` when sage cannot be used |
+| `H3_PROFILE` | `auto` | Added 2026-11-17. When none of the main profile variables is set, fills in the 96/80/48/32/16/8GB-tier defaults from total VRAM (`core/profile.py`). On the 32GB-and-below tiers it also enables the turbo LoRA (ref2v / fl2v 4-step files), since in group mode it must be applied at startup; also with `file` streaming (the LoRA, about 1.2GB, stays on the GPU; 2026-11-18). `96gb`..`8gb` forces a tier, `off` disables. Also sets `H3_ATTN_BACKEND=default` when sage cannot be used |
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder quantization (`none` = bf16, 66.7GB) |
 | `H3_TE_PRUNE` | `0` | Remove unused upper layers of TE (output unchanged, -3.6GB) |
 | `H3_TE_PROJ` | (off) | **Projected TE**: replaces the 32B TE with Qwen3-VL-4B + a linear map (repo id or .safetensors path; quality is an approximation, see the dated 2026-08-10 section) |
@@ -202,7 +202,7 @@ only set these if you want to change them permanently):
 | `H3_KEEP_TRANSFORMER` | `0` | Keep the transformer resident, removing the reload fixed cost (see its section for the preconditions) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache (denoise -25%; measured ineffective on the int8+SDPA trajectory) |
 | `H3_ATTN_BACKEND` | `sage` | The sage build is sm_120-only. **Any other GPU must use `default` (SDPA)** |
-| `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use). Since 2026-11-17 also works in `group` (`H3_GROUP_STREAM=own` + the flag at startup; not with `file` streaming. A4000 16GB: t2va 5 s 768² in 151 s at 4 steps; with the 8GB-tier flags under an 8GB cap, 768² 209 s / 3.08GB, 1024² 376 s / 3.73GB ref2va 768² 299 s / 3.0GB and fl2va 768² 225 s / 3.4GB. Note: ref2va in group mode with the in-house streamer crashed on a layout device mismatch, fixed the same day) |
+| `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use). Since 2026-11-17 also works in `group` (`H3_GROUP_STREAM=own` + the flag at startup; with `file` streaming the LoRA, about 1.2GB, stays on the GPU: 8GB-tier flags under an 8GB cap gave 768² 205 s / 4.19GB, 1024² 376 s / 4.85GB. A4000 16GB: t2va 5 s 768² in 151 s at 4 steps; with the 8GB-tier flags under an 8GB cap, 768² 209 s / 3.08GB, 1024² 376 s / 3.73GB ref2va 768² 299 s / 3.0GB and fl2va 768² 225 s / 3.4GB. Note: ref2va in group mode with the in-house streamer crashed on a layout device mismatch, fixed the same day) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | When the bf16 transformer / transformer_ref weights (~66GB each) are not cached, download them from HF only if `1` (default: no download, fail with a hint) |
 | `H3_PIKA_RENOISE` | `0` | Renoise sampler for the Pika H3 Flex turbo LoRA (experimental) |
 | `H3_BLOCK_COMPILE` | `0` | `1` torch.compiles the 50 transformer_ref blocks after the turbo LoRA is applied (attention itself is a graph break). About -13% per step at 1024×768 on an RTX PRO 6000; +5-14s on the first call only |

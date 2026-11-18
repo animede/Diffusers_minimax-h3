@@ -73,11 +73,24 @@ def slot_names(unit: torch.nn.Module, prefix: str) -> list[str | None]:
     """`collect_slots(unit)` と同じ順序で、各スロットの safetensors 上の名前。torchao の wrapper の内側は
     diffusers の直列化規則(`<module>.weight` → `<module>._weight_<inner>`)。名前が付けられないものは None。"""
     names, seen = [], set()
+    # turbo LoRA の wrapper(core/runner.py の _TurboLoRALinear)は元の Linear を `.base` に抱えるので、パラメータ名が
+    # `<mod>.base.weight` になる。ファイル側の名前は巻く前の `<mod>.weight` なので `.base` を外して引く
+    # (lora_a / lora_b はファイルに無いので GPU 常駐になる。2026-11-18)。
+    wrappers = {n for n, m in unit.named_modules() if type(m).__name__ == "_TurboLoRALinear"}
+
+    def canon(pname: str) -> str:
+        head, _, leaf = pname.rpartition(".")
+        if head.endswith(".base") and head[:-5] in wrappers:
+            return f"{head[:-5]}.{leaf}"
+        if head == "base" and "" in wrappers:
+            return leaf
+        return pname
+
     for pname, p in unit.named_parameters(recurse=True):
         if id(p) in seen:
             continue
         seen.add(id(p))
-        full = prefix + pname
+        full = prefix + canon(pname)
         inner = _inner_names(p)
         if inner:
             head, _, leaf = full.rpartition(".")

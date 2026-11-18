@@ -56,7 +56,7 @@ INFO: dict = {"mode": "unapplied"}
 
 
 # group の原本をファイルから流す(H3_GROUP_STREAM_HOST=file)判定と同じ閾値(core/runner.py の
-# H3_GROUP_STREAM_FILE_BELOW_GB の既定)。file は LoRA バッファを流せないので turbo と併用できない。
+# H3_GROUP_STREAM_FILE_BELOW_GB の既定)。status の note 用。
 FILE_STREAM_BELOW_GB = 48.0
 
 
@@ -85,15 +85,12 @@ def tier_env(total_vram_gb: float, host_ram_gb: float | None, group_host: str = 
     env = dict(env)
     note = None
     if "H3_TURBO_LORA" in env:
+        # 2026-11-18: file ストリーミング(ホスト RAM 48GB 未満)でも turbo は使える(LoRA 約 1.2GB は GPU 常駐)。
+        # 以前はここで外していたが、8GB 上限の模擬で問題なく通ることを確認したので入れたままにする。
         below = float(os.environ.get("H3_GROUP_STREAM_FILE_BELOW_GB", "").strip() or FILE_STREAM_BELOW_GB)
         uses_file = group_host == "file" or (group_host == "auto" and host_ram_gb is not None and host_ram_gb < below)
         if uses_file:
-            for k in list(_TURBO):
-                env.pop(k, None)
-            why = ("H3_GROUP_STREAM_HOST=file が指定されている" if group_host == "file"
-                   else f"host RAM {host_ram_gb:.0f}GB が {below:.0f}GB 未満な")
-            note = (f"{why}ので重みをファイルから流す(file)構成になり、"
-                    "turbo LoRA は併用できないため入れない(GUI の turbo も無効)")
+            note = "重みはファイルから流す(file)構成。turbo LoRA(約 1.2GB)は GPU に常駐する"
     return name, env, note
 
 

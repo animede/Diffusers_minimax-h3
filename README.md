@@ -31,7 +31,7 @@ t2va 5 秒・768² の実測。詳細な行(80GB / 18GB / 12GB 級など)と測�
 | 24 / 32GB 単騎 | ck-w4a8 + AdaLN-pruned + pinned 退避の一式([詳細](docs/FEATURES.md#2026-10-更新-24gb32gb-単騎でリアルタイム会話生成)) | 320×448・141f が **5.57 秒 = 実時間の 0.95 倍**(32GB)/ 7.1 秒(24GB) |
 | 32GB 級 | `H3_LOWVRAM=group` | peak 28.7GB / 約 280 秒 |
 | 16GB 単体(実 4060 Ti / A4000) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | 4060 Ti: peak 11.4GB(2026-08)。A4000(2026-11-17): 30 ステップ peak 8.0GB / 790 秒、turbo 4 ステップ(`H3_TURBO_LORA=1`)peak 7.0GB / 151 秒 ※ |
-| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に 8GB の上限、VAE デコーダをストリーミング): 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒。fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒(いずれも 768²・5 秒) |
+| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に 8GB の上限、VAE デコーダをストリーミング): 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒。fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒(いずれも 768²・5 秒)。ホスト RAM 48GB 未満の `file` ストリーミング + turbo(同じ 8GB 上限): 768² 4.19GB / 205 秒、1024² 4.85GB / 376 秒 |
 | 8GB×2 | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB ※ |
 
 ※ 時間は PCIe 帯域に強く依存する(低 VRAM 構成は毎ステップの重み転送が律速)。4060 Ti(Gen3 x4、sm_89、30 ステップ)では 16GB 単体・8GB×2 とも t2va 5 秒に約 25 分かかったが、同じ構成が A4000(Gen4 x4)では 790 秒、48GB 機の GPU0 では 272 秒で、Gen4 x16 なら 4〜5 分の見込み。**turbo LoRA(`H3_TURBO_LORA=1`、4 ステップ)が group でも使えるようになったため、転送律速の「動くが遅い」はほぼ解消できる**: x4 接続の A4000 でも t2va 5 秒が 151 秒(16GB 級)、8GB 級の指定(VAE デコーダのストリーミング込み)でも 768² 209 秒 / 1024² 376 秒で完走する(転送回数がステップ数に比例して減るため)。8GB 級の値は A4000 に 8GB の上限(`H3_VRAM_LIMIT_GB`)を切った模擬で、デノイズ中のピーク 3.1〜3.7GB は 6GB 級にも収まる。sm_120 以外のカードは `H3_ATTN_BACKEND=default` も必要(既定の sage は sm_120 専用ビルド。未指定なら `H3_PROFILE=auto` が自動で入れる)。構成をまたぐと同一 seed でも構図が変わる(劣化ではなく軌道の分岐)ことは [性能の概要](docs/FEATURES.md#性能の概要) に詳しい。
@@ -198,7 +198,7 @@ Windows:
 venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 ```
 
-何も指定しなければ **`H3_PROFILE=auto`** が計算用 GPU の総 VRAM から 96 / 80 / 48 / 32 / 16 / 8GB 級の既定値一式(下の起動例と同じ内容)を選ぶ。32GB 以下の級(group)では turbo LoRA(4 ステップ)も既定で ON になる(group では起動時に巻かないと GUI からも使えないため。GUI で turbo を外せば 30 ステップ、`H3_TURBO_LORA=0` で起動時から無効)。ただしホスト RAM が 48GB 未満の PC は重みを量子化キャッシュのファイルから流す構成(`H3_GROUP_STREAM_HOST=file`)になり、これは turbo と併用できないので turbo は入らない(起動ログの `H3_PROFILE:` に理由が出る)。48GB 以上は GUI の turbo チェックでリクエストごとに使う。`H3_LOWVRAM` や `H3_TE_PROJ` など主プロファイル系の変数をひとつでも指定すると手動扱いになり、自動では何も入れない。sage が使えない GPU(sm_120 以外)や未インストールのときは `H3_ATTN_BACKEND=default` も自動で入る。選ばれた級は `/api/status` の `profile` と起動ログで確認できる。
+何も指定しなければ **`H3_PROFILE=auto`** が計算用 GPU の総 VRAM から 96 / 80 / 48 / 32 / 16 / 8GB 級の既定値一式(下の起動例と同じ内容)を選ぶ。32GB 以下の級(group)では turbo LoRA(4 ステップ)も既定で ON になる(group では起動時に巻かないと GUI からも使えないため。GUI で turbo を外せば 30 ステップ、`H3_TURBO_LORA=0` で起動時から無効)。48GB 以上は GUI の turbo チェックでリクエストごとに使う。`H3_LOWVRAM` や `H3_TE_PROJ` など主プロファイル系の変数をひとつでも指定すると手動扱いになり、自動では何も入れない。sage が使えない GPU(sm_120 以外)や未インストールのときは `H3_ATTN_BACKEND=default` も自動で入る。選ばれた級は `/api/status` の `profile` と起動ログで確認できる。
 
 ブラウザで `http://<host>:8611/` を開く。初回起動時はモデルのロード(既定では TE を NF4 量子化して GPU 常駐)に数分かかる。`run.sh` は diffusers-movie-server 統合用の起動スクリプトで、内部ポート 8631 と会話用途の既定値(turbo LoRA 等)を設定したうえで同じサーバを起動する。
 
@@ -348,7 +348,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
-| `H3_PROFILE` | `auto` | 主プロファイルの自動選択。`auto` は主プロファイル系の変数が未指定のときだけ総 VRAM から級を選ぶ(32GB 以下の級は turbo LoRA も ON。ただしホスト RAM 48GB 未満 = `file` ストリーミングでは入れない)/ `96gb`〜`8gb` で級を強制(`H3_VRAM_LIMIT_GB` で小さいカードを模擬するときに使う)/ `off` |
+| `H3_PROFILE` | `auto` | 主プロファイルの自動選択。`auto` は主プロファイル系の変数が未指定のときだけ総 VRAM から級を選ぶ(32GB 以下の級は turbo LoRA も ON)/ `96gb`〜`8gb` で級を強制(`H3_VRAM_LIMIT_GB` で小さいカードを模擬するときに使う)/ `off` |
 | `H3_LOWVRAM` | `0` | `1` = 48GB 級のフェーズ循環 / `group` = 32GB 級以下の block offload(int8 重みをブロック単位でストリーム) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` で transformer を 66.3→34GB。`ck-w4a8` は ComfyUI の W4A8 カーネル(要 `comfy-kitchen`) |
 | `H3_TE_QUANT` | `bnb-4bit` | text_encoder の量子化(`none` は bf16 で 66.7GB) |
@@ -363,7 +363,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | ref2va の transformer_ref を AdaLN-pruned 版で読む(`H3_TRANSFORMER_QUANT=int8` 併用必須)と、その量子化方式 |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外の GPU は `default`(SDPA)必須** |
-| `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。ホスト RAM 48GB 未満の `file` ストリーミングとは併用不可) |
+| `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。`file` ストリーミングでは LoRA 約 1.2GB が GPU に常駐) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得 |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使う外部 LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |
 | `H3_LLM_LOCAL_IDLE_S` / `H3_LLM_LOCAL_STOP_ON_GENERATE` | `300` / `auto` | 内蔵 LLM の省メモリ: 最後の利用から 300 秒で llama-server を止める(0 で止めない)/ 生成開始時に止める(`auto` = ホスト RAM 32GB 未満のときだけ、`1` / `0` で強制)。止まっても次の LLM 強化で自動再起動する |

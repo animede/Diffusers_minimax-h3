@@ -5413,11 +5413,9 @@ class MiniMaxH3Runner:
             t1 - t0, ram_gb(),
         )
         if H3_TURBO_LORA:
-            # ストリーマ構築より前に巻く(lora_a / lora_b をストリーマの転送対象に入れるため)。
-            # file ストリーミングは safetensors の原本から読むため LoRA バッファを持てない。
-            if self._group_stream_host_hint() == "file":
-                raise RuntimeError("H3_TURBO_LORA=1 は H3_GROUP_STREAM_HOST=file と併用できません(LoRA バッファを"
-                                   "ファイルから流せない)。H3_GROUP_STREAM_HOST=pinned を指定してください。")
+            # ストリーマ構築より前に巻く(lora_a / lora_b をストリーマの転送対象に入れるため)。pinned ではブロックと
+            # 一緒に流れ、file(原本をファイルから読む)では「ファイルに無いテンソル」として GPU に常駐する
+            # (約 1.2GB。2026-11-18 に 8GB 上限の模擬で確認)。
             n = self._apply_turbo_lora_checkpoint(self._pipe.transformer, is_ref=False)
             self._turbo_lora_wrapped = True
             logger.info("H3_TURBO_LORA=1 (group): applied turbo LoRA on CPU before the block streamer "
@@ -5833,10 +5831,7 @@ class MiniMaxH3Runner:
             t1 - t0, ram_gb(),
         )
         if H3_TURBO_LORA:
-            # base 側と同じ: ストリーマ構築より前に巻いて lora_a / lora_b を転送対象に入れる
-            if self._group_stream_host_hint() == "file":
-                raise RuntimeError("H3_TURBO_LORA=1 は H3_GROUP_STREAM_HOST=file と併用できません(LoRA バッファを"
-                                   "ファイルから流せない)。H3_GROUP_STREAM_HOST=pinned を指定してください。")
+            # base 側と同じ: ストリーマ構築より前に巻く(file では LoRA は GPU 常駐、約 1.2GB)
             n = self._apply_turbo_lora_checkpoint(self._pipe_ref.transformer_ref, is_ref=True)
             self._turbo_lora_wrapped_ref = True
             logger.info("H3_TURBO_LORA=1 (group): applied turbo LoRA on CPU before the block streamer "
