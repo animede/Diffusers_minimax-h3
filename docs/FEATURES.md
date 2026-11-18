@@ -192,7 +192,7 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃(成立条件は該当節参照) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外のGPUは `default`(SDPA)必須** |
-| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは当初 LoRA 約 1.2GB が GPU 常駐で、8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB、ref2va 768² 276 秒・4.13GB。同日 15 時にホスト RAM から単位ごとに流す方式に変え(`H3_FILE_STREAM_HOST_MIN_MB`)、6GB 上限の模擬で 768² 211 秒・2.82GB、1024² 380 秒・3.48GB。実機の Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB では 768² 452 秒(利用者報告。低クロックのラップトップ GPU で、NVMe の実効読み出しが約 500MB/s と SATA SSD 並み。重みの読み出しが律速)。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
+| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは当初 LoRA 約 1.2GB が GPU 常駐で、8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB、ref2va 768² 276 秒・4.13GB。同日 15 時にホスト RAM から単位ごとに流す方式に変え(`H3_FILE_STREAM_HOST_MIN_MB`)、6GB 上限の模擬で 768² 211 秒・2.82GB、1024² 380 秒・3.48GB。実機の Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB と Windows 10 + RTX 3050 6GB / RAM 16GB で動作確認済み(生成時間は公平な条件で測り直してから載せる。重みの読み出しが律速で SSD の速さに依存)。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | transformer / transformer_ref の bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得する(既定は取得せず、エラーで案内する) |
 | `H3_PIKA_RENOISE` | `0` | Pika H3 Flex の turbo LoRA 用 renoise サンプラー(実験) |
 | `H3_BLOCK_COMPILE` | `0` | `1` で turbo LoRA 適用後に transformer_ref の 50 ブロックを torch.compile(attention 本体は graph break)。RTX PRO 6000・1024×768 で 1 step 約 -13%、初回のみ +5〜14s |
@@ -528,7 +528,10 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   lora_a / lora_b、計 1.24GiB)のうちこのサイズ以上のものは GPU に常駐させず、ホスト RAM(ページャブル)に置いて単位ごとに
   受け皿へ memcpy して流す(2026-11-18。常駐だと 6GB のカードで Windows が共有メモリへ退避して極端に遅くなる、RTX 3050 で実測)。`/api/status` の `group_stream_host` / `group_stream_file`。
 - Windows は `fadvise` が無いので捨てる制御は効かない(読み自体は `FILE_FLAG_SEQUENTIAL_SCAN` で動く。画像サーバの
-  RTX 3050 / RAM 16GB 機で実証した方式)。
+  RTX 3050 / RAM 16GB 機で実証した方式)。2026-11-18: `FILE_FLAG_SEQUENTIAL_SCAN` は「RAM に収まらないもの」(30GB の
+  transformer)にだけ付け、収まるもの(VAE デコーダ 4.5GB、投影 TE 1.9GB)は通常のキャッシュ付きで開く。前者を全部に
+  付けていたため、RTX 4060 Laptop / RAM 16GB でデコード中にタイルごとの再読込が毎回 NVMe から走っていた
+  (デコード 124 秒、NVMe 約 1GB/s で張り付き)。判定は「重み + 1GiB + 予約 ≤ 使える RAM」、ログの `page cache kept / not kept`。
 - 量子化キャッシュは `scripts/prepare_lowvram.py` で先に作る(bf16 シャードを 1 つずつ落として量子化して消す。RAM 16GB で可)。
   Ref2VA / Ref2I は `transformer` とは別の重み `transformer_ref/`(66GB、全シャードの内容が異なる)を使うので、
   `--ref` で `transformer_ref_int8` も作る(+32GB)。2026-11-18 まで ref2va の group 読み込みはキャッシュの有無を見る前に

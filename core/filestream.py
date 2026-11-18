@@ -166,9 +166,16 @@ def _process_anon_gb() -> float:
 
 
 class _Reader:
-    """ファイルの指定範囲をピン留めバッファへ読む。32MB ずつ複数スレッドで並列に読む。"""
+    """ファイルの指定範囲をピン留めバッファへ読む。32MB ずつ複数スレッドで並列に読む。
 
-    def __init__(self):
+    sequential(Windows のみ意味がある): True なら FILE_FLAG_SEQUENTIAL_SCAN で開き、読んだページをキャッシュに
+    残さない(30GB の transformer のように RAM に収まらないもの向け。LRU の巡回で他を押し出さない)。False なら
+    通常のキャッシュ付きで開く(VAE デコーダ 4.5GB や投影 TE 1.9GB のように RAM に収まるもの向け。タイルごと・
+    ステップごとの再読込がページキャッシュから返るので NVMe を毎回読まない。2026-11-18、RTX 4060 Laptop で
+    デコード中に NVMe が張り付いていた件の対策)。"""
+
+    def __init__(self, sequential: bool = True):
+        self.sequential = sequential
         self.pool = ThreadPoolExecutor(_READ_THREADS, thread_name_prefix="filestream-read")
         self.local = threading.local()      # pread の無い OS(Windows)はスレッドごとに fd
         self.shared: dict[Path, int] = {}
@@ -178,7 +185,7 @@ class _Reader:
     def _open(self, path: Path) -> int:
         flags = os.O_RDONLY
         if sys.platform == "win32":
-            flags |= os.O_BINARY | getattr(os, "O_SEQUENTIAL", 0)
+            flags |= os.O_BINARY | (getattr(os, "O_SEQUENTIAL", 0) if self.sequential else 0)
         return os.open(str(path), flags)
 
     def _fd(self, path: Path) -> int:
@@ -301,7 +308,10 @@ class FileBlockStreamer:
         self.total_gb = total / 2**30
         self.ring = max(2, int(ring))
         self.drop_from = self.n - self._decide_drop(drop_units, reserve_gb)
-        self.reader = _Reader()
+        # ページキャッシュに丸ごと収まる(重み + 余裕 < 使える RAM)なら Windows でもキャッシュさせる(再読込が速い)。
+        # 収まらないものは sequential(キャッシュに残さない)。Linux では open のフラグに影響しない
+        self.cached_reads = (self.total_gb + 1.0 + float(reserve_gb)) <= host_cache_budget_gb()
+        self.reader = _Reader(sequential=not self.cached_reads)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"filestream-{label}")
         # 受け皿は torch.empty(匿名メモリ)を cudaHostRegister でピン留めする(pin_memory() の cudaHostAlloc は
         # cgroup に file として計上され、ページキャッシュの予算計算から漏れる、image server で実測)
@@ -324,9 +334,10 @@ class FileBlockStreamer:
         self._wait = self._rt = self._t0 = 0.0
         self._passes = 0
         logger.info("file streaming (%s): %d units (%.2f GiB) read from %d files, staging %d x %.2f GiB pinned, "
-                    "drop %d units after use, resident %.2f GiB",
+                    "drop %d units after use, resident %.2f GiB, page cache %s",
                     label, self.n, self.total_gb, len(files), self.ring, self.unit_bytes / 2**30,
-                    self.n - self.drop_from, resident_bytes / 2**30)
+                    self.n - self.drop_from, resident_bytes / 2**30,
+                    "kept (fits in RAM)" if self.cached_reads else "not kept (sequential)")
 
     def _decide_drop(self, drop_units, reserve_gb: float) -> int:
         if self.n == 0:
@@ -426,4 +437,4 @@ class FileBlockStreamer:
     def describe(self) -> dict:
         return {"blocks": self.n, "host": "file", "weights_gib": round(self.total_gb, 2),
                 "staging_gib": round(self.ring * self.unit_bytes / 2**30, 2), "drop_units": self.n - self.drop_from,
-                "host_staged_gib": round(self.host_staged_gb, 2)}
+                "host_staged_gib": round(self.host_staged_gb, 2), "page_cache": "kept" if self.cached_reads else "sequential"}
