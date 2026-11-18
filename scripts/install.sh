@@ -70,5 +70,7 @@ echo "==> 確認"
 venv/bin/python scripts/check_install.py
 
 echo
-echo "完了。次はモデルの取得:  venv/bin/python scripts/download_t2va.py"
+echo "完了。次はモデルの準備:"
+echo "  低 VRAM / 低 RAM の PC(32GB 以下・RAM 48GB 未満): venv/bin/python scripts/prepare_lowvram.py"
+echo "  48GB 以上・RAM 64GB 以上:                         venv/bin/python scripts/download_t2va.py"
 echo "起動:                    venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611"

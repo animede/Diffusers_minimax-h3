@@ -56,5 +56,7 @@ Write-Host ""
 Write-Host "==> check"
 & $python scripts\check_install.py
 Write-Host ""
-Write-Host "Done. Next, fetch the model:  .\venv\Scripts\python.exe scripts\download_t2va.py"
+Write-Host "Done. Next, prepare the models (low-VRAM / low-RAM PCs, builds the int8 cache shard by shard):"
+Write-Host "    .\venv\Scripts\python.exe scripts\prepare_lowvram.py"
+Write-Host "  (48GB+ VRAM and 64GB+ RAM: .\venv\Scripts\python.exe scripts\download_t2va.py also works)"
 Write-Host "Start the server:             .\run.bat   (http://127.0.0.1:8611/)"

@@ -113,10 +113,10 @@ cd Diffusers_minimax-h3
 `install.bat` は PowerShell の実行ポリシーに関係なく `scripts\install.ps1` を実行する(Windows の既定では未署名の `.ps1` を直接実行できないため)。venv を作り、torch(cu128)と `requirements.txt` を入れる。`-LocalLLM` を付けると内蔵 LLM のバイナリも取得する。続けてモデルを取得する:
 
 ```powershell
-.\venv\Scripts\python.exe scripts\download_t2va.py
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py
 ```
 
-手動で入れる場合は次の順に実行する(PyPI の Windows 版 torch は CPU 専用なので、torch を先に PyTorch の index から入れる順序が必要):
+(VRAM 48GB 以上・RAM 64GB 以上の PC なら `scripts\download_t2va.py` でもよい。下の「低 VRAM / 低 RAM の PC の準備」参照。)手動で入れる場合は次の順に実行する(PyPI の Windows 版 torch は CPU 専用なので、torch を先に PyTorch の index から入れる順序が必要):
 
 ```powershell
 py -3.12 -m venv venv
@@ -162,6 +162,8 @@ venv/bin/python scripts/fetch_llama_server.py --model   # GGUF(約 4.4GB)も先�
 
 ### モデルの取得
 
+**VRAM 32GB 以下、またはホスト RAM 48GB 未満の PC は、次の「低 VRAM / 低 RAM の PC の準備」を使う**(こちらの手順は 144GB をそのまま落とすので、低 VRAM 級では無駄が多く、RAM の少ない PC では量子化キャッシュを作れず起動時に止まる)。
+
 `MiniMaxAI/MiniMax-H3` は 498.6GB あるが、T2VA / FL2VA には `transformer/`(66.3GB)+ `text_encoder/`(66.7GB)+ `vae/`(10.4GB)+ `audio_vae/`(0.6GB)+ 設定類の**約 144GB** で足りる。`transformer_ref/`(Ref2VA 用、66.3GB)は必要なときだけ取得し、**丸ごと `snapshot_download` しないこと**。
 
 ```bash
@@ -169,6 +171,22 @@ venv/bin/python scripts/download_t2va.py
 ```
 
 内部で `allow_patterns` を使って必要なサブフォルダのみを取得する。ダウンロード中は `logs/du_monitor.log` でキャッシュサイズを監視できる。bf16 の transformer / transformer_ref がキャッシュに無いときは、`H3_ALLOW_WEIGHT_DOWNLOAD=1` のときだけ自動取得する(既定はエラーで案内)。
+
+### 低 VRAM / 低 RAM の PC の準備
+
+`H3_LOWVRAM=group`(32GB 以下の級)で重みを量子化キャッシュのファイルから流す構成は、**int8 量子化済みキャッシュ(`models/prequant/transformer_int8`、約 32GB)が先にあること**が前提。無いと bf16(66GB)から量子化する従来経路に落ち、ホスト RAM 40GB のガードで止まる(RAM 16GB の PC で実際にこのエラーになる)。`scripts/prepare_lowvram.py` は、bf16 のシャード(14 個、各 4.7GB)を 1 つずつ落として量子化して消す方式でこのキャッシュを作る。RAM は数 GB、VRAM は不要(既定は CPU で量子化、`--device cuda` も可)、ディスクのピークはシャード 1 つ分 + 出力。出来上がりはサーバが自分で作るキャッシュと**ビット単位で同一**(確認済み)。あわせて VAE デコーダの fp16 キャッシュを作り、投影 TE(Qwen3-VL-4B + ClipProj)を先に取得する。32B の text_encoder は落とさない。
+
+```bash
+venv/bin/python scripts/prepare_lowvram.py
+```
+
+Windows:
+
+```powershell
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py
+```
+
+所要時間はほぼ 66GB のダウンロード時間(量子化はシャードあたり数秒〜数十秒)。`--keep-source` で bf16 シャードを残せる(+66GB、再構築が速い)。投影 TE の NF4 キャッシュは初回起動時にサーバが作る(VRAM 8GB・RAM 16GB で可)。
 
 ## 起動
 

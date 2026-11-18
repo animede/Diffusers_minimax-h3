@@ -113,10 +113,10 @@ cd Diffusers_minimax-h3
 `install.bat` runs `scripts\install.ps1` regardless of PowerShell's execution policy (Windows does not run unsigned `.ps1` files directly by default). It creates the venv and installs torch (cu128) and `requirements.txt`; add `-LocalLLM` to also fetch the built-in LLM binary. Then fetch the model:
 
 ```powershell
-.\venv\Scripts\python.exe scripts\download_t2va.py
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py
 ```
 
-To install by hand, run these in order (PyPI's Windows torch is CPU-only, so torch must come first from the PyTorch index):
+(On a PC with 48GB+ VRAM and 64GB+ RAM, `scripts\download_t2va.py` works as well; see "Preparing a low-VRAM / low-RAM PC" below.) To install by hand, run these in order (PyPI's Windows torch is CPU-only, so torch must come first from the PyTorch index):
 
 ```powershell
 py -3.12 -m venv venv
@@ -162,6 +162,8 @@ Both are optional and can be run later on an existing installation. On the first
 
 ### Obtaining the model
 
+**PCs with 32GB of VRAM or less, or less than 48GB of host RAM, should use "Preparing a low-VRAM / low-RAM PC" below instead** (the steps here fetch the full 144GB, which is wasteful on the low-VRAM tiers, and a low-RAM PC cannot build the quantized cache and stops at startup).
+
 `MiniMaxAI/MiniMax-H3` is 498.6GB, but T2VA / FL2VA only need `transformer/` (66.3GB) + `text_encoder/` (66.7GB) + `vae/` (10.4GB) + `audio_vae/` (0.6GB) + configs, **about 144GB**. Fetch `transformer_ref/` (Ref2VA, 66.3GB) only when needed, and **never `snapshot_download` the whole repo**.
 
 ```bash
@@ -169,6 +171,22 @@ venv/bin/python scripts/download_t2va.py
 ```
 
 It uses `allow_patterns` internally to fetch only the needed subfolders; `logs/du_monitor.log` tracks the cache size while downloading. When the bf16 transformer / transformer_ref weights are not cached, they are downloaded only with `H3_ALLOW_WEIGHT_DOWNLOAD=1` (the default fails with a hint).
+
+### Preparing a low-VRAM / low-RAM PC
+
+The `H3_LOWVRAM=group` configuration (32GB tier and below) that streams the weights from the quantized cache files **requires the int8 quantized cache (`models/prequant/transformer_int8`, about 32GB) to exist first**. Without it the server falls back to quantizing from bf16 (66GB) and stops at the 40GB host-RAM guard (this is exactly what happens on a 16GB-RAM PC). `scripts/prepare_lowvram.py` builds that cache by fetching the bf16 shards (14 × 4.7GB) one at a time, quantizing each and deleting it: a few GB of RAM, no VRAM needed (CPU quantization by default, `--device cuda` optional), and disk peaks at one shard plus the output. The result is **bit-identical** to the cache the server would build itself (verified). It also builds the VAE decoder fp16 cache and pre-fetches the projected TE (Qwen3-VL-4B + ClipProj). The 32B text_encoder is not downloaded.
+
+```bash
+venv/bin/python scripts/prepare_lowvram.py
+```
+
+Windows:
+
+```powershell
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py
+```
+
+The time is dominated by downloading 66GB (quantization takes seconds to tens of seconds per shard). `--keep-source` keeps the bf16 shards (+66GB, faster rebuilds). The projected TE's NF4 cache is built by the server on first start (fine with 8GB VRAM / 16GB RAM).
 
 ## Starting
 
