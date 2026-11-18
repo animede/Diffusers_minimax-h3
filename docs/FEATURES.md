@@ -192,7 +192,7 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃(成立条件は該当節参照) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外のGPUは `default`(SDPA)必須** |
-| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは LoRA 約 1.2GB が GPU 常駐: 8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB、ref2va 768² 276 秒・4.13GB。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
+| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは LoRA 約 1.2GB が GPU 常駐: 8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB、ref2va 768² 276 秒・4.13GB。実機の Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB では 768² 452 秒(利用者報告。低クロックのラップトップ GPU で、NVMe の実効読み出しが約 500MB/s と SATA SSD 並み。重みの読み出しが律速)。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | transformer / transformer_ref の bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得する(既定は取得せず、エラーで案内する) |
 | `H3_PIKA_RENOISE` | `0` | Pika H3 Flex の turbo LoRA 用 renoise サンプラー(実験) |
 | `H3_BLOCK_COMPILE` | `0` | `1` で turbo LoRA 適用後に transformer_ref の 50 ブロックを torch.compile(attention 本体は graph break)。RTX PRO 6000・1024×768 で 1 step 約 -13%、初回のみ +5〜14s |
