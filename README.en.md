@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-18 12:34 JST** — `prepare_lowvram.py`: fixed the `WinError 5` crash when deleting a source shard on Windows / `--ref` builds the transformer_ref cache for Ref2VA / Ref2I. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-18 12:49 JST** — Windows / low-VRAM quick start added at the top / fixed the final metadata step of `prepare_lowvram.py` failing on Windows. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -12,6 +12,26 @@ It is built on the diffusers Modular Pipeline (PR #14355, pinned to commit **f37
 ![Main GUI](docs/images/ui_main_en.png)
 
 *A single-page browser UI. Five modes on tabs (video: **T2VA** = text / **FL2VA** = frame / **Ref2VA** = reference; still image: **T2I** / **Ref2I**). The lower section is a gallery of outputs, from which checked videos can be concatenated and exported. Prompts can be enhanced into the official H3 guide format via a local LLM, and FirstBlockCache / Sage / Turbo / quantization / low-VRAM mode are toggled from this panel **without a restart**. Includes a Japanese/English switch.*
+
+## Quick start (Windows, 6 to 16GB of VRAM)
+
+The shortest path for people arriving from social media. Details are under [Installation](#installation) and [Starting](#starting).
+
+```powershell
+winget install --id Git.Git -e --source winget
+winget install --id Python.Python.3.12 -e --source winget
+git clone https://github.com/animede/Diffusers_minimax-h3.git
+cd Diffusers_minimax-h3
+.\scripts\install.bat
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py
+.\run.bat
+```
+
+- Reopen PowerShell after the winget installs. `install.bat` creates the venv and installs the dependencies (a few minutes).
+- `prepare_lowvram.py` prepares the model. It does not fetch 144GB: it downloads the 66GB of weights one shard at a time, quantizes each and deletes it, so **about 60GB of disk** and 16GB of RAM are enough. The time is dominated by your connection (hours). If it stops, rerun it and it continues. Add `--ref` if you also want Ref2VA / Ref2I (video from reference material; +32GB).
+- `run.bat` starts the server; open `http://127.0.0.1:8611` in a browser. The first start takes a few minutes to build the projected text encoder's quantized cache. The settings for your GPU size (low-VRAM mode, 4-step turbo) are applied automatically.
+- Expect about 3.5 minutes for a 768², 5-second clip under an 8GB cap (measured on an A4000; a 4060 / 3060 takes somewhat longer), with a peak of about 4.2GB of VRAM. 6GB cards are limited to 768².
+- If something fails, see the troubleshooting notes in the [Windows](#windows) section and the [Issues](https://github.com/animede/Diffusers_minimax-h3/issues).
 
 ## Highlights
 
@@ -138,7 +158,7 @@ The built-in LLM (the fallback when the external LLM is unreachable) can be adde
 
 Running `.\scripts\install.bat -LocalLLM` later does the same (already-installed packages are left as they are). Details: [Built-in LLM (optional)](#built-in-llm-optional) below.
 
-> The Windows branches were written on paper: **this video server has not yet been verified on a real Windows machine** (the image server built the same way, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server), is verified on Windows 11 + RTX 3050). Please report problems as issues.
+> Windows status (2026-11-18): a user's Windows 11 + RTX 4060 8GB / 16GB RAM machine got through install, `prepare_lowvram.py` and startup. Windows 10 + RTX 3050 6GB is in progress (the Hub cache symlink, source-shard deletion, execution-policy and encoding problems found along the way are fixed). The image server built the same way, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server), generates fine on Windows 11 + RTX 3050. Please report problems in the [Issues](https://github.com/animede/Diffusers_minimax-h3/issues).
 
 ### SageAttention (optional, enabled by default; Linux only)
 

@@ -144,8 +144,17 @@ def finalize_metadata(cache_dir: Path) -> dict:
             tensors = {k: f.get_tensor(k) for k in f.keys()}
         tmp = fp.with_suffix(".tmp")
         save_file(tensors, str(tmp), metadata=full)
-        os.replace(tmp, fp)
+        # Windows は mmap が生きている間は元ファイルを置き換えられない(WinError 5 / 32)。参照を手放して GC してから
         del tensors
+        gc.collect()
+        for attempt in range(6):
+            try:
+                os.replace(tmp, fp)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(1.0 + attempt)
         rewritten += 1
     if rewritten:
         logger.info("メタデータを %d シャードで統一(%d テンソル、%d ファイルを書き直し)", len(files), len(names), rewritten)

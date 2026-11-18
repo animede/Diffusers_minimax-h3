@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 12:34 JST** — `prepare_lowvram.py`: Windows で原本シャードの削除が `WinError 5` で落ちる問題を修正 / `--ref` で Ref2VA / Ref2I 用の transformer_ref キャッシュも作れるように。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 12:49 JST** — Windows / 低 VRAM 向けのクイックスタートを冒頭に追加 / `prepare_lowvram.py` の最終段(メタデータ統一)が Windows で落ちる問題を修正。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -12,6 +12,26 @@
 ![GUI メイン画面](docs/images/ui_main.png)
 
 *ブラウザから使う単一ページ UI。5 つのモードをタブで切替(動画: **T2VA**=テキスト / **FL2VA**=フレーム / **Ref2VA**=参照、静止画: **T2I** / **Ref2I**)。下段は生成物ギャラリーで、チェックした動画を連結して書き出せる。プロンプトはローカル LLM で H3 公式ガイドの形式へ強化でき、FirstBlockCache・Sage・Turbo・量子化・低 VRAM モードなどは**再起動なしで**このパネルから切替。日英切替あり。*
+
+## クイックスタート(Windows・VRAM 6〜16GB の PC)
+
+X などから来た方向けの最短手順。詳細は下の「[インストール](#インストール)」「[起動](#起動)」。
+
+```powershell
+winget install --id Git.Git -e --source winget
+winget install --id Python.Python.3.12 -e --source winget
+git clone https://github.com/animede/Diffusers_minimax-h3.git
+cd Diffusers_minimax-h3
+.\scripts\install.bat
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py
+.\run.bat
+```
+
+- winget のあとは PowerShell を一度開き直す。`install.bat` は venv を作って依存を入れる(数分)。
+- `prepare_lowvram.py` はモデルの準備。144GB を落とすのではなく、66GB の重みを 1 つずつ落として量子化しながら消すので、**ディスクは約 60GB**、RAM 16GB で足りる。所要時間はほぼ回線速度で決まる(数時間)。途中で止まっても再実行すれば続きから進む。Ref2VA / Ref2I(参照素材から動画)も使うなら `--ref` を付ける(+32GB)。
+- `run.bat` でサーバが起動し、ブラウザで `http://127.0.0.1:8611` を開く。初回起動は投影 TE の量子化キャッシュを作るので数分かかる。GPU の大きさに合わせた設定(低 VRAM モード、turbo 4 ステップ)は自動で入る。
+- 目安: 8GB 上限で 768²・5 秒の動画が約 3.5 分(A4000 で実測。4060 / 3060 はもう少し長い)、ピーク VRAM 約 4.2GB。6GB の GPU は 768² まで。
+- うまく行かないときは「[Windows](#windows)」節のトラブル対処と [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
 
 ## 特徴
 
@@ -138,7 +158,7 @@ py -3.12 -m venv venv
 
 `.\scripts\install.bat -LocalLLM` を後から実行しても同じ(既に入っている依存はそのまま)。詳細は下の「[内蔵 LLM(任意)](#内蔵-llm任意)」。
 
-> Windows 用の分岐は机上で用意したもので、**この動画サーバ自体の Windows 実機確認はまだ行っていません**(同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で確認済み)。問題があれば issue で報告してください。
+> Windows の実機状況(2026-11-18): 利用者の Windows 11 + RTX 4060 8GB / RAM 16GB で、インストール → `prepare_lowvram.py` → 起動まで確認済み。Windows 10 + RTX 3050 6GB は準備中(その過程で見つかった HF キャッシュの symlink、原本シャードの削除、実行ポリシー、文字コードの各問題は修正済み)。同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で生成まで確認済み。問題があれば [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
 
 ### SageAttention(任意、既定で有効。Linux のみ)
 
