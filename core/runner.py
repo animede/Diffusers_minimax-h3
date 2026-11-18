@@ -4795,7 +4795,12 @@ class MiniMaxH3Runner:
         # デコード時間の大半だった(RTX 4060 Laptop で実測)。空きは H3_VRAM_LIMIT_GB の上限も考慮する。
         if H3_VAE_DECODER_RESIDENT != "0":
             torch.cuda.empty_cache()
-            free_gib = torch.cuda.mem_get_info(DEVICE)[0] / 2**30
+            # 使える量 = ドライバが見る空き + torch が確保済みで未使用の分(reserved − allocated)。Windows は
+            # expandable_segments が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop: allocated 1.46 /
+            # reserved 3.33GB で、ドライバの空きは 3.8GB だった)。その分は新しい確保に使い回されるので数えてよい。
+            free_drv = torch.cuda.mem_get_info(DEVICE)[0] / 2**30
+            cached = max(0.0, (torch.cuda.memory_reserved(DEVICE) - torch.cuda.memory_allocated(DEVICE)) / 2**30)
+            free_gib = free_drv + cached
             if H3_VRAM_LIMIT_GB:
                 free_gib = min(free_gib, float(H3_VRAM_LIMIT_GB) * 1e9 / 2**30 - torch.cuda.memory_allocated(DEVICE) / 2**30)
             # 実測(A4000、8GB 上限、768²・5 秒): 常駐 4.5GiB + デコードの活性と出力で 1.34GiB(出力 1.0GiB 込み)。
@@ -4809,8 +4814,8 @@ class MiniMaxH3Runner:
                 self._vae_streamer = filestream.ResidentLoader(
                     blocks, DEVICE, names_root=vae, files=[self._vae_cache_file], label="vae.decoder")
                 self._vae_streamer_transient = True
-                logger.info("vae.decoder: resident on the GPU for this decode (free VRAM %.1f GiB, output ~%.1f GiB) %s",
-                            free_gib, out_gib, self._vae_streamer.describe())
+                logger.info("vae.decoder: resident on the GPU for this decode (usable VRAM %.1f GiB = driver free %.1f + torch "
+                            "cached %.1f, output ~%.1f GiB) %s", free_gib, free_drv, cached, out_gib, self._vae_streamer.describe())
                 return
             if k > 0:
                 resident = filestream.ResidentLoader(
@@ -4820,10 +4825,11 @@ class MiniMaxH3Runner:
                     label="vae.decoder[%d:]" % k, drop_units=H3_GROUP_STREAM_DROP_UNITS, ring=H3_GROUP_STREAM_RING)
                 self._vae_streamer = filestream.SplitDecoder(resident, streamer)
                 self._vae_streamer_transient = True
-                logger.info("vae.decoder: %d/%d blocks resident on the GPU, the rest streamed from file (free VRAM %.1f GiB, "
-                            "output ~%.1f GiB) %s", k, len(blocks), free_gib, out_gib, self._vae_streamer.describe())
+                logger.info("vae.decoder: %d/%d blocks resident on the GPU, the rest streamed from file (usable VRAM %.1f GiB = "
+                            "driver free %.1f + torch cached %.1f, output ~%.1f GiB) %s", k, len(blocks), free_gib, free_drv,
+                            cached, out_gib, self._vae_streamer.describe())
                 return
-            logger.info("vae.decoder: no room on the GPU for resident decoder blocks (free VRAM %.1f GiB, output ~%.1f GiB)",
+            logger.info("vae.decoder: no room on the GPU for resident decoder blocks (usable VRAM %.1f GiB, output ~%.1f GiB)",
                         free_gib, out_gib)
         if budget >= need:
             self._vae_streamer = _bs.BlockStreamer(

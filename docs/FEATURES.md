@@ -541,6 +541,9 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   33.8 秒・ピーク 6.22GB、全体 149 秒。6GB 上限で 15/36 常駐、デコード 51 秒・ピーク 4.21GB。いずれも出力ハッシュ一致。
   流す側が 0.75〜2.6GB に減るのでページキャッシュにも残りやすい(RAM 16GB の PC でデコードが 90〜300 秒と揺れていた原因は、
   4.5GB のデコーダがキャッシュに入ったり入らなかったりしていたこと)。
+- 置ける数の判定は「ドライバの空き + torch が確保済みで未使用の分(reserved − allocated)」で見る。Windows の torch は
+  `expandable_segments` が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop の実機: allocated 1.46 / reserved 3.33GB、
+  ドライバの空き 3.8GB → 当初 10/36 しか置けなかった)。その分は新しい確保に使い回されるので数えてよい。
 - 量子化キャッシュは `scripts/prepare_lowvram.py` で先に作る(bf16 シャードを 1 つずつ落として量子化して消す。RAM 16GB で可)。
   Ref2VA / Ref2I は `transformer` とは別の重み `transformer_ref/`(66GB、全シャードの内容が異なる)を使うので、
   `--ref` で `transformer_ref_int8` も作る(+32GB)。2026-11-18 まで ref2va の group 読み込みはキャッシュの有無を見る前に

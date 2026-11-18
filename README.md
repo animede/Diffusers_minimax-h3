@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 19:40 JST** — VAE デコーダを空き VRAM に入るぶんだけ GPU に置いてデコード(`H3_VAE_DECODER_RESIDENT`。8GB 級の模擬でデコード 86 → 34 秒、6GB 級で 51 秒) / Windows: RAM に収まる重みはページキャッシュに残す / 6GB・8GB 実機の生成時間は公平な測定まで非掲載に / ffmpeg 未導入時はトレースバックではなく 1 度だけ導入案内を出す / turbo LoRA をホスト RAM から流してピーク VRAM を 4.19GB → 2.82GB に(6GB のカードで Windows が共有メモリへ退避して極端に遅くなる問題の対策)/ Windows 10 + RTX 3050 6GB で生成を確認 / Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 20:10 JST** — VAE デコーダを空き VRAM に入るぶんだけ GPU に置いてデコード(`H3_VAE_DECODER_RESIDENT`。8GB 級の模擬でデコード 86 → 34 秒、6GB 級で 51 秒。Windows で torch が抱えたままの VRAM も数えるよう修正) / Windows: RAM に収まる重みはページキャッシュに残す / 6GB・8GB 実機の生成時間は公平な測定まで非掲載に / ffmpeg 未導入時はトレースバックではなく 1 度だけ導入案内を出す / turbo LoRA をホスト RAM から流してピーク VRAM を 4.19GB → 2.82GB に(6GB のカードで Windows が共有メモリへ退避して極端に遅くなる問題の対策)/ Windows 10 + RTX 3050 6GB で生成を確認 / Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。

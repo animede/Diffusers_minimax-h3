@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-18 19:40 JST** — VAE decoder kept on the GPU as far as VRAM allows during decode (`H3_VAE_DECODER_RESIDENT`; decode 86 to 34 s in the 8GB emulation, 51 s at 6GB) / Windows: weight sets that fit in RAM stay in the page cache / 6GB and 8GB real-machine times withheld until measured fairly / missing ffmpeg now gives a one-time install hint instead of tracebacks / turbo LoRA streamed from host RAM, peak VRAM 4.19GB to 2.82GB (fixes the crawl on 6GB cards when Windows spills to shared memory) / generation confirmed on Windows 10 + RTX 3050 6GB / Windows, low-VRAM quick start added at the top. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-18 20:10 JST** — VAE decoder kept on the GPU as far as VRAM allows during decode (`H3_VAE_DECODER_RESIDENT`; decode 86 to 34 s in the 8GB emulation, 51 s at 6GB; now also counts VRAM torch keeps reserved on Windows) / Windows: weight sets that fit in RAM stay in the page cache / 6GB and 8GB real-machine times withheld until measured fairly / missing ffmpeg now gives a one-time install hint instead of tracebacks / turbo LoRA streamed from host RAM, peak VRAM 4.19GB to 2.82GB (fixes the crawl on 6GB cards when Windows spills to shared memory) / generation confirmed on Windows 10 + RTX 3050 6GB / Windows, low-VRAM quick start added at the top. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
