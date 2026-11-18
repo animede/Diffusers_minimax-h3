@@ -119,6 +119,66 @@ def slot_names(unit: torch.nn.Module, prefix: str) -> list[str | None]:
     return names
 
 
+class ResidentLoader:
+    """`FileBlockStreamer` と同じ名前解決でファイルの重みを読み、**全単位を GPU に載せたまま**にする(フック無し)。
+    VAE デコーダ(4.5GB)のデコード中の置き場所として使う(2026-11-18): タイルごとに 36 ブロックを流す方式だと
+    768²・5 秒で約 150 回 × 4.5GB をホストから送り直すため、RAM 16GB の PC ではこの転送(ページキャッシュ → 受け皿 →
+    GPU)がデコード時間の大半を占めていた(RTX 4060 Laptop で 1 パス 0.77 秒のうち 0.68 秒が読み待ち)。VRAM に
+    収まるなら 1 回読んで置いたままにするほうが速く、出力は同じ。`release()` でプレースホルダに戻して GPU を空ける。"""
+
+    def __init__(self, units, device, *, names_root: torch.nn.Module, files: list[Path], label: str):
+        self.device = torch.device(device)
+        self.label = label
+        index = safetensors_index(files)
+        mod_names = {id(m): nm for nm, m in names_root.named_modules()}
+        self.slots: list[tuple] = []          # (owner, attr, placeholder)
+        reader = _Reader(sequential=False)
+        total = 0
+        t0 = time.time()
+        try:
+            for unit in units:
+                prefix = mod_names[id(unit)] + "."
+                plan, pos = [], 0
+                for (owner, attr, t), name in zip(collect_slots(unit), slot_names(unit, prefix)):
+                    ent = index.get(name) if name else None
+                    nb = t.numel() * t.element_size()
+                    if ent is not None and t.numel() == 0:
+                        region = FileRegion(ent[0], ent[1], ent[2], ent[3], ent[4])
+                    elif ent is None or ent[2] != nb or ent[3] != t.dtype:
+                        _set(owner, attr, t.to(self.device))
+                        continue
+                    else:
+                        region = FileRegion(ent[0], ent[1], nb, t.dtype, tuple(t.shape))
+                    plan.append(((owner, attr), region, pos))
+                    pos += (region.nbytes + _ALIGN - 1) // _ALIGN * _ALIGN
+                if not plan:
+                    continue
+                buf = torch.empty(max(pos, _ALIGN), dtype=torch.uint8)
+                reader.read_unit(buf, plan, drop=False)
+                for (owner, attr), r, p in plan:
+                    g = buf[p:p + r.nbytes].view(r.dtype).view(r.shape).to(self.device)
+                    self.slots.append((owner, attr, torch.empty(0, dtype=r.dtype)))
+                    _set(owner, attr, g)
+                    total += r.nbytes
+                del buf
+        finally:
+            reader.close()
+        self.total_gb = total / 2**30
+        logger.info("resident (%s): %d tensors (%.2f GiB) read from %d files to the GPU in %.1fs",
+                    label, len(self.slots), self.total_gb, len(files), time.time() - t0)
+
+    def release(self) -> float:
+        for owner, attr, placeholder in self.slots:
+            _set(owner, attr, placeholder)
+        self.slots = []
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        return self.total_gb
+
+    def describe(self) -> dict:
+        return {"host": "gpu-resident", "weights_gib": round(self.total_gb, 2)}
+
+
 def host_cache_budget_gb() -> float:
     """この後ページキャッシュに使える見込みのホスト RAM(GB)。MemAvailable と、cgroup の上限があれば
     「上限 − このプロセスの匿名メモリ」の小さい方(cgroup の使用量はキャッシュ込みなので使わない)。"""

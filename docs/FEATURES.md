@@ -532,6 +532,12 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   transformer)にだけ付け、収まるもの(VAE デコーダ 4.5GB、投影 TE 1.9GB)は通常のキャッシュ付きで開く。前者を全部に
   付けていたため、RTX 4060 Laptop / RAM 16GB でデコード中にタイルごとの再読込が毎回 NVMe から走っていた
   (デコード 124 秒、NVMe 約 1GB/s で張り付き)。判定は「重み + 1GiB + 予約 ≤ 使える RAM」、ログの `page cache kept / not kept`。
+- 同日: デコーダを **GPU に置き切る**経路(`H3_VAE_DECODER_RESIDENT`、既定 auto、`core/filestream.py` の `ResidentLoader`)。768²・5 秒の
+  デコードは 7 クリップ × 16 タイル ≒ 150 パスで、タイルごとに 36 ブロック 4.5GB をホストから送り直す方式は RAM 16GB の PC では
+  その転送(ページキャッシュ → 受け皿 → GPU)がデコード時間の大半だった(RTX 4060 Laptop: 1 パス 0.77 秒のうち 0.68 秒が読み待ち、
+  デコード約 90 秒)。空き VRAM が「4.5 + 0.5 + 出力 + 余裕 0.5GiB」以上なら 1 回読んで GPU に置いたままにする。A4000 の 8GB 上限で
+  強制して実測: デコード 86 → 34 秒、全体 201 → 152 秒、ピーク 7.03GB、出力ハッシュ一致。8GB のカードは表示用の分を引くと
+  768² では足りない(auto は取らない)。12GB 以上のカードに RAM 16GB の組み合わせで効く。
 - 量子化キャッシュは `scripts/prepare_lowvram.py` で先に作る(bf16 シャードを 1 つずつ落として量子化して消す。RAM 16GB で可)。
   Ref2VA / Ref2I は `transformer` とは別の重み `transformer_ref/`(66GB、全シャードの内容が異なる)を使うので、
   `--ref` で `transformer_ref_int8` も作る(+32GB)。2026-11-18 まで ref2va の group 読み込みはキャッシュの有無を見る前に

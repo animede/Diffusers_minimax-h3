@@ -581,6 +581,13 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   sets that fit (the 4.5 GB VAE decoder, the 1.9 GB projected TE) are opened with normal caching. Applying it to everything
   made every per-tile re-read of the decoder hit the NVMe on an RTX 4060 Laptop / 16 GB RAM machine (decode 124 s, NVMe
   pinned at about 1 GB/s). The rule is "weights + 1 GiB + reserve <= usable RAM"; the log says `page cache kept / not kept`.
+- Same day: a path that keeps the decoder **resident on the GPU** (`H3_VAE_DECODER_RESIDENT`, default auto, `ResidentLoader` in
+  `core/filestream.py`). A 768², 5 s decode is 7 clips x 16 tiles, about 150 passes, and re-sending the 36 blocks (4.5 GB) from the
+  host per tile made that transfer (page cache -> staging -> GPU) most of the decode time on 16 GB-RAM PCs (RTX 4060 Laptop: 0.68 s
+  of each 0.77 s pass waiting for reads, decode about 90 s). When free VRAM is at least 4.5 + 0.5 + output + 0.5 GiB headroom the
+  decoder is read once and kept. Forced on the A4000 under an 8 GB cap: decode 86 -> 34 s, total 201 -> 152 s, peak 7.03 GB,
+  identical output hash. 8 GB cards do not have the room at 768² once the desktop's share is subtracted (auto declines); it pays
+  off on 12 GB-and-up cards paired with 16 GB of RAM.
 - The quantized cache is built beforehand with `scripts/prepare_lowvram.py` (fetches the bf16 shards one at a time,
   quantizes and deletes them; fine with 16 GB RAM). Ref2VA / Ref2I use a different set of weights, `transformer_ref/`
   (66 GB, every shard differs from `transformer`), so `--ref` also builds `transformer_ref_int8` (+32 GB). Until

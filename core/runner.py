@@ -1594,6 +1594,12 @@ H3_GROUP_STREAM_REFINER = os.environ.get("H3_GROUP_STREAM_REFINER", "1").strip()
 # 流すとデコードはタイルごとに 36 ブロックを送り直すため遅くなる(512² 6 → 17 秒、768² 11 → 30 秒)。
 # H3_VAE_PINNED=1(VAE 全体のピン留め往復)とは併用せず、そちらが優先。
 H3_GROUP_STREAM_VAE = os.environ.get("H3_GROUP_STREAM_VAE", "auto").strip().lower()
+# file モードのデコードでデコーダ(4.5GiB)を GPU に置き切るか: auto(空き VRAM が足りれば)/ 1(常に)/ 0(しない)。
+# 余裕は H3_VAE_DECODER_RESIDENT_MARGIN_GB(既定 0.5GiB。Windows は表示用の分が別に要るので mem_get_info の空きから見る)
+H3_VAE_DECODER_RESIDENT = os.environ.get("H3_VAE_DECODER_RESIDENT", "auto").strip().lower()
+if H3_VAE_DECODER_RESIDENT not in ("auto", "1", "0"):
+    raise ValueError(f"H3_VAE_DECODER_RESIDENT must be 'auto', '1' or '0', got {H3_VAE_DECODER_RESIDENT!r}")
+H3_VAE_DECODER_RESIDENT_MARGIN_GB = float(os.environ.get("H3_VAE_DECODER_RESIDENT_MARGIN_GB", "0.5").strip() or "0.5")
 if H3_GROUP_STREAM_VAE not in ("auto", "1", "0"):
     raise ValueError(f"H3_GROUP_STREAM_VAE must be 'auto', '1' or '0', got {H3_GROUP_STREAM_VAE!r}")
 H3_GROUP_STREAM_VAE_FREE_GB = float(os.environ.get("H3_GROUP_STREAM_VAE_FREE_GB", "8").strip() or "8")
@@ -4784,6 +4790,25 @@ class MiniMaxH3Runner:
             out_gib = 2.0
         need = 4.5 + 2.0 + 2 * out_gib
         budget = filestream.host_cache_budget_gb()
+        # 2026-11-18: VRAM に収まるならデコーダ全体(4.5GiB)をデコードの間だけ GPU に置く(読みは 1 回、出力は同じ)。
+        # タイルごとに 36 ブロックを送り直す方式は 768²・5 秒で約 150 パスになり、RAM 16GB の PC ではホスト側の転送が
+        # デコード時間の大半だった(RTX 4060 Laptop で実測)。空きは H3_VRAM_LIMIT_GB の上限も考慮する。
+        if H3_VAE_DECODER_RESIDENT != "0":
+            torch.cuda.empty_cache()
+            free_gib = torch.cuda.mem_get_info(DEVICE)[0] / 2**30
+            if H3_VRAM_LIMIT_GB:
+                free_gib = min(free_gib, float(H3_VRAM_LIMIT_GB) * 1e9 / 2**30 - torch.cuda.memory_allocated(DEVICE) / 2**30)
+            # 実測(A4000、8GB 上限、768²・5 秒): 常駐 4.5GiB + デコードの活性と出力で 1.34GiB(出力 1.0GiB 込み)
+            need_vram = 4.5 + 0.5 + out_gib + H3_VAE_DECODER_RESIDENT_MARGIN_GB
+            if H3_VAE_DECODER_RESIDENT == "1" or free_gib >= need_vram:
+                self._vae_streamer = filestream.ResidentLoader(
+                    vae.decoder.transformer_blocks, DEVICE, names_root=vae, files=[self._vae_cache_file], label="vae.decoder")
+                self._vae_streamer_transient = True
+                logger.info("vae.decoder: resident on the GPU for this decode (free VRAM %.1f GiB >= %.1f needed, "
+                            "output ~%.1f GiB) %s", free_gib, need_vram, out_gib, self._vae_streamer.describe())
+                return
+            logger.info("vae.decoder: not enough free VRAM to keep the decoder resident (%.1f GiB < %.1f needed)",
+                        free_gib, need_vram)
         if budget >= need:
             self._vae_streamer = _bs.BlockStreamer(
                 vae.decoder.transformer_blocks, DEVICE, window=2, root=vae.decoder, pin=True,
@@ -4808,7 +4833,8 @@ class MiniMaxH3Runner:
         vae = self._pipe.vae
         if self._vae_file_mode() and device == CPU and getattr(self, "_vae_streamer_transient", False):
             # デコードの間だけピン留めしていた分を返す(次のデコードで空き RAM を見て決め直す)
-            logger.info("vae.decoder: transient pinned copy released (%.2f GiB)", self._vae_streamer.release())
+            logger.info("vae.decoder: transient copy released (%.2f GiB, %s)", self._vae_streamer.release(),
+                        self._vae_streamer.describe().get("host", "pinned"))
             self._vae_streamer = None
             self._vae_streamer_transient = False
         if getattr(self, "_vae_streamer", None) is None and not self._vae_file_mode():
