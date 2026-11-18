@@ -2,12 +2,12 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-18 12:49 JST** — Windows / low-VRAM quick start added at the top / fixed the final metadata step of `prepare_lowvram.py` failing on Windows. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-18 12:52 JST** — Video generation confirmed on Windows 11 + RTX 4060 8GB / 16GB RAM (user report) / Windows, low-VRAM quick start added at the top. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
 It is built on the diffusers Modular Pipeline (PR #14355, pinned to commit **f37ab93**).
-**Verified on a single 6GB card, on two 8GB cards and on a single real RTX 4060 Ti 16GB**, and a single 32GB card reaches realtime conversational generation (0.95x real time).
+**Verified on a single 6GB card, on two 8GB cards, on a single real RTX 4060 Ti 16GB and on Windows 11 + RTX 4060 8GB (16GB RAM)**, and a single 32GB card reaches realtime conversational generation (0.95x real time).
 
 ![Main GUI](docs/images/ui_main_en.png)
 
@@ -158,7 +158,7 @@ The built-in LLM (the fallback when the external LLM is unreachable) can be adde
 
 Running `.\scripts\install.bat -LocalLLM` later does the same (already-installed packages are left as they are). Details: [Built-in LLM (optional)](#built-in-llm-optional) below.
 
-> Windows status (2026-11-18): a user's Windows 11 + RTX 4060 8GB / 16GB RAM machine got through install, `prepare_lowvram.py` and startup. Windows 10 + RTX 3050 6GB is in progress (the Hub cache symlink, source-shard deletion, execution-policy and encoding problems found along the way are fixed). The image server built the same way, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server), generates fine on Windows 11 + RTX 3050. Please report problems in the [Issues](https://github.com/animede/Diffusers_minimax-h3/issues).
+> Windows status (2026-11-18): a user's Windows 11 + RTX 4060 8GB / 16GB RAM machine got through install, `prepare_lowvram.py`, startup and **video generation (30 steps, no turbo)**. Turbo is enabled automatically from the 2026-11-18 noon version on (`git pull` and restart). Windows 10 + RTX 3050 6GB is in progress (the Hub cache symlink, source-shard deletion, execution-policy and encoding problems found along the way are fixed). The image server built the same way, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server), generates fine on Windows 11 + RTX 3050. Please report problems in the [Issues](https://github.com/animede/Diffusers_minimax-h3/issues).
 
 ### SageAttention (optional, enabled by default; Linux only)
 

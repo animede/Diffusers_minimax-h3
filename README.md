@@ -2,12 +2,12 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 12:49 JST** — Windows / 低 VRAM 向けのクイックスタートを冒頭に追加 / `prepare_lowvram.py` の最終段(メタデータ統一)が Windows で落ちる問題を修正。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 12:52 JST** — Windows 11 + RTX 4060 8GB / RAM 16GB での動画生成を確認(利用者報告)/ Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
 基盤は diffusers の Modular Pipeline(PR #14355、コミット **f37ab93** にピン留め)。
-**6GB 単体・8GB×2・実 RTX 4060 Ti 16GB 単体で動くことを実測済み**で、32GB 単騎ならリアルタイム会話生成(実時間の 0.95 倍)まで到達している。
+**6GB 単体・8GB×2・実 RTX 4060 Ti 16GB 単体、Windows 11 + RTX 4060 8GB(RAM 16GB)で動くことを実測済み**で、32GB 単騎ならリアルタイム会話生成(実時間の 0.95 倍)まで到達している。
 
 ![GUI メイン画面](docs/images/ui_main.png)
 
@@ -158,7 +158,7 @@ py -3.12 -m venv venv
 
 `.\scripts\install.bat -LocalLLM` を後から実行しても同じ(既に入っている依存はそのまま)。詳細は下の「[内蔵 LLM(任意)](#内蔵-llm任意)」。
 
-> Windows の実機状況(2026-11-18): 利用者の Windows 11 + RTX 4060 8GB / RAM 16GB で、インストール → `prepare_lowvram.py` → 起動まで確認済み。Windows 10 + RTX 3050 6GB は準備中(その過程で見つかった HF キャッシュの symlink、原本シャードの削除、実行ポリシー、文字コードの各問題は修正済み)。同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で生成まで確認済み。問題があれば [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
+> Windows の実機状況(2026-11-18): 利用者の Windows 11 + RTX 4060 8GB / RAM 16GB で、インストール → `prepare_lowvram.py` → 起動 → **動画生成(30 ステップ、turbo なし)まで確認済み**。turbo は 11/18 12 時以降の版で自動 ON になる(`git pull` と再起動)。Windows 10 + RTX 3050 6GB は準備中(その過程で見つかった HF キャッシュの symlink、原本シャードの削除、実行ポリシー、文字コードの各問題は修正済み)。同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で生成まで確認済み。問題があれば [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
 
 ### SageAttention(任意、既定で有効。Linux のみ)
 
