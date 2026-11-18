@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 12:52 JST** — Windows 11 + RTX 4060 8GB / RAM 16GB での動画生成を確認(利用者報告)/ Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 13:05 JST** — Windows 11 + RTX 4060 8GB / RAM 16GB で動画生成(30 ステップ・turbo とも)を確認(利用者報告)/ Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -158,7 +158,7 @@ py -3.12 -m venv venv
 
 `.\scripts\install.bat -LocalLLM` を後から実行しても同じ(既に入っている依存はそのまま)。詳細は下の「[内蔵 LLM(任意)](#内蔵-llm任意)」。
 
-> Windows の実機状況(2026-11-18): 利用者の Windows 11 + RTX 4060 8GB / RAM 16GB で、インストール → `prepare_lowvram.py` → 起動 → **動画生成(30 ステップ、turbo なし)まで確認済み**。turbo は 11/18 12 時以降の版で自動 ON になる(`git pull` と再起動)。Windows 10 + RTX 3050 6GB は準備中(その過程で見つかった HF キャッシュの symlink、原本シャードの削除、実行ポリシー、文字コードの各問題は修正済み)。同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で生成まで確認済み。問題があれば [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
+> Windows の実機状況(2026-11-18): 利用者の Windows 11 + RTX 4060 8GB / RAM 16GB で、インストール → `prepare_lowvram.py` → 起動 → **動画生成まで確認済み(30 ステップと turbo 4 ステップの両方)**。生成中のタスクマネージャの表示は専用 GPU メモリ 6.3 / 8.0GB、共有 GPU メモリ 2.0GB(ノート PC の RTX 4060 Laptop)。専用側はサーバが報告するピーク(約 4.2GB)より大きく見えるが、これは torch が確保したまま使い回す領域とデスクトップの分を含むため。共有側はストリーミング用にピン留めしたホスト RAM(受け皿)で、Windows はこれを共有 GPU メモリとして数える。Windows 10 + RTX 3050 6GB は準備中(その過程で見つかった HF キャッシュの symlink、原本シャードの削除、実行ポリシー、文字コードの各問題は修正済み)。同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で生成まで確認済み。問題があれば [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
 
 ### SageAttention(任意、既定で有効。Linux のみ)
 
