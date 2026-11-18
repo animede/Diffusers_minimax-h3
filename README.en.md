@@ -157,6 +157,8 @@ scripts/install.sh --local-llm            # pre-fetch llama-server into tools/ll
 venv/bin/python scripts/fetch_llama_server.py --model   # also pre-fetch the GGUF, about 4.4GB (optional)
 ```
 
+On low-RAM PCs (16GB class) video generation and the built-in LLM compete for RAM, so llama-server is stopped 300 s after its last use (`H3_LLM_LOCAL_IDLE_S`) and, on hosts under 32GB RAM, also when a generation starts (`H3_LLM_LOCAL_STOP_ON_GENERATE=auto`). The next LLM enhancement restarts it in a few seconds.
+
 Both are optional and can be run later on an existing installation. On the first fallback `llama-server` is fetched into `tools/llama/` and the model into `models/llm/` automatically. The child process stops with the server, and if the server is killed hard it is taken down with it (Windows: Job Object with KILL_ON_JOB_CLOSE; Linux: `PR_SET_PDEATHSIG`), so it never lingers as an orphan (verified with SIGKILL on Linux; Windows untested). To use existing files set `H3_LLAMA_SERVER=<path to llama-server>` and `H3_LLM_LOCAL_GGUF=<path to the GGUF>` (a llama-server you started yourself that answers on `H3_LLM_LOCAL_PORT` is used as-is).
 
 
@@ -186,7 +188,7 @@ Windows:
 .\venv\Scripts\python.exe scripts\prepare_lowvram.py
 ```
 
-The time is dominated by downloading 66GB (quantization takes seconds to tens of seconds per shard). `--keep-source` keeps the bf16 shards (+66GB, faster rebuilds). The projected TE's NF4 cache is built by the server on first start (fine with 8GB VRAM / 16GB RAM).
+The time is dominated by downloading 66GB (quantization takes seconds to tens of seconds per shard). The cache is checked against the Hugging Face snapshot, but on a PC without the bf16 originals (where a rebuild is impossible anyway) the check is skipped and the cache is used as-is. Reruns are idempotent: an existing cache is only inspected, which takes seconds. `--keep-source` keeps the bf16 shards (+66GB, faster rebuilds). The projected TE's NF4 cache is built by the server on first start (fine with 8GB VRAM / 16GB RAM).
 
 ## Starting
 
@@ -364,6 +366,7 @@ Defaults shown. Most **can also be toggled from the UI**, so set them only to ch
 | `H3_TURBO_LORA` | `0` | lightx2v 4 / 8-step distilled LoRA (downloads about 780MB on first use). Works in `group` too (needs the in-house streamer `H3_GROUP_STREAM=own` and the flag at startup; not with `file` streaming on hosts under 48GB RAM) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | Download the bf16 weights (~66GB each) from HF only when `1` if they are not cached |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / none | External LLM for prompt enhancement and its API key (the key is also read from the git-ignored `config.local.env`) |
+| `H3_LLM_LOCAL_IDLE_S` / `H3_LLM_LOCAL_STOP_ON_GENERATE` | `300` / `auto` | Memory saving for the built-in LLM: stop llama-server 300 s after its last use (0 = never) / stop it when a generation starts (`auto` = only on hosts under 32GB RAM, `1` / `0` to force). It restarts automatically on the next LLM enhancement |
 | `H3_LLM_LOCAL` / `H3_LLM_LOCAL_GGUF` | `auto` / none | Built-in LLM (Gemma 4 E4B, CPU, a prebuilt `llama-server` child process). `auto` = only when the external LLM is unreachable / `1` = built-in only / `0` = never. The GGUF is downloaded to `models/llm/`; point `H3_LLM_LOCAL_GGUF` at an existing file instead. Also `H3_LLAMA_SERVER` (binary path), `H3_LLAMA_CPP_TAG` (llama.cpp tag to fetch), `H3_LLM_LOCAL_PORT` (default 64661) |
 
 ## Documentation

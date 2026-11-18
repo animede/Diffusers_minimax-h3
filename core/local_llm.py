@@ -48,6 +48,8 @@ TOOLS_DIR = ROOT / "tools" / "llama"
 LOGS_DIR = ROOT / "logs"
 DEFAULT_TAG = "b12475"          # 2026-11-17 に Gemma 4 E4B Q4_0 で動作確認(Linux x64 / Windows x64 の CPU 版)
 DEFAULT_PORT = 64661
+DEFAULT_IDLE_S = 300          # 最後の利用からこの秒数で llama-server を止める(0 = 止めない)
+STOP_ON_GENERATE_BELOW_GB = 32.0   # auto: ホスト RAM がこれ未満なら生成開始時に止める(16GB 機の RAM 争いを避ける)
 N_CTX = 16384
 HEALTH_TIMEOUT_S = 300          # 初回はモデルのページキャッシュが無く読み込みに時間がかかる
 
@@ -233,6 +235,35 @@ def _windows_job_object(proc: subprocess.Popen):
         return None
 
 
+def _host_ram_total_gb() -> float | None:
+    try:
+        import psutil
+
+        return psutil.virtual_memory().total / 1e9
+    except Exception:  # noqa: BLE001
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1e6
+        except OSError:
+            pass
+    return None
+
+
+def idle_seconds() -> int:
+    v = os.environ.get("H3_LLM_LOCAL_IDLE_S", "").strip()
+    return int(v) if v else DEFAULT_IDLE_S
+
+
+def stop_on_generate() -> bool:
+    """H3_LLM_LOCAL_STOP_ON_GENERATE: auto(既定。ホスト RAM 32GB 未満なら止める)/ 1 / 0。"""
+    v = (os.environ.get("H3_LLM_LOCAL_STOP_ON_GENERATE", "auto").strip().lower() or "auto")
+    if v in ("1", "0"):
+        return v == "1"
+    ram = _host_ram_total_gb()
+    return ram is not None and ram < STOP_ON_GENERATE_BELOW_GB
+
+
 def _health_ok(port: int, timeout: float = 2.0) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as resp:
@@ -250,6 +281,8 @@ class LocalLLM:
         self._lock = threading.Lock()
         self._unavailable_reason = ""
         self._external_on_port = False   # 自分で起動したのではなく、既にそのポートで動いていたものを使っている
+        self._last_used = 0.0
+        self._idle_thread: threading.Thread | None = None
         atexit.register(self.stop)
 
     def is_available(self) -> bool:
@@ -270,6 +303,7 @@ class LocalLLM:
     def ensure_running(self) -> str:
         """llama-server を(必要なら取得して)起動し、OpenAI 互換の base URL を返す。"""
         with self._lock:
+            self._last_used = time.time()
             port = _port()
             if self.running() and _health_ok(port):
                 return self.base_url()
@@ -299,10 +333,48 @@ class LocalLLM:
                                        f"(logs/llama-server.log 参照)")
                 if _health_ok(port):
                     logger.info("内蔵 LLM 起動完了(%.1fs、%s、port %d)", time.time() - t0, gguf.name, port)
+                    self._start_idle_watch()
                     return self.base_url()
                 time.sleep(0.5)
             self.stop()
             raise RuntimeError(f"llama-server が {HEALTH_TIMEOUT_S}s 以内に /health を返しませんでした")
+
+    def touch(self) -> None:
+        """chat の完了時刻を記録(アイドル判定用)。"""
+        self._last_used = time.time()
+
+    def _start_idle_watch(self) -> None:
+        if idle_seconds() <= 0 or (self._idle_thread is not None and self._idle_thread.is_alive()):
+            return
+
+        def _watch():
+            while True:
+                time.sleep(15)
+                proc = self._proc
+                if proc is None or proc.poll() is not None:
+                    return
+                idle = time.time() - self._last_used
+                if idle >= idle_seconds():
+                    with self._lock:
+                        if self._proc is proc and time.time() - self._last_used >= idle_seconds():
+                            logger.info("内蔵 LLM を停止(%.0f 秒未使用。次の LLM 強化で再起動する)", idle)
+                            self.stop()
+                            return
+
+        self._idle_thread = threading.Thread(target=_watch, name="local-llm-idle", daemon=True)
+        self._idle_thread.start()
+
+    def before_generation(self) -> None:
+        """動画生成の開始時に呼ぶ。ホスト RAM の少ない PC では、自分で起動した llama-server を止めて RAM を空ける
+        (次の LLM 強化で再起動する。既にそのポートで動いていた外部のサーバには触らない)。"""
+        if self._external_on_port or self._proc is None or self._proc.poll() is not None:
+            return
+        if not stop_on_generate():
+            return
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                logger.info("生成開始のため内蔵 LLM を停止(ホスト RAM を空ける。次の LLM 強化で再起動する)")
+                self.stop()
 
     def stop(self) -> None:
         proc, self._proc = self._proc, None
@@ -327,6 +399,8 @@ class LocalLLM:
             "reason": self._unavailable_reason or None,
             "running": self.running(),
             "port": _port(),
+            "idle_stop_s": idle_seconds(),
+            "stop_on_generate": stop_on_generate(),
             "model": MODEL_FILE,
             "model_downloaded": path.exists(),
             "model_path": str(path),

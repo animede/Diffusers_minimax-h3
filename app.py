@@ -26,6 +26,7 @@ import core.gallery as gallery
 # として読むために必要)。
 import core.runner as runner_mod
 import core.settings as settings
+from core.local_llm import local_llm
 from core.llm import (
     H3SkillNotFetchedError,
     InfeasibleInputError,
@@ -370,6 +371,8 @@ def _run_generation(
         raise HTTPException(400, "prompt is required")
 
     acquired = _generation_lock.acquire(blocking=False)
+    if acquired:
+        local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
     if not acquired:
         raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
@@ -561,6 +564,8 @@ def api_t2i_batch(
         height, width = RESOLUTION_PRESETS[resolution]
 
     acquired = _generation_lock.acquire(blocking=False)
+    if acquired:
+        local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
     if not acquired:
         raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
@@ -825,6 +830,8 @@ def api_ref2va(
 
         runner_mod._tl("api_refs_built")
         acquired = _generation_lock.acquire(blocking=False)
+        if acquired:
+            local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
         if not acquired:
             raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
@@ -971,6 +978,8 @@ def _run_ref_batch(
                 raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
 
         acquired = _generation_lock.acquire(blocking=False)
+        if acquired:
+            local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
         if not acquired:
             raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 

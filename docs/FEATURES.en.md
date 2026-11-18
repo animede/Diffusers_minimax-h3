@@ -210,7 +210,7 @@ only set these if you want to change them permanently):
 | `H3_VIDEO_VAE_FP16` | `0` | fp16-ify the video VAE (reduces decode peak; required at 16GB and below) |
 | `H3_LLM_URL` | `http://127.0.0.1:64660` | Local LLM used for prompt enhancement (optional feature) |
 | `H3_LLM_API_KEY` | none | API key for the LLM server (sent as `Authorization: Bearer`). If unset, read from the same-named line in the git-ignored `config.local.env` at the repo root |
-| `H3_LLM_LOCAL` / `H3_LLM_LOCAL_GGUF` | `auto` / none | Added 2026-11-17. Falls back to a built-in CPU LLM (Gemma 4 E4B, GGUF Q4_0) when the external LLM is unreachable; it is llama.cpp's prebuilt `llama-server` run as a child process (`core/local_llm.py` fetches and starts it, no compiler needed). `1` = built-in only, `0` = off |
+| `H3_LLM_LOCAL` / `H3_LLM_LOCAL_GGUF` | `auto` / none | Added 2026-11-17. Falls back to a built-in CPU LLM (Gemma 4 E4B, GGUF Q4_0) when the external LLM is unreachable; it is llama.cpp's prebuilt `llama-server` run as a child process (`core/local_llm.py` fetches and starts it, no compiler needed). `1` = built-in only, `0` = off. `H3_LLM_LOCAL_IDLE_S` (default 300) stops it when idle, `H3_LLM_LOCAL_STOP_ON_GENERATE` (auto = hosts under 32GB RAM) stops it when a generation starts |
 
 ### Oct 2026 update: realtime conversational generation on a single 24GB/32GB GPU
 

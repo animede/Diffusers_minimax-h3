@@ -110,6 +110,7 @@ def chat_completion(system_prompt: str, user_text: str, *, temperature: float = 
     except Exception as e:  # noqa: BLE001
         raise LLMConnectionError(f"内蔵 LLM(E4B)も使えません: {e}") from e
     out = _chat_completion_external(system_prompt, user_text, temperature=temperature, base_url=base_url, auth=False)
+    local_llm.touch()
     from core.local_llm import THOUGHT_RE
 
     _backend_state.backend = "local-e4b"

@@ -157,6 +157,8 @@ scripts/install.sh --local-llm            # llama-server を tools/llama/ へ先
 venv/bin/python scripts/fetch_llama_server.py --model   # GGUF(約 4.4GB)も先に取得(任意)
 ```
 
+RAM の少ない PC(16GB 級)では動画生成と内蔵 LLM が RAM を奪い合うため、llama-server は最後の利用から 300 秒(`H3_LLM_LOCAL_IDLE_S`)で止まり、ホスト RAM 32GB 未満の PC では生成の開始時にも止まる(`H3_LLM_LOCAL_STOP_ON_GENERATE=auto`)。次に LLM 強化を押せば数秒で再起動する。
+
 どちらも省略でき、後から実行しても同じ(インストール済みの環境に足せる)。初めてフォールバックしたときに `llama-server` は `tools/llama/` へ、モデルは `models/llm/` へ自動取得される。子プロセスはサーバ終了時に止まり、サーバが強制終了された場合も Windows は Job Object(KILL_ON_JOB_CLOSE)、Linux は `PR_SET_PDEATHSIG` で道連れにするので孤児にならない(Linux は SIGKILL で実測、Windows は未検証)。既にあるものを使うなら `H3_LLAMA_SERVER=<llama-server のパス>`、`H3_LLM_LOCAL_GGUF=<GGUF のパス>` で指定する(自分で起動した llama-server が `H3_LLM_LOCAL_PORT` で応答していればそれをそのまま使う)。
 
 
@@ -186,7 +188,7 @@ Windows:
 .\venv\Scripts\python.exe scripts\prepare_lowvram.py
 ```
 
-所要時間はほぼ 66GB のダウンロード時間(量子化はシャードあたり数秒〜数十秒)。`--keep-source` で bf16 シャードを残せる(+66GB、再構築が速い)。投影 TE の NF4 キャッシュは初回起動時にサーバが作る(VRAM 8GB・RAM 16GB で可)。
+所要時間はほぼ 66GB のダウンロード時間(量子化はシャードあたり数秒〜数十秒)。キャッシュは HF 側のスナップショットと照合されるが、bf16 の原本がローカルに無い PC では(作り直しができないので)照合を省略してそのまま使う。再実行は冪等で、既にあるキャッシュは検査だけして数秒で終わる。`--keep-source` で bf16 シャードを残せる(+66GB、再構築が速い)。投影 TE の NF4 キャッシュは初回起動時にサーバが作る(VRAM 8GB・RAM 16GB で可)。
 
 ## 起動
 
@@ -364,6 +366,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。ホスト RAM 48GB 未満の `file` ストリーミングとは併用不可) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得 |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使う外部 LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |
+| `H3_LLM_LOCAL_IDLE_S` / `H3_LLM_LOCAL_STOP_ON_GENERATE` | `300` / `auto` | 内蔵 LLM の省メモリ: 最後の利用から 300 秒で llama-server を止める(0 で止めない)/ 生成開始時に止める(`auto` = ホスト RAM 32GB 未満のときだけ、`1` / `0` で強制)。止まっても次の LLM 強化で自動再起動する |
 | `H3_LLM_LOCAL` / `H3_LLM_LOCAL_GGUF` | `auto` / なし | 内蔵 LLM(Gemma 4 E4B、CPU、ビルド済み `llama-server` を子プロセスで起動)。`auto` = 外部 LLM に接続できないときだけ使う / `1` = 内蔵のみ / `0` = 使わない。GGUF は `models/llm/` へ自動 DL、既にあるファイルは `H3_LLM_LOCAL_GGUF` で指定。`H3_LLAMA_SERVER`(バイナリのパス)、`H3_LLAMA_CPP_TAG`(取得する llama.cpp のタグ)、`H3_LLM_LOCAL_PORT`(既定 64661)も可 |
 
 ## ドキュメント

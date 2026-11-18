@@ -6602,6 +6602,15 @@ class MiniMaxH3Runner:
             name = "transformer_ref_int8" if is_ref else "transformer_int8"
         return H3_TRANSFORMER_PREQUANT_DIR / name
 
+    @staticmethod
+    def _bf16_shards_absent(config_path) -> bool:
+        """current の source_snapshot(transformer/config.json のパス、または None)に対応する bf16 シャードが
+        ローカルに無いか。無ければキャッシュの作り直しは不可能なので、照合を省略してキャッシュを使う。"""
+        if not config_path:
+            return True
+        d = Path(str(config_path)).parent
+        return not any(p.exists() and p.stat().st_size > 1 << 20 for p in d.glob("diffusion_pytorch_model*.safetensors"))
+
     def _transformer_prequant_metadata(self, pruned: bool = False) -> dict:
         """キャッシュ無効化用のメタデータ。保存時に `meta.json` として書き込み、
         ロード時にこれと一致するかを確認する。一致しなければキャッシュは無効
@@ -6682,9 +6691,13 @@ class MiniMaxH3Runner:
             # 2026-11-15: bf16 の原本を HF キャッシュから消した箱では source_snapshot だけが None になる。
             # 原本が無いのだから更新の検知もできず、作り直しもできない(ロードが失敗するだけ)ので、
             # それ以外が一致していればキャッシュを有効とみなす。
-            if (current_meta.get("source_snapshot") is None
-                    and {k: v for k, v in saved_meta.items() if k != "source_snapshot"}
-                    == {k: v for k, v in current_meta.items() if k != "source_snapshot"}):
+            # 2026-11-18: source_snapshot が None ではなく「別のスナップショットのパス」になる場合も同様に扱う。
+            # HF の main が進んで config.json だけ新しいスナップショットに取得されると(scripts/prepare_lowvram.py や
+            # HEAD 問い合わせで起きる)パスが変わるが、bf16 シャードがローカルに無ければ作り直せないので、
+            # シャードの有無を見て「無ければ照合を省略」する(低 RAM の PC で生成が止まるのを防ぐ)。
+            rest_equal = ({k: v for k, v in saved_meta.items() if k != "source_snapshot"}
+                          == {k: v for k, v in current_meta.items() if k != "source_snapshot"})
+            if rest_equal and self._bf16_shards_absent(current_meta.get("source_snapshot")):
                 logger.info("transformer 量子化済みキャッシュ: bf16 原本が無いので source_snapshot の照合を省略して使います: %s",
                             cache_dir)
             else:
