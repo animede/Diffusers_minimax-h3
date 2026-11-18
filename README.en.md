@@ -2,6 +2,8 @@
 
 [日本語](README.md) | **English**
 
+**Latest: 2026-11-18 12:08 JST** — turbo LoRA now works with `file` streaming (low-RAM hosts) / Windows first-download `WinError 1314` avoided. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
 It is built on the diffusers Modular Pipeline (PR #14355, pinned to commit **f37ab93**).

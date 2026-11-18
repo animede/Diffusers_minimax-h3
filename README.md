@@ -2,6 +2,8 @@
 
 **日本語** | [English](README.en.md)
 
+**最新版: 2026-11-18 12:08 JST** — file ストリーミング(低 RAM 機)でも turbo LoRA を使えるようにした / Windows の初回ダウンロードで落ちる `WinError 1314` を回避。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
 基盤は diffusers の Modular Pipeline(PR #14355、コミット **f37ab93** にピン留め)。
