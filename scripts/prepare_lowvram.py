@@ -10,6 +10,8 @@
   1. 本家 MiniMaxAI/MiniMax-H3 の小物(vae / audio_vae / scheduler / tokenizer / processor / 各 config)を HF キャッシュへ。
      32B の text_encoder(66.7GB)は落とさない(低 VRAM 級は投影 TE を使うため不要)。
   2. transformer の int8 量子化キャッシュ(models/prequant/transformer_int8)をシャード単位で構築。
+     `--ref` を付けると Ref2VA / Ref2I 用の transformer_ref(transformer とは別の重み、66GB)も同じ方式で
+     models/prequant/transformer_ref_int8 に作る(+32GB)。低 RAM の PC は、これが無いと参照モードを使えない。
      torchao の Int8WeightOnlyConfig(version=2) をサーバと同じ条件で掛け、サーバの save_pretrained と同じ
      safetensors 形式(torchao の flatten)で書くので、出来上がりはサーバが自分で作るものと同じ。
   3. video VAE デコーダの fp16 キャッシュ(models/prequant/vae_decoder_fp16)。
@@ -21,6 +23,7 @@
   venv/bin/python scripts/prepare_lowvram.py --keep-source   # bf16 シャードを消さずに残す(再構築が速い。+66GB)
   venv/bin/python scripts/prepare_lowvram.py --device cuda   # 量子化を GPU で(既定は cpu。結果は同じ)
   venv/bin/python scripts/prepare_lowvram.py --skip-vae --skip-te   # transformer だけ
+  venv/bin/python scripts/prepare_lowvram.py --ref           # Ref2VA / Ref2I 用の transformer_ref(別の 66GB)のキャッシュも作る(+32GB)
 """
 from __future__ import annotations
 
@@ -134,7 +137,9 @@ def finalize_metadata(cache_dir: Path) -> dict:
     return full
 
 
-def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | None, keep_source: bool) -> None:
+def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | None, keep_source: bool,
+                           subfolder: str = "transformer") -> None:
+    """`subfolder` は "transformer"(T2VA / FL2VA)か "transformer_ref"(Ref2VA / Ref2I、別の重み 66GB)。"""
     import torch
     from huggingface_hub import hf_hub_download, try_to_load_from_cache
     from safetensors import safe_open
@@ -149,10 +154,10 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
         if idx.get("metadata", {}).get("tensor_names") != full["tensor_names"]:
             idx["metadata"] = {**full, "total_size": idx["metadata"]["total_size"]}
             idx_path.write_text(json.dumps(idx, indent=2))
-        logger.info("transformer int8 キャッシュは既にあるのでスキップ(メタデータは確認済み): %s", out_dir)
+        logger.info("%s int8 キャッシュは既にあるのでスキップ(メタデータは確認済み): %s", subfolder, out_dir)
         return
-    cfg_path = Path(hf_hub_download(MODEL_ID, "transformer/config.json"))
-    index = json.loads(Path(hf_hub_download(MODEL_ID, "transformer/diffusion_pytorch_model.safetensors.index.json")).read_text())
+    cfg_path = Path(hf_hub_download(MODEL_ID, f"{subfolder}/config.json"))
+    index = json.loads(Path(hf_hub_download(MODEL_ID, f"{subfolder}/diffusion_pytorch_model.safetensors.index.json")).read_text())
     shards = sorted(set(index["weight_map"].values()))
     if only_shards:
         shards = [s for i, s in enumerate(shards, 1) if i in only_shards]
@@ -164,7 +169,7 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
     t_all = time.time()
     for n, shard in enumerate(shards, 1):
         t0 = time.time()
-        src = Path(hf_hub_download(MODEL_ID, f"transformer/{shard}"))
+        src = Path(hf_hub_download(MODEL_ID, f"{subfolder}/{shard}"))
         tensors, n_q = {}, 0
         with safe_open(str(src), framework="pt", device="cpu") as f:
             for key in f.keys():
@@ -182,7 +187,7 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
             total += v.numel() * v.element_size()
         del tensors, flat
         freed = 0.0 if keep_source else _release(src)
-        logger.info("[%d/%d] %s: %d 層を int8 化、%.1fs%s", n, len(shards), shard, n_q, time.time() - t0,
+        logger.info("[%d/%d] %s/%s: %d 層を int8 化、%.1fs%s", n, len(shards), subfolder, shard, n_q, time.time() - t0,
                     f"(原本 {freed:.1f}GB を削除)" if freed else "")
     # diffusers の save_pretrained は、全テンソルぶんの torchao メタデータ(+ tensor_names)を**全シャードの
     # ヘッダに同じ内容で**書く。ロード側はその前提で 1 つのメタデータから全体を復元するので、シャードごとの
@@ -199,6 +204,8 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
     cfg["_name_or_path"] = MODEL_ID
     cfg["quantization_config"] = QUANTIZATION_CONFIG
     (tmp / "config.json").write_text(json.dumps(cfg, indent=2, sort_keys=True))
+    # サーバは transformer_ref 側のキャッシュも transformer/config.json のスナップショットで識別する
+    # (core/runner.py の _transformer_prequant_metadata)。同じ値を書く
     cached = try_to_load_from_cache(MODEL_ID, "transformer/config.json")
     (tmp / "meta.json").write_text(json.dumps({
         "model_id": MODEL_ID,
@@ -211,7 +218,7 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
     if out_dir.exists():
         shutil.rmtree(out_dir)
     tmp.rename(out_dir)
-    logger.info("transformer int8 キャッシュ完成: %s(%d シャード、%.1fGB、%.0fs)", out_dir, len(shards), total / 1e9,
+    logger.info("%s int8 キャッシュ完成: %s(%d シャード、%.1fGB、%.0fs)", subfolder, out_dir, len(shards), total / 1e9,
                 time.time() - t_all)
 
 
@@ -270,6 +277,9 @@ def main() -> None:
     ap.add_argument("--keep-source", action="store_true", help="bf16 シャードを削除せず HF キャッシュに残す")
     ap.add_argument("--only-shards", default="", help="デバッグ用: 1,2 のように番号指定したシャードだけ処理")
     ap.add_argument("--out", default="", help="transformer int8 キャッシュの出力先(既定 models/prequant/transformer_int8)")
+    ap.add_argument("--ref", action="store_true",
+                    help="Ref2VA / Ref2I 用の transformer_ref(別の重み 66GB)の int8 キャッシュ(models/prequant/transformer_ref_int8、"
+                         "約 32GB)も作る。低 RAM の PC で参照モードを使うなら必要")
     ap.add_argument("--skip-small", action="store_true")
     ap.add_argument("--skip-transformer", action="store_true")
     ap.add_argument("--skip-vae", action="store_true")
@@ -290,6 +300,9 @@ def main() -> None:
         fetch_small()
     if not args.skip_transformer:
         build_transformer_int8(out, args.device, only, args.keep_source)
+    if args.ref:
+        build_transformer_int8(PREQUANT_DIR / "transformer_ref_int8", args.device, only, args.keep_source,
+                               subfolder="transformer_ref")
     if not args.skip_vae:
         build_vae_fp16(PREQUANT_DIR / "vae_decoder_fp16")
     if not args.skip_te:

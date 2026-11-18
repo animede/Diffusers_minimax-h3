@@ -192,7 +192,7 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃(成立条件は該当節参照) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外のGPUは `default`(SDPA)必須** |
-| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは LoRA 約 1.2GB が GPU 常駐: 8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
+| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは LoRA 約 1.2GB が GPU 常駐: 8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB、ref2va 768² 276 秒・4.13GB。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | transformer / transformer_ref の bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得する(既定は取得せず、エラーで案内する) |
 | `H3_PIKA_RENOISE` | `0` | Pika H3 Flex の turbo LoRA 用 renoise サンプラー(実験) |
 | `H3_BLOCK_COMPILE` | `0` | `1` で turbo LoRA 適用後に transformer_ref の 50 ブロックを torch.compile(attention 本体は graph break)。RTX PRO 6000・1024×768 で 1 step 約 -13%、初回のみ +5〜14s |
@@ -527,6 +527,11 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   `H3_GROUP_STREAM_RING`(受け皿の本数、既定 3)。`/api/status` の `group_stream_host` / `group_stream_file`。
 - Windows は `fadvise` が無いので捨てる制御は効かない(読み自体は `FILE_FLAG_SEQUENTIAL_SCAN` で動く。画像サーバの
   RTX 3050 / RAM 16GB 機で実証した方式)。
+- 量子化キャッシュは `scripts/prepare_lowvram.py` で先に作る(bf16 シャードを 1 つずつ落として量子化して消す。RAM 16GB で可)。
+  Ref2VA / Ref2I は `transformer` とは別の重み `transformer_ref/`(66GB、全シャードの内容が異なる)を使うので、
+  `--ref` で `transformer_ref_int8` も作る(+32GB)。2026-11-18 まで ref2va の group 読み込みはキャッシュの有無を見る前に
+  40GB の RAM ガードを通していたため、低 RAM 機では参照モードが必ず止まっていた。base 側と同じく「キャッシュがあって
+  file で流すならガード無し」にし、キャッシュが無いときは `--ref` の案内で止める。
 
 実測(48GB 機の GPU0、RAM の上限を cgroup で模擬し、量子化キャッシュのページキャッシュを捨ててから開始。この機の
 NVMe は直読み 3.3GB/s。出力はすべて pinned と MD5 一致):

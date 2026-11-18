@@ -5799,7 +5799,20 @@ class MiniMaxH3Runner:
         if self._transformer_ref_loaded:
             self._active_variant = "ref2va"
             return
-        self._check_group_offload_ram_guard()
+        # base 側(_ensure_transformer_group)と同じ: 量子化済みキャッシュを file で流すなら RAM ガードは不要。
+        # file 構成でキャッシュが無いときは、bf16(66GB)の取得 + RAM 上での量子化に落ちて確実に失敗するので、
+        # 作り方を示して先に止める(低 RAM の PC で Ref2VA / Ref2I を使うには prepare_lowvram.py --ref が要る)。
+        prequant_ready = H3_TRANSFORMER_PREQUANT and (self._transformer_prequant_dir(is_ref=True) / "config.json").exists()
+        if self._group_stream_host_hint() == "file" and not prequant_ready:
+            raise RuntimeError(
+                "Ref2VA / Ref2I needs the int8 cache of transformer_ref "
+                f"({self._transformer_prequant_dir(is_ref=True)}), which is missing. On this host (file streaming, "
+                "RAM below the pinned threshold) it cannot be quantized from bf16 at load time. Build it once with "
+                "`scripts/prepare_lowvram.py --ref` (downloads transformer_ref 66GB shard by shard, writes ~32GB), "
+                "then retry."
+            )
+        if not (prequant_ready and self._group_stream_host_hint() == "file"):
+            self._check_group_offload_ram_guard()
         if progress:
             progress.update(phase="loading_transformer", message="transformer_ref (group offload) をロード中...")
         t0 = time.time()

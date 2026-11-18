@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-18 12:08 JST** — turbo LoRA now works with `file` streaming (low-RAM hosts) / Windows first-download `WinError 1314` avoided. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-18 12:29 JST** — Ref2VA / Ref2I on low-RAM hosts: `prepare_lowvram.py --ref` now builds the transformer_ref cache too, and the startup RAM-guard stop is fixed. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -33,7 +33,7 @@ Measured for t2va 5 s at 768². The detailed rows (80GB / 18GB / 12GB tiers etc.
 | single 24 / 32GB | ck-w4a8 + AdaLN-pruned + pinned parking ([details](docs/FEATURES.en.md#oct-2026-update-realtime-conversational-generation-on-a-single-24gb32gb-gpu)) | 320×448, 141 frames in **5.57 s = 0.95x real time** (32GB) / 7.1 s (24GB) |
 | 32GB tier | `H3_LOWVRAM=group` | peak 28.7GB / about 280 s |
 | single 16GB (real 4060 Ti / A4000) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | 4060 Ti: peak 11.4GB (Aug 2026). A4000 (2026-11-17): 30 steps peak 8.0GB / 790 s, turbo 4 steps (`H3_TURBO_LORA=1`) peak 7.0GB / 151 s * |
-| single 6GB / 8GB | the row above + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 steps: 768² 4.62GB / 1024² 6.41GB (272 / 552 s on the 48GB box). Turbo 4 steps (A4000 under an 8GB cap, VAE decoder streamed): 768² 3.08GB / 209 s, 1024² 3.73GB / 376 s; fl2va 3.37GB / 225 s, ref2va 3.02GB / 299 s (all 768², 5 s). `file` streaming (host RAM under 48GB) + turbo under the same 8GB cap: 768² 4.19GB / 205 s, 1024² 4.85GB / 376 s |
+| single 6GB / 8GB | the row above + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 steps: 768² 4.62GB / 1024² 6.41GB (272 / 552 s on the 48GB box). Turbo 4 steps (A4000 under an 8GB cap, VAE decoder streamed): 768² 3.08GB / 209 s, 1024² 3.73GB / 376 s; fl2va 3.37GB / 225 s, ref2va 3.02GB / 299 s (all 768², 5 s). `file` streaming (host RAM under 48GB) + turbo under the same 8GB cap: 768² 4.19GB / 205 s, 1024² 4.85GB / 376 s, ref2va 768² 4.13GB / 276 s |
 | 8GB x 2 | single-16GB flags + `H3_TE_DEVICE=cuda:1` | peak 7.23GB * |
 
 \* Times depend heavily on PCIe bandwidth (low-VRAM setups are bound by the per-step weight transfer). On a 4060 Ti (Gen3 x4, sm_89, 30 steps) both the single 16GB and the 8GB x 2 setups took about 25 minutes for t2va 5 s; the same configuration takes 790 s on an A4000 (Gen4 x4) and 272 s on GPU0 of the 48GB box, so expect roughly 4-5 minutes on Gen4 x16. **Since the turbo LoRA (`H3_TURBO_LORA=1`, 4 steps) now works in group mode too, the transfer-bound "runs but slowly" caveat is largely gone**: even on the x4-connected A4000, t2va 5 s takes 151 s (16GB tier), and with the 8GB-tier flags (VAE decoder streamed) 209 s at 768² / 376 s at 1024² (the number of transfers scales with the step count). The 8GB-tier figures were measured on the A4000 under an 8GB allocator cap (`H3_VRAM_LIMIT_GB`); the denoise peak of 3.1-3.7GB also fits a 6GB card. Cards other than sm_120 also need `H3_ATTN_BACKEND=default` (the default sage build is sm_120-only; `H3_PROFILE=auto` sets it when unset). That crossing configurations changes the composition even at the same seed (a trajectory divergence, not degradation) is covered in the [performance overview](docs/FEATURES.en.md#performance-overview).
@@ -46,7 +46,7 @@ Measured for t2va 5 s at 768². The detailed rows (80GB / 18GB / 12GB tiers etc.
 |---|---|
 | GPU | Minimum: a **single 6GB card** (768²) / **single 8GB** (1024²) / **single 16GB** (all features). **48GB tier** recommended for comfortable use |
 | Host RAM | 64GB or more recommended (`H3_LOWVRAM=group` pins ~34GB of int8 weights, so 48GB+ free is needed). Below 48GB the weights are streamed from the quantized cache instead (`H3_GROUP_STREAM_HOST=file`; on a 32GB box 1K runs at the same speed, 512² about 2x slower) |
-| Disk | About 145GB (T2VA / FL2VA only) / about 207GB (if Ref2VA is also used) |
+| Disk | About 145GB (T2VA / FL2VA only) / about 207GB (if Ref2VA is also used). The low-VRAM / low-RAM preparation path (`scripts/prepare_lowvram.py`) keeps only the quantized caches, about 60GB (+32GB with `--ref` for Ref2VA) |
 | CUDA | 12.8 series (to match torch 2.9.0+cu128). If building SageAttention, `nvcc` must be the same series |
 | Python | 3.12 |
 | Other | `ffmpeg` (used for gallery concatenation and info retrieval; generation itself works without it) |
@@ -191,6 +191,18 @@ Windows:
 ```
 
 The time is dominated by downloading 66GB (quantization takes seconds to tens of seconds per shard). The cache is checked against the Hugging Face snapshot, but on a PC without the bf16 originals (where a rebuild is impossible anyway) the check is skipped and the cache is used as-is. Reruns are idempotent: an existing cache is only inspected, which takes seconds. `--keep-source` keeps the bf16 shards (+66GB, faster rebuilds). The projected TE's NF4 cache is built by the server on first start (fine with 8GB VRAM / 16GB RAM).
+
+**Add `--ref` if you also use Ref2VA / Ref2I.** The reference modes use a different set of weights, `transformer_ref/` (66GB; every shard differs from `transformer`), so its cache `models/prequant/transformer_ref_int8` (about 32GB) is built the same way. On a host with less than 48GB RAM the reference modes stop at startup without it (the error tells you how to build it). It can be added later (reruns are idempotent; an existing `transformer_int8` is only inspected, which takes seconds).
+
+```bash
+venv/bin/python scripts/prepare_lowvram.py --ref
+```
+
+Windows:
+
+```powershell
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py --ref
+```
 
 ## Starting
 

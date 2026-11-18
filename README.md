@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 12:08 JST** — file ストリーミング(低 RAM 機)でも turbo LoRA を使えるようにした / Windows の初回ダウンロードで落ちる `WinError 1314` を回避。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 12:29 JST** — 低 RAM 機の Ref2VA / Ref2I: `prepare_lowvram.py --ref` で transformer_ref のキャッシュも作れるようにし、起動時の RAM ガードで止まる不具合を修正。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -33,7 +33,7 @@ t2va 5 秒・768² の実測。詳細な行(80GB / 18GB / 12GB 級など)と測�
 | 24 / 32GB 単騎 | ck-w4a8 + AdaLN-pruned + pinned 退避の一式([詳細](docs/FEATURES.md#2026-10-更新-24gb32gb-単騎でリアルタイム会話生成)) | 320×448・141f が **5.57 秒 = 実時間の 0.95 倍**(32GB)/ 7.1 秒(24GB) |
 | 32GB 級 | `H3_LOWVRAM=group` | peak 28.7GB / 約 280 秒 |
 | 16GB 単体(実 4060 Ti / A4000) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | 4060 Ti: peak 11.4GB(2026-08)。A4000(2026-11-17): 30 ステップ peak 8.0GB / 790 秒、turbo 4 ステップ(`H3_TURBO_LORA=1`)peak 7.0GB / 151 秒 ※ |
-| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に 8GB の上限、VAE デコーダをストリーミング): 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒。fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒(いずれも 768²・5 秒)。ホスト RAM 48GB 未満の `file` ストリーミング + turbo(同じ 8GB 上限): 768² 4.19GB / 205 秒、1024² 4.85GB / 376 秒 |
+| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に 8GB の上限、VAE デコーダをストリーミング): 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒。fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒(いずれも 768²・5 秒)。ホスト RAM 48GB 未満の `file` ストリーミング + turbo(同じ 8GB 上限): 768² 4.19GB / 205 秒、1024² 4.85GB / 376 秒、ref2va 768² 4.13GB / 276 秒 |
 | 8GB×2 | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB ※ |
 
 ※ 時間は PCIe 帯域に強く依存する(低 VRAM 構成は毎ステップの重み転送が律速)。4060 Ti(Gen3 x4、sm_89、30 ステップ)では 16GB 単体・8GB×2 とも t2va 5 秒に約 25 分かかったが、同じ構成が A4000(Gen4 x4)では 790 秒、48GB 機の GPU0 では 272 秒で、Gen4 x16 なら 4〜5 分の見込み。**turbo LoRA(`H3_TURBO_LORA=1`、4 ステップ)が group でも使えるようになったため、転送律速の「動くが遅い」はほぼ解消できる**: x4 接続の A4000 でも t2va 5 秒が 151 秒(16GB 級)、8GB 級の指定(VAE デコーダのストリーミング込み)でも 768² 209 秒 / 1024² 376 秒で完走する(転送回数がステップ数に比例して減るため)。8GB 級の値は A4000 に 8GB の上限(`H3_VRAM_LIMIT_GB`)を切った模擬で、デノイズ中のピーク 3.1〜3.7GB は 6GB 級にも収まる。sm_120 以外のカードは `H3_ATTN_BACKEND=default` も必要(既定の sage は sm_120 専用ビルド。未指定なら `H3_PROFILE=auto` が自動で入れる)。構成をまたぐと同一 seed でも構図が変わる(劣化ではなく軌道の分岐)ことは [性能の概要](docs/FEATURES.md#性能の概要) に詳しい。
@@ -46,7 +46,7 @@ t2va 5 秒・768² の実測。詳細な行(80GB / 18GB / 12GB 級など)と測�
 |---|---|
 | GPU | 最小: **6GB 単体**(768²)/ **8GB 単体**(1024²)/ **16GB 単体**(全機能)。快適動作は **48GB 級**を推奨 |
 | ホスト RAM | 64GB 以上を推奨(`H3_LOWVRAM=group` は int8 重み ~34GB をピン留めするため 48GB 以上の空きが要る)。48GB 未満では量子化キャッシュから直接流す方式に自動で切り替わる(`H3_GROUP_STREAM_HOST=file`、32GB 機で 1K は同速・512² は約 2 倍) |
-| ディスク | 約 145GB(T2VA / FL2VA のみ)/ 約 207GB(Ref2VA も使う場合) |
+| ディスク | 約 145GB(T2VA / FL2VA のみ)/ 約 207GB(Ref2VA も使う場合)。低 VRAM / 低 RAM の準備経路(`scripts/prepare_lowvram.py`)は量子化キャッシュだけを置くので約 60GB(Ref2VA も使うなら `--ref` で +32GB) |
 | CUDA | 12.8 系(torch 2.9.0+cu128 に合わせる)。SageAttention をビルドするなら `nvcc` も同系統 |
 | Python | 3.12 |
 | その他 | `ffmpeg`(ギャラリーの連結・情報取得に使用。無くても生成自体は動く) |
@@ -191,6 +191,18 @@ Windows:
 ```
 
 所要時間はほぼ 66GB のダウンロード時間(量子化はシャードあたり数秒〜数十秒)。キャッシュは HF 側のスナップショットと照合されるが、bf16 の原本がローカルに無い PC では(作り直しができないので)照合を省略してそのまま使う。再実行は冪等で、既にあるキャッシュは検査だけして数秒で終わる。`--keep-source` で bf16 シャードを残せる(+66GB、再構築が速い)。投影 TE の NF4 キャッシュは初回起動時にサーバが作る(VRAM 8GB・RAM 16GB で可)。
+
+**Ref2VA / Ref2I も使うなら `--ref` を付ける。** 参照モードは `transformer` とは別の重み `transformer_ref/`(66GB、全シャードの内容が異なる)を使うので、そのキャッシュ `models/prequant/transformer_ref_int8`(約 32GB)も同じ方式で作る。ホスト RAM 48GB 未満の PC ではこれが無いと参照モードは起動時に止まる(作り方を案内するエラーになる)。後から足してもよい(再実行は冪等で、既にある `transformer_int8` は数秒の検査だけ)。
+
+```bash
+venv/bin/python scripts/prepare_lowvram.py --ref
+```
+
+Windows:
+
+```powershell
+.\venv\Scripts\python.exe scripts\prepare_lowvram.py --ref
+```
 
 ## 起動
 
