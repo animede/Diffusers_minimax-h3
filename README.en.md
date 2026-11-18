@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-18 13:12 JST** — Turbo 768², 5 s in 452 s on Windows 11 + RTX 4060 Laptop 8GB / 16GB RAM (user report) / Windows, low-VRAM quick start added at the top. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-18 13:18 JST** — Sample video generated on an RTX 4060 Laptop 8GB added / turbo 768², 5 s in 452 s (user report) / Windows, low-VRAM quick start added at the top. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -41,6 +41,12 @@ cd Diffusers_minimax-h3
 - **Five generation modes plus batches**: T2VA / FL2VA / Ref2VA (ordered references: up to 9 images, 3 videos and 3 audio clips; lip sync from an audio reference) / T2I / Ref2I. Still images and reference-conditioned videos batch up to 24 scenes. **The still-image modes (T2I / Ref2I) do not use the dedicated image model MiniMax-H3-Image: they generate a 22-frame ultra-short video with this video model (MiniMax-H3) and save the center frame as a PNG.** Slower than a dedicated image model, but the look matches exactly when the result is used as an FL2VA first frame or a Ref2VA reference. MiniMax-H3-Image lives in a separate repository, [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server).
 - **LLM prompt enhancement**: an external LLM (OpenAI-compatible API, `H3_LLM_URL`) rewrites the input into the format of the official `h3-prompt-writing` skill, with a verify + repair loop before generation. When the external LLM is unreachable it falls back automatically to a built-in CPU LLM (Gemma 4 E4B, GGUF Q4_0, about 4.4GB, downloaded on first use, thinking off), the same idea as ACE-Step-1.5-fast's easy-music; the built-in LLM is llama.cpp's prebuilt `llama-server` started as a child process, so no compiler is needed and it works as-is on Windows.
 - **Quality guarded**: diffusers upgrades and quantized caches are regression-checked by identical-seed MD5.
+
+## Sample
+
+[![t2va 768², 5 s, 4-step turbo, RTX 4060 Laptop 8GB](docs/samples/t2va_768_turbo4_rtx4060laptop.gif)](docs/samples/t2va_768_turbo4_rtx4060laptop.mp4)
+
+*t2va generated on a user's Windows 11 + RTX 4060 Laptop 8GB / 16GB RAM (768², 5 s, 4-step turbo, 452 s). The GIF is a downscaled, reduced-colour preview; click it for the original mp4 with audio (1MB).*
 
 ## Supported GPUs (at a glance)
 
@@ -438,7 +444,7 @@ minimax-h3/
 │   ├── settings.py, gallery.py
 ├── static/index.html      # single-page UI (ja / en)
 ├── scripts/               # install.sh / install.ps1 / install.bat, download, regression and probe scripts
-├── docs/                  # documentation (table above)
+├── docs/                  # documentation (table above); docs/samples/ holds the sample video
 ├── models/                # quantized caches etc. (git-ignored)
 ├── outputs/, logs/        # outputs and logs (git-ignored)
 └── venv/                  # dedicated venv (git-ignored)

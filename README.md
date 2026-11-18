@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 13:12 JST** — Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB で turbo 768²・5 秒が 452 秒(利用者報告)/ Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 13:18 JST** — RTX 4060 Laptop 8GB で生成したサンプル動画を追加 / turbo 768²・5 秒が 452 秒(利用者報告)/ Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -41,6 +41,12 @@ cd Diffusers_minimax-h3
 - **5 つの生成モードとバッチ**: T2VA / FL2VA / Ref2VA(画像最大 9・動画最大 3・音声最大 3 の順序付き参照、音声参照でリップシンク)/ T2I / Ref2I。静止画・参照付き動画は最大 24 場面のバッチ生成に対応。**静止画(T2I / Ref2I)は画像専用モデルの MiniMax-H3-Image ではなく、この動画モデル(MiniMax-H3)で 22 フレームの超短尺動画を生成して中央フレームを PNG にしたもの**。専用モデルより遅いが、FL2VA の先頭フレームや Ref2VA の参照に使うと画風が完全に一致する。MiniMax-H3-Image は別リポジトリ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) で扱う。
 - **LLM プロンプト強化**: 外部 LLM(OpenAI 互換 API、`H3_LLM_URL`)で入力を H3 公式スキル `h3-prompt-writing` の形式へ整形。生成前の検証 + 修復ループつき。外部 LLM に接続できないときは CPU 上の内蔵 LLM(Gemma 4 E4B、GGUF Q4_0、約 4.4GB、初回に自動 DL、thinking OFF)へ自動フォールバックする(ACE-Step-1.5-fast の easy-music と同じ考え方。実体は llama.cpp のビルド済み `llama-server` を子プロセスで起動するので、コンパイラ不要で Windows でもそのまま動く)。
 - **品質の担保**: diffusers の更新や量子化キャッシュの導入は、同一 seed の MD5 一致で回帰確認している。
+
+## サンプル
+
+[![t2va 768² 5 秒、turbo 4 ステップ、RTX 4060 Laptop 8GB](docs/samples/t2va_768_turbo4_rtx4060laptop.gif)](docs/samples/t2va_768_turbo4_rtx4060laptop.mp4)
+
+*利用者の Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB で生成した t2va(768²・5 秒・turbo 4 ステップ、452 秒)。GIF は縮小・減色したプレビューで、クリックすると音声つきの元の mp4(1MB)が開く。*
 
 ## 対応 GPU(早見表)
 
@@ -438,7 +444,7 @@ minimax-h3/
 │   ├── settings.py, gallery.py
 ├── static/index.html      # 単一ページ UI(日英)
 ├── scripts/               # install.sh / install.ps1 / install.bat、ダウンロード・回帰・各種プローブ
-├── docs/                  # ドキュメント(上の表)
+├── docs/                  # ドキュメント(上の表)。docs/samples/ にサンプル動画
 ├── models/                # 量子化済みキャッシュ等(.gitignore 対象)
 ├── outputs/, logs/        # 生成物・ログ(.gitignore 対象)
 └── venv/                  # 専用 venv(.gitignore 対象)
