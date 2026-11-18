@@ -6715,6 +6715,18 @@ class MiniMaxH3Runner:
                     pass
             # group モード (device=CPU) はホスト常駐のまま使う(from_pretrained は CPU に読む)
             tr = tr.to(DEVICE if device is None else device)
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                # scripts/prepare_lowvram.py の旧版(2026-11-18 以前)が書いたキャッシュ: シャードごとの部分メタデータ
+                # しか無く、他シャードの重みが初期化されない。ヘッダの書き直しだけで直る。
+                logger.error(
+                    "%s 量子化済みキャッシュ %s のメタデータが不完全です(旧版の prepare_lowvram.py で作成)。"
+                    "次を実行して修復してください(再量子化は不要、約 1 分): "
+                    "python scripts/prepare_lowvram.py --finalize-only %s", label, cache_dir, cache_dir,
+                )
+            else:
+                logger.exception("%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s", label, cache_dir)
+            return False
         except Exception:
             logger.exception(
                 "%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",

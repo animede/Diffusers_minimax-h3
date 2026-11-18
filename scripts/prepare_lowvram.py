@@ -105,14 +105,19 @@ def finalize_metadata(cache_dir: Path) -> dict:
     from safetensors.torch import save_file
 
     files = sorted(cache_dir.glob("*.safetensors"))
-    full, names = {}, []
+    full, names, seen = {}, [], set()
     for fp in files:
         with safe_open(str(fp), framework="pt", device="cpu") as f:
             m = dict(f.metadata() or {})
-        names += json.loads(m.pop("tensor_names", "[]"))
+        for name in json.loads(m.pop("tensor_names", "[]")):
+            if name not in seen:            # 統一済みのシャードは全名を持つので重複を除く(冪等にする)
+                seen.add(name)
+                names.append(name)
+        m.pop("format", None)
         full.update(m)
     full["tensor_names"] = json.dumps(names)
     full["format"] = "pt"   # safetensors.torch.save_file(..., metadata) が付ける既定と同じ
+    rewritten = 0
     for fp in files:
         with safe_open(str(fp), framework="pt", device="cpu") as f:
             if dict(f.metadata() or {}) == full:
@@ -122,7 +127,9 @@ def finalize_metadata(cache_dir: Path) -> dict:
         save_file(tensors, str(tmp), metadata=full)
         os.replace(tmp, fp)
         del tensors
-    logger.info("メタデータを %d シャードで統一(%d テンソル)", len(files), len(names))
+        rewritten += 1
+    if rewritten:
+        logger.info("メタデータを %d シャードで統一(%d テンソル、%d ファイルを書き直し)", len(files), len(names), rewritten)
     return full
 
 
@@ -134,7 +141,14 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
     from torchao.prototype.safetensors.safetensors_support import flatten_tensor_state_dict
 
     if (out_dir / "config.json").exists() and (out_dir / "meta.json").exists() and only_shards is None:
-        logger.info("transformer int8 キャッシュは既にあるのでスキップ: %s", out_dir)
+        # 既にある: 旧版(シャードごとの部分メタデータ)で作ったものなら、ヘッダだけ統合形式に直す(冪等、約 1 分)
+        full = finalize_metadata(out_dir)
+        idx_path = out_dir / "diffusion_pytorch_model.safetensors.index.json"
+        idx = json.loads(idx_path.read_text())
+        if idx.get("metadata", {}).get("tensor_names") != full["tensor_names"]:
+            idx["metadata"] = {**full, "total_size": idx["metadata"]["total_size"]}
+            idx_path.write_text(json.dumps(idx, indent=2))
+        logger.info("transformer int8 キャッシュは既にあるのでスキップ(メタデータは確認済み): %s", out_dir)
         return
     cfg_path = Path(hf_hub_download(MODEL_ID, "transformer/config.json"))
     index = json.loads(Path(hf_hub_download(MODEL_ID, "transformer/diffusion_pytorch_model.safetensors.index.json")).read_text())
