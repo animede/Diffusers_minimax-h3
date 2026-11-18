@@ -5,8 +5,8 @@
 #   .\scripts\install.bat -LocalLLM   # also fetch the prebuilt llama-server.exe for the built-in LLM
 #
 # - Needs Python 3.12 (py launcher) and git. No compiler. If missing:
-#     winget install --id Git.Git -e
-#     winget install --id Python.Python.3.12 -e
+#     winget install --id Git.Git -e --source winget
+#     winget install --id Python.Python.3.12 -e --source winget
 # - torch / torchvision / torchaudio come from the PyTorch cu128 index (PyPI's Windows torch is CPU-only).
 #   torchao uses PyPI's pure-Python wheel (0.17.0); the C++ extensions are not needed.
 # - SageAttention has no Windows build and is skipped; H3_PROFILE=auto sets H3_ATTN_BACKEND=default at startup.
@@ -17,7 +17,7 @@ $ErrorActionPreference = "Stop"
 Set-Location -Path (Join-Path $PSScriptRoot "..")
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    throw "git not found (needed to install diffusers pinned to a commit). Install it with: winget install --id Git.Git -e  (then reopen PowerShell)"
+    throw "git not found (needed to install diffusers pinned to a commit). Install it with: winget install --id Git.Git -e --source winget  (then reopen PowerShell)"
 }
 
 if (-not (Test-Path ".\venv\Scripts\python.exe")) {
@@ -29,7 +29,7 @@ if (-not (Test-Path ".\venv\Scripts\python.exe")) {
     }
     if (-not $created) {
         $ver = & python -c "import sys; print('%d.%d' % sys.version_info[:2])"
-        if ($ver -ne "3.12") { throw "Python 3.12 not found (found python $ver). Install it with: winget install --id Python.Python.3.12 -e  (then reopen PowerShell)" }
+        if ($ver -ne "3.12") { throw "Python 3.12 not found (found python $ver). Install it with: winget install --id Python.Python.3.12 -e --source winget  (then reopen PowerShell)" }
         & python -m venv venv
     }
 }

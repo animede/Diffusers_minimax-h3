@@ -99,9 +99,9 @@ All dependencies have Windows wheels (torch 2.9.0+cu128 from the PyTorch index, 
 Requirements: Python 3.12 (callable as `py -3.12`), git, an NVIDIA driver for CUDA 12.8. `ffmpeg` is optional (gallery concatenation). If git or Python is missing, install them with winget (then reopen PowerShell):
 
 ```powershell
-winget install --id Git.Git -e
-winget install --id Python.Python.3.12 -e
-winget install --id Gyan.FFmpeg -e
+winget install --id Git.Git -e --source winget
+winget install --id Python.Python.3.12 -e --source winget
+winget install --id Gyan.FFmpeg -e --source winget
 ```
 
 ```powershell

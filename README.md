@@ -99,9 +99,9 @@ venv/bin/pip install torchao==0.17.0
 必要なもの: Python 3.12(`py -3.12` で呼べること)、git、CUDA 12.8 系に対応した NVIDIA ドライバ。`ffmpeg` は任意(ギャラリーの連結用)。git や Python が無い場合は winget で入れる(入れたあと PowerShell を開き直す):
 
 ```powershell
-winget install --id Git.Git -e
-winget install --id Python.Python.3.12 -e
-winget install --id Gyan.FFmpeg -e
+winget install --id Git.Git -e --source winget
+winget install --id Python.Python.3.12 -e --source winget
+winget install --id Gyan.FFmpeg -e --source winget
 ```
 
 ```powershell
