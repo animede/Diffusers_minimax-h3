@@ -98,6 +98,34 @@ def quantize_linear_weight(w, device: str):
     return q
 
 
+def finalize_metadata(cache_dir: Path) -> dict:
+    """全シャードのヘッダを「全テンソルぶんのメタデータ + tensor_names」に揃える(diffusers の save_pretrained と同じ)。
+    各シャードは自分のテンソルだけを持ち、メタデータは全体で共通。統合したメタデータを返す。"""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    files = sorted(cache_dir.glob("*.safetensors"))
+    full, names = {}, []
+    for fp in files:
+        with safe_open(str(fp), framework="pt", device="cpu") as f:
+            m = dict(f.metadata() or {})
+        names += json.loads(m.pop("tensor_names", "[]"))
+        full.update(m)
+    full["tensor_names"] = json.dumps(names)
+    full["format"] = "pt"   # safetensors.torch.save_file(..., metadata) が付ける既定と同じ
+    for fp in files:
+        with safe_open(str(fp), framework="pt", device="cpu") as f:
+            if dict(f.metadata() or {}) == full:
+                continue
+            tensors = {k: f.get_tensor(k) for k in f.keys()}
+        tmp = fp.with_suffix(".tmp")
+        save_file(tensors, str(tmp), metadata=full)
+        os.replace(tmp, fp)
+        del tensors
+    logger.info("メタデータを %d シャードで統一(%d テンソル)", len(files), len(names))
+    return full
+
+
 def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | None, keep_source: bool) -> None:
     import torch
     from huggingface_hub import hf_hub_download, try_to_load_from_cache
@@ -141,8 +169,13 @@ def build_transformer_int8(out_dir: Path, device: str, only_shards: list[int] | 
         freed = 0.0 if keep_source else _release(src)
         logger.info("[%d/%d] %s: %d 層を int8 化、%.1fs%s", n, len(shards), shard, n_q, time.time() - t0,
                     f"(原本 {freed:.1f}GB を削除)" if freed else "")
+    # diffusers の save_pretrained は、全テンソルぶんの torchao メタデータ(+ tensor_names)を**全シャードの
+    # ヘッダに同じ内容で**書く。ロード側はその前提で 1 つのメタデータから全体を復元するので、シャードごとの
+    # 部分メタデータだと他シャードの重みが初期化されず「Cannot copy out of meta tensor」で落ちる(実測)。
+    # 各シャードを書き終えてから、全体のメタデータで全シャードのヘッダを書き直す。
+    full_meta = finalize_metadata(tmp)
     (tmp / "diffusion_pytorch_model.safetensors.index.json").write_text(
-        json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map}, indent=2))
+        json.dumps({"metadata": {**full_meta, "total_size": total}, "weight_map": weight_map}, indent=2))
     import diffusers
     import torchao
 
@@ -226,7 +259,16 @@ def main() -> None:
     ap.add_argument("--skip-transformer", action="store_true")
     ap.add_argument("--skip-vae", action="store_true")
     ap.add_argument("--skip-te", action="store_true")
+    ap.add_argument("--finalize-only", default="", help="内部用: 既に書いたキャッシュのメタデータ統一だけを行う")
     args = ap.parse_args()
+    if args.finalize_only:
+        d = Path(args.finalize_only)
+        full = finalize_metadata(d)
+        idx_path = d / "diffusion_pytorch_model.safetensors.index.json"
+        idx = json.loads(idx_path.read_text())
+        idx["metadata"] = {**full, "total_size": idx["metadata"]["total_size"]}
+        idx_path.write_text(json.dumps(idx, indent=2))
+        return
     only = [int(x) for x in args.only_shards.split(",") if x.strip()] or None
     out = Path(args.out) if args.out else PREQUANT_DIR / "transformer_int8"
     if not args.skip_small:
