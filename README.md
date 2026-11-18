@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 19:25 JST** — 空き VRAM が足りればデコードの間だけ VAE デコーダを GPU に置き切る(`H3_VAE_DECODER_RESIDENT`、デコード 86 → 34 秒) / Windows: RAM に収まる重みはページキャッシュに残す / 6GB・8GB 実機の生成時間は公平な測定まで非掲載に / ffmpeg 未導入時はトレースバックではなく 1 度だけ導入案内を出す / turbo LoRA をホスト RAM から流してピーク VRAM を 4.19GB → 2.82GB に(6GB のカードで Windows が共有メモリへ退避して極端に遅くなる問題の対策)/ Windows 10 + RTX 3050 6GB で生成を確認 / Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 19:40 JST** — VAE デコーダを空き VRAM に入るぶんだけ GPU に置いてデコード(`H3_VAE_DECODER_RESIDENT`。8GB 級の模擬でデコード 86 → 34 秒、6GB 級で 51 秒) / Windows: RAM に収まる重みはページキャッシュに残す / 6GB・8GB 実機の生成時間は公平な測定まで非掲載に / ffmpeg 未導入時はトレースバックではなく 1 度だけ導入案内を出す / turbo LoRA をホスト RAM から流してピーク VRAM を 4.19GB → 2.82GB に(6GB のカードで Windows が共有メモリへ退避して極端に遅くなる問題の対策)/ Windows 10 + RTX 3050 6GB で生成を確認 / Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -404,7 +404,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | ref2va の transformer_ref を AdaLN-pruned 版で読む(`H3_TRANSFORMER_QUANT=int8` 併用必須)と、その量子化方式 |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外の GPU は `default`(SDPA)必須** |
-| `H3_VAE_DECODER_RESIDENT` | `auto` | file ストリーミングのデコードで、空き VRAM が足りれば VAE デコーダ(4.5GB)をデコードの間だけ GPU に置き切る(読みは 1 回、出力は同じ。A4000 の 8GB 上限で 768² のデコードが 86 → 34 秒)。`1` で強制、`0` で無効。余裕は `H3_VAE_DECODER_RESIDENT_MARGIN_GB`(既定 0.5) |
+| `H3_VAE_DECODER_RESIDENT` | `auto` | file ストリーミングのデコードで、空き VRAM に入るぶんだけ VAE デコーダ(36 ブロック、4.5GB)をデコードの間 GPU に置き、残りをファイルから流す(置いた分だけ毎パスの転送が減る。出力は同じ)。A4000 の模擬: 8GB 上限で 30/36 ブロック常駐、768² のデコード 86 → 34 秒(ピーク 6.2GB)、6GB 上限で 15/36、デコード 51 秒(ピーク 4.2GB)。`1` で全部強制、`0` で無効。余裕は `H3_VAE_DECODER_RESIDENT_MARGIN_GB`(既定 1.0) |
 | `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。`file` ストリーミングでは LoRA 約 1.2GB をホスト RAM からブロックごとに流す。`H3_FILE_STREAM_HOST_MIN_MB`(既定 1)以上のファイルに無いテンソルが対象) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得 |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使う外部 LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |

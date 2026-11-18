@@ -179,6 +179,22 @@ class ResidentLoader:
         return {"host": "gpu-resident", "weights_gib": round(self.total_gb, 2)}
 
 
+class SplitDecoder:
+    """先頭の K ブロックを GPU に置き切り(ResidentLoader)、残りをファイルから流す(FileBlockStreamer)の組。
+    VRAM に全部は入らないカード(8GB に 768² など)向け: 置いた分だけ毎パスの転送が減り、流す側の重みも小さくなって
+    ページキャッシュに残りやすくなる(2026-11-18)。"""
+
+    def __init__(self, resident: "ResidentLoader", streamer: "FileBlockStreamer"):
+        self.resident, self.streamer = resident, streamer
+
+    def release(self) -> float:
+        return self.resident.release() + self.streamer.release()
+
+    def describe(self) -> dict:
+        return {"host": "gpu-resident+file", "resident_gib": round(self.resident.total_gb, 2),
+                "resident_tensors": len(self.resident.slots), "streamed": self.streamer.describe()}
+
+
 def host_cache_budget_gb() -> float:
     """この後ページキャッシュに使える見込みのホスト RAM(GB)。MemAvailable と、cgroup の上限があれば
     「上限 − このプロセスの匿名メモリ」の小さい方(cgroup の使用量はキャッシュ込みなので使わない)。"""

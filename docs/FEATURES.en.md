@@ -586,8 +586,11 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   host per tile made that transfer (page cache -> staging -> GPU) most of the decode time on 16 GB-RAM PCs (RTX 4060 Laptop: 0.68 s
   of each 0.77 s pass waiting for reads, decode about 90 s). When free VRAM is at least 4.5 + 0.5 + output + 0.5 GiB headroom the
   decoder is read once and kept. Forced on the A4000 under an 8 GB cap: decode 86 -> 34 s, total 201 -> 152 s, peak 7.03 GB,
-  identical output hash. 8 GB cards do not have the room at 768² once the desktop's share is subtracted (auto declines); it pays
-  off on 12 GB-and-up cards paired with 16 GB of RAM.
+  identical output hash. When the whole decoder does not fit, only as many blocks as fit are kept and the rest is streamed
+  (`SplitDecoder`; default headroom 1.0 GiB). A4000 emulation: 30/36 resident under an 8 GB cap, decode 33.8 s, peak 6.22 GB,
+  total 149 s; 15/36 under a 6 GB cap, decode 51 s, peak 4.21 GB. Identical output hashes in both. The streamed remainder shrinks
+  to 0.75-2.6 GB, so it also stays in the page cache (the 90-300 s decode swings on 16 GB-RAM PCs came from the 4.5 GB decoder
+  falling in and out of the cache).
 - The quantized cache is built beforehand with `scripts/prepare_lowvram.py` (fetches the bf16 shards one at a time,
   quantizes and deletes them; fine with 16 GB RAM). Ref2VA / Ref2I use a different set of weights, `transformer_ref/`
   (66 GB, every shard differs from `transformer`), so `--ref` also builds `transformer_ref_int8` (+32 GB). Until
