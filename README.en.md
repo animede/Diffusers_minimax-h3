@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-18 15:22 JST** — Turbo LoRA streamed from host RAM, peak VRAM 4.19GB to 2.82GB (fixes the crawl on 6GB cards when Windows spills to shared memory) / generation confirmed on Windows 10 + RTX 3050 6GB / Windows, low-VRAM quick start added at the top. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-18 15:52 JST** — Missing ffmpeg now gives a one-time install hint instead of tracebacks / turbo LoRA streamed from host RAM, peak VRAM 4.19GB to 2.82GB (fixes the crawl on 6GB cards when Windows spills to shared memory) / generation confirmed on Windows 10 + RTX 3050 6GB / Windows, low-VRAM quick start added at the top. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -20,6 +20,7 @@ The shortest path for people arriving from social media. Details are under [Inst
 ```powershell
 winget install --id Git.Git -e --source winget
 winget install --id Python.Python.3.12 -e --source winget
+winget install --id Gyan.FFmpeg -e --source winget
 git clone https://github.com/animede/Diffusers_minimax-h3.git
 cd Diffusers_minimax-h3
 .\scripts\install.bat
@@ -27,7 +28,7 @@ cd Diffusers_minimax-h3
 .\run.bat
 ```
 
-- Reopen PowerShell after the winget installs. `install.bat` creates the venv and installs the dependencies (a few minutes).
+- Reopen PowerShell after the winget installs. ffmpeg is used for the gallery's length / resolution display and for video concatenation (generation works without it; the log then shows a hint). `install.bat` creates the venv and installs the dependencies (a few minutes).
 - `prepare_lowvram.py` prepares the model. It does not fetch 144GB: it downloads the 66GB of weights one shard at a time, quantizes each and deletes it, so **about 60GB of disk** and 16GB of RAM are enough. The time is dominated by your connection (hours). If it stops, rerun it and it continues. Add `--ref` if you also want Ref2VA / Ref2I (video from reference material; +32GB).
 - `run.bat` starts the server; open `http://127.0.0.1:8611` in a browser. The first start takes a few minutes to build the projected text encoder's quantized cache. The settings for your GPU size (low-VRAM mode, 4-step turbo) are applied automatically.
 - Expect a 768², 5-second clip (4-step turbo) to take 452 s (about 7.5 minutes) on a laptop RTX 4060 8GB / 16GB RAM (low-clock GPU, NVMe about 500MB/s), or 205 s on an A4000 under an 8GB cap (NVMe 3.3GB/s), with a peak of about 2.8GB of VRAM (768²) or 3.5GB (1024²). A 16GB-RAM PC reads the 30GB of weights from the NVMe on every step, so SSD speed matters directly. 6GB cards (RTX 3050 etc.) run 768² too (about 2000 s on a real Windows 10 + RTX 3050 6GB / 16GB RAM machine).

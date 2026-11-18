@@ -21,6 +21,11 @@ try:
     print("sageattention: installed (H3_ATTN_BACKEND=sage, sm_120 only)")
 except ImportError:
     print("sageattention: not installed -> H3_ATTN_BACKEND=default (set automatically by H3_PROFILE=auto)")
+import shutil  # noqa: E402
+
+ff = shutil.which("ffmpeg") and shutil.which("ffprobe")
+print("ffmpeg / ffprobe:", "found" if ff else "NOT found -> gallery length / resolution and video concatenation need it (generation works without). "
+      "Windows: winget install --id Gyan.FFmpeg -e --source winget (then reopen PowerShell); Linux: sudo apt install ffmpeg")
 from core import local_llm  # noqa: E402
 
 exe = local_llm.find_binary()

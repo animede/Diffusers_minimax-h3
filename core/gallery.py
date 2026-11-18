@@ -51,8 +51,18 @@ def safe_output_path(output_dir: Path, name: str) -> Path:
     return candidate
 
 
+_FFMPEG_HINT = ("ffmpeg / ffprobe が見つかりません。ギャラリーの長さ・解像度の表示と動画の連結に必要です(生成自体は動く)。"
+                "Windows: winget install --id Gyan.FFmpeg -e --source winget のあと PowerShell を開き直す。"
+                "Linux: sudo apt install ffmpeg")
+_ffprobe_missing_warned = False
+
+
 def _run_ffprobe(path: Path) -> dict:
-    """ffprobe で duration/width/height/has_audio を取得する。失敗時は空 dict。"""
+    """ffprobe で duration/width/height/has_audio を取得する。失敗時は空 dict。
+    ffprobe が無い(Windows で ffmpeg 未導入)ときは、ファイルごとにトレースバックを出さず 1 度だけ案内する。"""
+    global _ffprobe_missing_warned
+    if _ffprobe_missing_warned:
+        return {}
     try:
         proc = subprocess.run(
             [
@@ -70,6 +80,10 @@ def _run_ffprobe(path: Path) -> dict:
             logger.warning("ffprobe failed for %s: %s", path, proc.stderr.strip()[:300])
             return {}
         data = json.loads(proc.stdout)
+    except FileNotFoundError:
+        _ffprobe_missing_warned = True
+        logger.warning("%s", _FFMPEG_HINT)
+        return {}
     except Exception:
         logger.exception("ffprobe error for %s", path)
         return {}
@@ -261,7 +275,10 @@ def concat_outputs(output_dir: Path, names: list[str]) -> dict:
                 "-c", "copy",
                 str(out_path),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            except FileNotFoundError:
+                raise GalleryError(_FFMPEG_HINT) from None
             if proc.returncode != 0:
                 # copy が失敗したら再エンコードにフォールバック(コンテナ非互換等の保険)
                 logger.warning("concat copy failed, falling back to re-encode: %s", proc.stderr[-2000:])
@@ -322,7 +339,10 @@ def concat_outputs(output_dir: Path, names: list[str]) -> dict:
             cmd += ["-c:a", "aac", "-b:a", "192k"]
         cmd += [str(out_path)]
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except FileNotFoundError:
+            raise GalleryError(_FFMPEG_HINT) from None
         if proc.returncode != 0:
             out_path.unlink(missing_ok=True)
             raise RuntimeError(f"ffmpeg concat (re-encode) failed: {proc.stderr[-3000:]}")
