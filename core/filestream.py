@@ -42,16 +42,23 @@ logger = logging.getLogger("minimax_h3.filestream")
 _ALIGN = 4096            # 受け皿内のテンソル境界(dtype の view が取れるように整列)
 _CHUNK = 32 << 20        # 並列読みの単位(1 スレッド逐次だと 1.6GB/s、8 スレッド × 32MB で NVMe の上限まで出る、実測)
 _READ_THREADS = 8
+# ファイルに無いテンソル(turbo LoRA の lora_a / lora_b など)のうち、このサイズ以上のものは GPU に常駐させず
+# ホスト RAM(ページャブル)に置いて単位ごとに受け皿へ memcpy して流す(2026-11-18)。turbo の LoRA は計 1.24GiB
+# あり、6GB のカードではこれが常駐すると Windows は共有メモリへ退避して極端に遅くなる(RTX 3050 6GB で実測)。
+# 小さいもの(norm など)は従来どおり GPU 常駐。0 で無効(全部 GPU 常駐)。
+_HOST_MIN_BYTES = int(float(os.environ.get("H3_FILE_STREAM_HOST_MIN_MB", "1").strip() or "1") * 2**20)
 _DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "U8": torch.uint8, "I8": torch.int8,
            "I32": torch.int32, "I64": torch.int64, "F8_E4M3": torch.float8_e4m3fn, "BOOL": torch.bool}
 
 
 class FileRegion:
-    """ファイル内の 1 テンソル分の領域と GPU 側の形。"""
-    __slots__ = ("path", "offset", "nbytes", "dtype", "shape")
+    """ファイル内の 1 テンソル分の領域と GPU 側の形。`host` が入っているときはファイルではなくホスト RAM 上の
+    テンソル(ファイルに無いもの)を受け皿へ写す。"""
+    __slots__ = ("path", "offset", "nbytes", "dtype", "shape", "host")
 
-    def __init__(self, path: Path, offset: int, nbytes: int, dtype: torch.dtype, shape: tuple[int, ...]):
-        self.path, self.offset, self.nbytes, self.dtype, self.shape = path, offset, nbytes, dtype, shape
+    def __init__(self, path: Path | None, offset: int, nbytes: int, dtype: torch.dtype, shape: tuple[int, ...],
+                 host: torch.Tensor | None = None):
+        self.path, self.offset, self.nbytes, self.dtype, self.shape, self.host = path, offset, nbytes, dtype, shape, host
 
 
 def safetensors_index(paths: list[Path]) -> dict[str, tuple[Path, int, int, torch.dtype | None, tuple]]:
@@ -212,12 +219,16 @@ class _Reader:
         """plan = [(slot, FileRegion, 受け皿内オフセット)] をまとめて並列に読む。drop なら読んだ範囲をキャッシュから捨てる。"""
         mv = memoryview(buf.numpy())
         futs = [self.pool.submit(self._read_chunk, r.path, mv[pos + c:pos + min(c + _CHUNK, r.nbytes)], r.offset + c)
-                for _, r, pos in plan for c in range(0, r.nbytes, _CHUNK)]
+                for _, r, pos in plan if r.host is None for c in range(0, r.nbytes, _CHUNK)]
+        for _, r, pos in plan:
+            if r.host is not None:      # ホスト RAM 上のテンソル: 受け皿へ memcpy(読みと並行)
+                buf[pos:pos + r.nbytes].copy_(r.host.view(-1).view(torch.uint8))
         for f in futs:
             f.result()
         if drop and hasattr(os, "posix_fadvise"):
             for _, r, _ in plan:
-                os.posix_fadvise(self._fd(r.path), r.offset, r.nbytes, os.POSIX_FADV_DONTNEED)
+                if r.host is None:
+                    os.posix_fadvise(self._fd(r.path), r.offset, r.nbytes, os.POSIX_FADV_DONTNEED)
 
     def close(self) -> None:
         self.pool.shutdown(wait=True)
@@ -245,6 +256,7 @@ class FileBlockStreamer:
         index = safetensors_index(files)
         mod_names = {id(m): nm for nm, m in names_root.named_modules()}
         self.plans, self.masters, resident_bytes, missing, total = [], [], 0, [], 0
+        staged_bytes, staged = 0, []
         for unit in self.units:
             prefix = mod_names[id(unit)] + "."
             plan, masters, pos = [], [], 0
@@ -255,11 +267,18 @@ class FileBlockStreamer:
                     # 既にプレースホルダ(vaecache.detach_blocks など): 形と dtype はファイルの方を信じる
                     region = FileRegion(ent[0], ent[1], ent[2], ent[3], ent[4])
                 elif ent is None or ent[2] != nb or ent[3] != t.dtype:
-                    _set(owner, attr, t.to(self.device))          # ファイルに無い(小さい)ものは GPU に常駐
-                    resident_bytes += nb
-                    if name:
-                        missing.append(name)
-                    continue
+                    if _HOST_MIN_BYTES and nb >= _HOST_MIN_BYTES and t.numel() > 0:
+                        # ファイルに無い大きめのもの(turbo LoRA): ホスト RAM に置いて単位ごとに流す
+                        region = FileRegion(None, 0, nb, t.dtype, tuple(t.shape),
+                                            host=t.detach().to("cpu").contiguous())
+                        staged_bytes += nb
+                        staged.append(name or attr)
+                    else:
+                        _set(owner, attr, t.to(self.device))      # ファイルに無い小さいものは GPU に常駐
+                        resident_bytes += nb
+                        if name:
+                            missing.append(name)
+                        continue
                 else:
                     region = FileRegion(ent[0], ent[1], nb, t.dtype, tuple(t.shape))
                 nb = region.nbytes
@@ -270,9 +289,13 @@ class FileBlockStreamer:
             self.plans.append(plan)
             self.masters.append(masters)
             total += pos
+        if staged:
+            logger.info("file streaming (%s): %d tensors not in the files are staged from host RAM per unit (%.2f GiB), "
+                        "e.g. %s", label, len(staged), staged_bytes / 2**30, staged[:2])
         if missing:
-            logger.warning("file streaming (%s): %d tensors not found in the files, kept on the GPU, e.g. %s",
-                           label, len(missing), missing[:3])
+            logger.warning("file streaming (%s): %d tensors not found in the files, kept on the GPU (%.2f GiB), e.g. %s",
+                           label, len(missing), resident_bytes / 2**30, missing[:3])
+        self.host_staged_gb = staged_bytes / 2**30
         self.unit_bytes = max((plan[-1][2] + plan[-1][1].nbytes if plan else 0) for plan in self.plans) if self.plans else 0
         self.unit_bytes = (self.unit_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
         self.total_gb = total / 2**30
@@ -402,4 +425,5 @@ class FileBlockStreamer:
 
     def describe(self) -> dict:
         return {"blocks": self.n, "host": "file", "weights_gib": round(self.total_gb, 2),
-                "staging_gib": round(self.ring * self.unit_bytes / 2**30, 2), "drop_units": self.n - self.drop_from}
+                "staging_gib": round(self.ring * self.unit_bytes / 2**30, 2), "drop_units": self.n - self.drop_from,
+                "host_staged_gib": round(self.host_staged_gb, 2)}

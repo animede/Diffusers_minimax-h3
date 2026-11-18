@@ -85,12 +85,12 @@ def tier_env(total_vram_gb: float, host_ram_gb: float | None, group_host: str = 
     env = dict(env)
     note = None
     if "H3_TURBO_LORA" in env:
-        # 2026-11-18: file ストリーミング(ホスト RAM 48GB 未満)でも turbo は使える(LoRA 約 1.2GB は GPU 常駐)。
+        # 2026-11-18: file ストリーミング(ホスト RAM 48GB 未満)でも turbo は使える(LoRA 約 1.2GB はホスト RAM から単位ごとに流す)。
         # 以前はここで外していたが、8GB 上限の模擬で問題なく通ることを確認したので入れたままにする。
         below = float(os.environ.get("H3_GROUP_STREAM_FILE_BELOW_GB", "").strip() or FILE_STREAM_BELOW_GB)
         uses_file = group_host == "file" or (group_host == "auto" and host_ram_gb is not None and host_ram_gb < below)
         if uses_file:
-            note = "重みはファイルから流す(file)構成。turbo LoRA(約 1.2GB)は GPU に常駐する"
+            note = "重みはファイルから流す(file)構成。turbo LoRA(約 1.2GB)はホスト RAM からブロックごとに流す"
     return name, env, note
 
 

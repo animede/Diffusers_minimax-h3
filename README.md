@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-18 13:18 JST** — RTX 4060 Laptop 8GB で生成したサンプル動画を追加 / turbo 768²・5 秒が 452 秒(利用者報告)/ Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-18 15:22 JST** — turbo LoRA をホスト RAM から流してピーク VRAM を 4.19GB → 2.82GB に(6GB のカードで Windows が共有メモリへ退避して極端に遅くなる問題の対策)/ Windows 10 + RTX 3050 6GB で生成を確認 / Windows・低 VRAM 向けクイックスタートを冒頭に追加。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -30,7 +30,7 @@ cd Diffusers_minimax-h3
 - winget のあとは PowerShell を一度開き直す。`install.bat` は venv を作って依存を入れる(数分)。
 - `prepare_lowvram.py` はモデルの準備。144GB を落とすのではなく、66GB の重みを 1 つずつ落として量子化しながら消すので、**ディスクは約 60GB**、RAM 16GB で足りる。所要時間はほぼ回線速度で決まる(数時間)。途中で止まっても再実行すれば続きから進む。Ref2VA / Ref2I(参照素材から動画)も使うなら `--ref` を付ける(+32GB)。
 - `run.bat` でサーバが起動し、ブラウザで `http://127.0.0.1:8611` を開く。初回起動は投影 TE の量子化キャッシュを作るので数分かかる。GPU の大きさに合わせた設定(低 VRAM モード、turbo 4 ステップ)は自動で入る。
-- 目安: 768²・5 秒の動画(turbo 4 ステップ)が、ノート PC の RTX 4060 8GB / RAM 16GB(低クロックの GPU、NVMe 約 500MB/s)で 452 秒(約 7.5 分)、A4000 の 8GB 上限(NVMe 3.3GB/s)で 205 秒。ピーク VRAM 約 4.2GB。RAM 16GB の PC は毎ステップ 30GB の重みを NVMe から読むので、SSD の速さがそのまま効く。6GB の GPU は 768² まで。
+- 目安: 768²・5 秒の動画(turbo 4 ステップ)が、ノート PC の RTX 4060 8GB / RAM 16GB(低クロックの GPU、NVMe 約 500MB/s)で 452 秒(約 7.5 分)、A4000 の 8GB 上限(NVMe 3.3GB/s)で 205 秒。ピーク VRAM 約 2.8GB(768²)・3.5GB(1024²)。RAM 16GB の PC は毎ステップ 30GB の重みを NVMe から読むので、SSD の速さがそのまま効く。6GB の GPU(RTX 3050 など)でも 768² が動く(Windows 10 + RTX 3050 6GB / RAM 16GB の実機で約 2000 秒)。
 - うまく行かないときは「[Windows](#windows)」節のトラブル対処と [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
 
 ## 特徴
@@ -59,7 +59,7 @@ t2va 5 秒・768² の実測。詳細な行(80GB / 18GB / 12GB 級など)と測�
 | 24 / 32GB 単騎 | ck-w4a8 + AdaLN-pruned + pinned 退避の一式([詳細](docs/FEATURES.md#2026-10-更新-24gb32gb-単騎でリアルタイム会話生成)) | 320×448・141f が **5.57 秒 = 実時間の 0.95 倍**(32GB)/ 7.1 秒(24GB) |
 | 32GB 級 | `H3_LOWVRAM=group` | peak 28.7GB / 約 280 秒 |
 | 16GB 単体(実 4060 Ti / A4000) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | 4060 Ti: peak 11.4GB(2026-08)。A4000(2026-11-17): 30 ステップ peak 8.0GB / 790 秒、turbo 4 ステップ(`H3_TURBO_LORA=1`)peak 7.0GB / 151 秒 ※ |
-| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に 8GB の上限、VAE デコーダをストリーミング): 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒。fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒(いずれも 768²・5 秒)。ホスト RAM 48GB 未満の `file` ストリーミング + turbo(同じ 8GB 上限): 768² 4.19GB / 205 秒、1024² 4.85GB / 376 秒、ref2va 768² 4.13GB / 276 秒。**実機: Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB で 768² 452 秒**(turbo 4 ステップ、file ストリーミング。ノート PC 向けの低クロックな GPU で、NVMe の実効読み出しが約 500MB/s と SATA SSD 並みの機体。※ 参照) |
+| 6GB / 8GB 単体 | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 30 ステップ: 768² 4.62GB / 1024² 6.41GB(48GB 機で 272 / 552 秒)。turbo 4 ステップ(A4000 に 8GB の上限、VAE デコーダをストリーミング): 768² 3.08GB / 209 秒、1024² 3.73GB / 376 秒。fl2va 3.37GB / 225 秒、ref2va 3.02GB / 299 秒(いずれも 768²・5 秒)。ホスト RAM 48GB 未満の `file` ストリーミング + turbo(A4000 に 6GB の上限、LoRA はホスト RAM から流す): 768² 2.82GB / 211 秒、1024² 3.48GB / 380 秒(ref2va は LoRA 常駐時の値で 768² 4.13GB / 276 秒)。**実機: Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB で 768² 452 秒**(turbo 4 ステップ、file ストリーミング。ノート PC 向けの低クロックな GPU で、NVMe の実効読み出しが約 500MB/s と SATA SSD 並みの機体。※ 参照) |
 | 8GB×2 | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB ※ |
 
 ※ 時間は PCIe 帯域に強く依存する(低 VRAM 構成は毎ステップの重み転送が律速)。4060 Ti(Gen3 x4、sm_89、30 ステップ)では 16GB 単体・8GB×2 とも t2va 5 秒に約 25 分かかったが、同じ構成が A4000(Gen4 x4)では 790 秒、48GB 機の GPU0 では 272 秒で、Gen4 x16 なら 4〜5 分の見込み。**turbo LoRA(`H3_TURBO_LORA=1`、4 ステップ)が group でも使えるようになったため、転送律速の「動くが遅い」はほぼ解消できる**: x4 接続の A4000 でも t2va 5 秒が 151 秒(16GB 級)、8GB 級の指定(VAE デコーダのストリーミング込み)でも 768² 209 秒 / 1024² 376 秒で完走する(転送回数がステップ数に比例して減るため)。8GB 級の値は A4000 に 8GB の上限(`H3_VRAM_LIMIT_GB`)を切った模擬で、デノイズ中のピーク 3.1〜3.7GB は 6GB 級にも収まる。sm_120 以外のカードは `H3_ATTN_BACKEND=default` も必要(既定の sage は sm_120 専用ビルド。未指定なら `H3_PROFILE=auto` が自動で入れる)。構成をまたぐと同一 seed でも構図が変わる(劣化ではなく軌道の分岐)ことは [性能の概要](docs/FEATURES.md#性能の概要) に詳しい。 RAM 16GB の PC(file ストリーミング)では毎ステップ約 30GB の重みを SSD から読むため、SSD の読み出し速度も効く(ノート PC の RTX 4060 8GB / RAM 16GB で turbo 768² が 452 秒。この機体は GPU が低クロックのラップトップ版で、NVMe の実効読み出しも約 500MB/s と SATA SSD 並み。A4000 + NVMe 3.3GB/s の 8GB 上限では 205 秒)。デスクトップの 4060 と速い NVMe なら、この中間に入る見込み。
@@ -164,7 +164,7 @@ py -3.12 -m venv venv
 
 `.\scripts\install.bat -LocalLLM` を後から実行しても同じ(既に入っている依存はそのまま)。詳細は下の「[内蔵 LLM(任意)](#内蔵-llm任意)」。
 
-> Windows の実機状況(2026-11-18): 利用者の Windows 11 + RTX 4060 8GB / RAM 16GB で、インストール → `prepare_lowvram.py` → 起動 → **動画生成まで確認済み(30 ステップと turbo 4 ステップの両方。turbo で 768²・5 秒が 452 秒。低クロックのラップトップ GPU + 約 500MB/s の NVMe)**。生成中のタスクマネージャの表示は専用 GPU メモリ 6.3 / 8.0GB、共有 GPU メモリ 2.0GB(ノート PC の RTX 4060 Laptop)。専用側はサーバが報告するピーク(約 4.2GB)より大きく見えるが、これは torch が確保したまま使い回す領域とデスクトップの分を含むため。共有側はストリーミング用にピン留めしたホスト RAM(受け皿)で、Windows はこれを共有 GPU メモリとして数える。Windows 10 + RTX 3050 6GB は準備中(その過程で見つかった HF キャッシュの symlink、原本シャードの削除、実行ポリシー、文字コードの各問題は修正済み)。同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で生成まで確認済み。問題があれば [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
+> Windows の実機状況(2026-11-18): 利用者の Windows 11 + RTX 4060 8GB / RAM 16GB で、インストール → `prepare_lowvram.py` → 起動 → **動画生成まで確認済み(30 ステップと turbo 4 ステップの両方。turbo で 768²・5 秒が 452 秒。低クロックのラップトップ GPU + 約 500MB/s の NVMe)**。生成中のタスクマネージャの表示は専用 GPU メモリ 6.3 / 8.0GB、共有 GPU メモリ 2.0GB(ノート PC の RTX 4060 Laptop)。専用側はサーバが報告するピーク(約 4.2GB)より大きく見えるが、これは torch が確保したまま使い回す領域とデスクトップの分を含むため。共有側はストリーミング用にピン留めしたホスト RAM(受け皿)で、Windows はこれを共有 GPU メモリとして数える。Windows 10 + RTX 3050 6GB / RAM 16GB でも turbo 768²・5 秒の生成を確認(約 2000 秒。その過程で見つかった HF キャッシュの symlink、原本シャードの削除、実行ポリシー、文字コードの各問題は修正済み)。この機では専用 GPU メモリ 5.8 / 6.0GB・共有 3.4GB と VRAM があふれ、Windows が共有メモリへ退避して極端に遅くなっていた(ハングもエラーも出ない)。turbo LoRA 約 1.2GB を GPU 常駐からホスト RAM 経由のストリーミングに変えてピークを 4.19GB → 2.82GB に下げたので(2026-11-18 15 時以降の版)、6GB でも収まる。同じ方式の画像サーバ [minimax-h3-image-server](https://github.com/animede/minimax-h3-image-server) は Windows 11 + RTX 3050 で生成まで確認済み。問題があれば [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
 
 ### SageAttention(任意、既定で有効。Linux のみ)
 
@@ -403,7 +403,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | ref2va の transformer_ref を AdaLN-pruned 版で読む(`H3_TRANSFORMER_QUANT=int8` 併用必須)と、その量子化方式 |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外の GPU は `default`(SDPA)必須** |
-| `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。`file` ストリーミングでは LoRA 約 1.2GB が GPU に常駐) |
+| `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。`file` ストリーミングでは LoRA 約 1.2GB をホスト RAM からブロックごとに流す。`H3_FILE_STREAM_HOST_MIN_MB`(既定 1)以上のファイルに無いテンソルが対象) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得 |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使う外部 LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |
 | `H3_LLM_LOCAL_IDLE_S` / `H3_LLM_LOCAL_STOP_ON_GENERATE` | `300` / `auto` | 内蔵 LLM の省メモリ: 最後の利用から 300 秒で llama-server を止める(0 で止めない)/ 生成開始時に止める(`auto` = ホスト RAM 32GB 未満のときだけ、`1` / `0` で強制)。止まっても次の LLM 強化で自動再起動する |
