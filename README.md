@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-19 18:23 JST** — Windows: VRAM の上限を自動で「カード容量 − 1.2GB」にして torch のプールが物理 VRAM を越えて退避するのを止める(RTX 3050 6GB で切り分け)/ ピン留め RAM からの転送を使わず常にファイルから流す / RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-19 18:33 JST** — Windows: VRAM の上限を自動で「カード容量 − 1.2GB」にして torch のプールが物理 VRAM を越えて退避するのを止める(RTX 3050 6GB で切り分け)/ ピン留め RAM からの転送を使わず常にファイルから流す / RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -405,7 +405,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | ref2va の transformer_ref を AdaLN-pruned 版で読む(`H3_TRANSFORMER_QUANT=int8` 併用必須)と、その量子化方式 |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外の GPU は `default`(SDPA)必須** |
-| `H3_VRAM_LIMIT_GB` | (なし) | このプロセスが確保できる VRAM の上限(GB)。**Windows では未指定なら自動で「カード容量 − 1.2GB」**(`H3_VRAM_AUTO_CAP_MARGIN_GB`)。Windows の torch はプールが膨らんだまま返せず、6GB のカードでは物理 VRAM を越えて退避し極端に遅くなるため、上限で膨らみを止める(上限に当たると未使用の区画を返して再利用する)。無効にするにはカード容量以上の値を指定 |
+| `H3_VRAM_LIMIT_GB` | (なし) | このプロセスが確保できる VRAM の上限(GB)。**Windows では未指定なら自動で「カード容量 − 1.2GB」**(`H3_VRAM_AUTO_CAP_MARGIN_GB`)。Windows の torch はプールが膨らんだまま返せず、6GB のカードでは物理 VRAM を越えて退避し極端に遅くなるため、上限で膨らみを止める(上限に当たると未使用の区画を返して再利用する)。6GB のカード(上限 4.8GB)でも 1024²・5 秒まで収まる(A4000 の模擬でピーク 3.5GB)。上限を越える要求は退避で延々と遅くなる代わりに OOM になる。無効にするにはカード容量以上の値(例 `99`)を指定 |
 | `H3_GPU_POOL_DEFRAG` | `auto` | デコードの直前に GPU に残っている実体(約 1.2GB)を CPU へ退避 → torch のプールを全部返す → 戻す(`auto` = Windows のみ。Windows の torch はプールが膨らんだまま返せず、6GB のカードでデコード中に退避して極端に遅くなるため)。`1` / `0` |
 | `H3_VAE_DECODER_RESIDENT` | `auto` | file ストリーミングのデコードで、空き VRAM に入るぶんだけ VAE デコーダ(36 ブロック、4.5GB)をデコードの間 GPU に置き、残りをファイルから流す(置いた分だけ毎パスの転送が減る。出力は同じ)。A4000 の模擬: 8GB 上限で 30/36 ブロック常駐、768² のデコード 86 → 34 秒(ピーク 6.2GB)、6GB 上限で 15/36、デコード 51 秒(ピーク 4.2GB)。`1` で全部強制、`0` で無効。余裕は `H3_VAE_DECODER_RESIDENT_MARGIN_GB`(既定 Linux 1.0、Windows 2.5。Windows の torch はプールが膨らむため) |
 | `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。`file` ストリーミングでは LoRA 約 1.2GB をホスト RAM からブロックごとに流す。`H3_FILE_STREAM_HOST_MIN_MB`(既定 1)以上のファイルに無いテンソルが対象) |
