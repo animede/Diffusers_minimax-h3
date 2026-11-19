@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-19 14:55 JST** — fixed the VAE decoder residency overshooting physical VRAM on 6GB Windows cards (decision now uses nvidia-smi's real usage) / real RTX 4060 Laptop 8GB figures added. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-19 15:48 JST** — fixed the VAE decoder residency overshooting physical VRAM on 6GB Windows cards (decision now uses nvidia-smi's real usage) / real RTX 4060 Laptop 8GB figures added. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -32,6 +32,7 @@ cd Diffusers_minimax-h3
 - `prepare_lowvram.py` prepares the model. It does not fetch 144GB: it downloads the 66GB of weights one shard at a time, quantizes each and deletes it, so **about 60GB of disk** and 16GB of RAM are enough. The time is dominated by your connection (hours). If it stops, rerun it and it continues. Add `--ref` if you also want Ref2VA / Ref2I (video from reference material; +32GB).
 - `run.bat` starts the server; open `http://127.0.0.1:8611` in a browser. The first start takes a few minutes to build the projected text encoder's quantized cache. The settings for your GPU size (low-VRAM mode, 4-step turbo) are applied automatically.
 - Expect a 768², 5-second clip (4-step turbo) to take 211 s on an A4000 under a 6GB cap (NVMe 3.3GB/s), with a peak of about 2.8GB of VRAM (768²) or 3.5GB (1024²). A 16GB-RAM PC reads the 30GB of weights from the NVMe on every step, so SSD speed matters directly. 6GB cards (RTX 3050 etc.) run 768² too. Real-machine figures (2026-11-19, real machine (Windows 11 gaming laptop, RTX 4060 Laptop 8GB / 16GB RAM, NVMe, 4-step turbo, 5 s): 512² 194 s (denoise 117 + decode 16), 768x512 279 s (191 + 65), 768² 412 s (313 + 85)). The RTX 3050 6GB is verified to work only; its times are not measured.
+- Low-VRAM speed is set by two numbers: host-to-GPU transfer speed and SSD read speed. If it feels slow, measure both with `.\venv\Scripts\python.exe scripts\check_bandwidth.py` (expect about 10GB/s pinned transfers on PCIe 4.0 x8, about 5GB/s on x4; under 1GB/s points at the link or BIOS settings).
 - If something fails, see the troubleshooting notes in the [Windows](#windows) section and the [Issues](https://github.com/animede/Diffusers_minimax-h3/issues).
 
 ## Highlights

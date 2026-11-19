@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-19 14:55 JST** — Windows の 6GB カードで VAE デコーダの常駐判定が物理 VRAM を越えて退避していた問題を修正(nvidia-smi の実使用量で判定)/ RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-19 15:48 JST** — Windows の 6GB カードで VAE デコーダの常駐判定が物理 VRAM を越えて退避していた問題を修正(nvidia-smi の実使用量で判定)/ RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -32,6 +32,7 @@ cd Diffusers_minimax-h3
 - `prepare_lowvram.py` はモデルの準備。144GB を落とすのではなく、66GB の重みを 1 つずつ落として量子化しながら消すので、**ディスクは約 60GB**、RAM 16GB で足りる。所要時間はほぼ回線速度で決まる(数時間)。途中で止まっても再実行すれば続きから進む。Ref2VA / Ref2I(参照素材から動画)も使うなら `--ref` を付ける(+32GB)。
 - `run.bat` でサーバが起動し、ブラウザで `http://127.0.0.1:8611` を開く。初回起動は投影 TE の量子化キャッシュを作るので数分かかる。GPU の大きさに合わせた設定(低 VRAM モード、turbo 4 ステップ)は自動で入る。
 - 目安: 768²・5 秒の動画(turbo 4 ステップ)が、A4000 に 6GB の上限を切った模擬(NVMe 3.3GB/s)で 211 秒、ピーク VRAM 約 2.8GB(768²)・3.5GB(1024²)。RAM 16GB の PC は毎ステップ 30GB の重みを NVMe から読むので、SSD の速さがそのまま効く。6GB の GPU(RTX 3050 など)でも 768² が動く。実機の値(2026-11-19、実機(Windows 11 のゲーミングノート、RTX 4060 Laptop 8GB / RAM 16GB、NVMe、turbo 4 ステップ・5 秒): 512² 194 秒(デノイズ 117 + デコード 16)、768×512 279 秒(191 + 65)、768² 412 秒(313 + 85))。RTX 3050 6GB は動作確認のみで時間は未計測。
+- 低 VRAM 構成の速さは「GPU への転送速度」と「SSD の読み出し速度」で決まる。遅いと感じたら `.\venv\Scripts\python.exe scripts\check_bandwidth.py` で両方を測れる(目安: PCIe 4.0 x8 でピン留め転送 10GB/s 前後、x4 で 5GB/s 前後。1GB/s を切っていればリンクや BIOS 設定の問題)。
 - うまく行かないときは「[Windows](#windows)」節のトラブル対処と [Issues](https://github.com/animede/Diffusers_minimax-h3/issues) へ。
 
 ## 特徴
