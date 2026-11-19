@@ -591,6 +591,12 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   total 149 s; 15/36 under a 6 GB cap, decode 51 s, peak 4.21 GB. Identical output hashes in both. The streamed remainder shrinks
   to 0.75-2.6 GB, so it also stays in the page cache (the 90-300 s decode swings on 16 GB-RAM PCs came from the 4.5 GB decoder
   falling in and out of the cache).
+- 2026-11-19, tried and rejected: 512 px VAE tiles instead of 256 px to cut the pass count to a quarter (on 8 GB laptops the
+  decode is GPU-compute-bound and this was the only remaining lever). Under an 8 GB cap on the A4000 the 768² decode drops from
+  86 to 38 s, but **the whole frame gets a grid-like artifact** (PSNR 22 dB, SSIM 0.60 against the 256 px output; everywhere, not
+  just at seams). The decoder's transformer blocks appear to be trained for 256 px tiles, so the tile size cannot be changed. Not
+  added to the code. On the RTX 4060 Laptop (26/36 resident, zero read wait) the 85.7 s decode, about 0.57 s x 150 passes, is
+  the floor for that GPU.
 - The block count is decided from "driver free + torch's reserved-but-unused memory". Windows torch has no
   `expandable_segments`, so a few GB stay reserved after the denoise (real RTX 4060 Laptop: allocated 1.46 / reserved 3.33 GB,
   driver free 3.8 GB, so only 10/36 blocks fit at first); that memory is reused by new allocations and may be counted.
