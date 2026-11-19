@@ -522,7 +522,10 @@ torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale
 のを防ぐ(捨てる数は auto: 「原本 + この後ピン留めする TE / VAE の分 − 使える RAM(cgroup の上限も見る)」)。
 file のときは VAE デコーダの流し元もピン留めしない(fp16 の写しをそのまま使う)。重みは同じ int8 なので出力は同じ。
 
-- `H3_GROUP_STREAM_HOST`: `auto`(既定。搭載 RAM が `H3_GROUP_STREAM_FILE_BELOW_GB` = 48GB 未満なら file)/ `pinned` / `file`。
+- `H3_GROUP_STREAM_HOST`: `auto`(既定。搭載 RAM が `H3_GROUP_STREAM_FILE_BELOW_GB` = 48GB 未満なら file。**Windows は RAM に関係なく常に file**:
+  2026-11-19、WDDM では数 GB のページロック領域の転送が病的に遅く、RTX 3050 6GB / RAM 32GB でデコーダ 4.5GB をピン留めして流すと
+  0.5GB/s 相当・512² のデコード 590 秒、受け皿 0.4GB でファイルから流すと 1 パス 0.96 秒・53 秒だった。VAE デコーダの
+  ピン留め経路も Windows では使わない)/ `pinned` / `file`。
   bf16 原本から量子化した(キャッシュが無い)ときは pinned に落ちる。`H3_GROUP_STREAM_DROP_UNITS`(auto / 数)、
   `H3_GROUP_STREAM_RING`(受け皿の本数、既定 3)。`H3_FILE_STREAM_HOST_MIN_MB`(既定 1): ファイルに無いテンソル(turbo LoRA の
   lora_a / lora_b、計 1.24GiB)のうちこのサイズ以上のものは GPU に常駐させず、ホスト RAM(ページャブル)に置いて単位ごとに

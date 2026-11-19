@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-19 16:49 JST** — fixed VAE decoder residency overshooting on 6GB Windows cards (accounts for torch's pool growth; traced on an RTX 3050 6GB) / real RTX 4060 Laptop 8GB figures added. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-19 17:22 JST** — Windows now always streams from file instead of pinned RAM (WDDM moves pinned RAM pathologically slowly; RTX 3050 6GB / 32GB RAM decode 587 s expected to drop to the 50 s range) / 6GB-card residency fixes / real RTX 4060 Laptop 8GB figures added. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -399,7 +399,7 @@ Defaults shown. Most **can also be toggled from the UI**, so set them only to ch
 | `H3_TE_PROJ_QUANT` | `bnb-4bit` | Quantization of the projected TE (NF4 = 3.11GB; `none` = bf16 8.88GB / `bnb-8bit`) |
 | `H3_TE_DEVICE` | (off) | Park the TE on a second GPU (e.g. `cuda:1`; the 32B TE needs a 20GB-class card, the projected TE fits an 8GB-class one) |
 | `H3_TE_STREAM` / `H3_TE_DIET` | `0` / `0` | Streaming and diet of the projected TE / token_refiner (the key to the 6GB / 8GB setups) |
-| `H3_GROUP_STREAM` / `H3_GROUP_STREAM_HOST` | `own` / `auto` | Weight transfer scheme in group mode. `HOST` streams straight from the quantized cache files (`file`) when the host has less than 48GB of RAM |
+| `H3_GROUP_STREAM` / `H3_GROUP_STREAM_HOST` | `own` / `auto` | Weight transfer scheme in group mode. `HOST` streams straight from the quantized cache files (`file`) when the host has less than 48GB of RAM; on Windows always `file` regardless of RAM (WDDM moves pinned RAM pathologically slowly) |
 | `H3_VIDEO_VAE_FP16` | `0` | fp16-ify the video VAE (reduces the decode peak; required at 16GB and below) |
 | `H3_KEEP_TRANSFORMER` | `0` | Keep the transformer resident, removing the reload fixed cost |
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | Load the AdaLN-pruned transformer_ref for ref2va (requires `H3_TRANSFORMER_QUANT=int8`) and its quantization scheme |

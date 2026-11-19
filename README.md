@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-19 16:49 JST** — Windows の 6GB カードで VAE デコーダを載せすぎて退避していた問題を修正(torch のプールの膨らみを見込む。RTX 3050 6GB で切り分け)/ RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-19 17:22 JST** — Windows ではピン留め RAM からの転送(WDDM で極端に遅い)を使わず常にファイルから流す(RTX 3050 6GB / RAM 32GB でデコード 587 秒 → 50 秒台の見込み)/ 6GB カードの常駐判定の修正 / RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -399,7 +399,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_TE_PROJ_QUANT` | `bnb-4bit` | 投影 TE の量子化(NF4 で 3.11GB。`none` = bf16 8.88GB / `bnb-8bit`) |
 | `H3_TE_DEVICE` | (無効) | TE を 2 枚目 GPU へ常駐(例 `cuda:1`。32B TE は 20GB 級、投影 TE なら 8GB 級) |
 | `H3_TE_STREAM` / `H3_TE_DIET` | `0` / `0` | 投影 TE・token_refiner のストリーミングと削減(6GB / 8GB 構成の鍵) |
-| `H3_GROUP_STREAM` / `H3_GROUP_STREAM_HOST` | `own` / `auto` | group モードの重み転送方式。`HOST` は搭載 RAM 48GB 未満なら量子化キャッシュのファイルから直接流す(`file`) |
+| `H3_GROUP_STREAM` / `H3_GROUP_STREAM_HOST` | `own` / `auto` | group モードの重み転送方式。`HOST` は搭載 RAM 48GB 未満なら量子化キャッシュのファイルから直接流す(`file`)。Windows は RAM に関係なく常に `file`(ピン留め RAM からの転送が WDDM では極端に遅いため) |
 | `H3_VIDEO_VAE_FP16` | `0` | video VAE を fp16 化(デコードのピークを削減。16GB 以下では必須) |
 | `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃 |
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | ref2va の transformer_ref を AdaLN-pruned 版で読む(`H3_TRANSFORMER_QUANT=int8` 併用必須)と、その量子化方式 |

@@ -568,7 +568,11 @@ else fits in the OS page cache makes it faster. The tail units that do not fit t
 weights + the TE / VAE pinning that comes later − usable RAM, honoring a cgroup limit). In file mode the VAE decoder's
 streaming source is not pinned either (the fp16 copy is used as is). The int8 weights are the same, so the output is the same.
 
-- `H3_GROUP_STREAM_HOST`: `auto` (default: file when the installed RAM is below `H3_GROUP_STREAM_FILE_BELOW_GB` = 48 GB),
+- `H3_GROUP_STREAM_HOST`: `auto` (default: file when the installed RAM is below `H3_GROUP_STREAM_FILE_BELOW_GB` = 48 GB;
+  **on Windows always file regardless of RAM**: 2026-11-19, WDDM moves multi-GB page-locked regions pathologically slowly, and on an
+  RTX 3050 6GB / 32 GB RAM machine streaming the 4.5 GB decoder from pinned RAM ran at about 0.5 GB/s, a 512² decode of 590 s,
+  while streaming from file through a 0.4 GB staging ring took 0.96 s per pass, 53 s. The VAE decoder's pinned path is likewise
+  not used on Windows),
   `pinned`, `file`. Falls back to pinned when the weights were quantized from bf16 at load (no cache file to read).
   `H3_GROUP_STREAM_DROP_UNITS` (auto / a number), `H3_GROUP_STREAM_RING` (staging buffers, default 3). `H3_FILE_STREAM_HOST_MIN_MB` (default 1): tensors missing from the files (the turbo LoRA's
   lora_a / lora_b, 1.24 GiB in total) at least this large are not kept on the GPU but held in pageable host RAM and

@@ -4862,7 +4862,8 @@ class MiniMaxH3Runner:
                 return
             logger.info("vae.decoder: no room on the GPU for resident decoder blocks (usable VRAM %.1f GiB = driver free %.1f + "
                         "torch cached %.1f, output ~%.1f GiB, floor %.1f)", free_gib, free_drv, cached, out_gib, floor)
-        if budget >= need:
+        if budget >= need and sys.platform != "win32":
+            # Windows ではデコーダ 4.5GB のピン留めが病的に遅い(_group_stream_host_hint のコメント参照)ので file 経路に落とす
             self._vae_streamer = _bs.BlockStreamer(
                 vae.decoder.transformer_blocks, DEVICE, window=2, root=vae.decoder, pin=True,
                 source_files=[self._vae_cache_file], names_root=vae)
@@ -4875,8 +4876,9 @@ class MiniMaxH3Runner:
                 files=[self._vae_cache_file], label="vae.decoder", drop_units=H3_GROUP_STREAM_DROP_UNITS,
                 ring=H3_GROUP_STREAM_RING)
             self._vae_streamer_transient = False
-            logger.info("vae.decoder: file streamer for this decode (budget %.1f GiB < %.1f needed, output ~%.1f GiB) %s",
-                        budget, need, out_gib, self._vae_streamer.describe())
+            logger.info("vae.decoder: file streamer for this decode (RAM budget %.1f GiB, pinned needs %.1f%s, output ~%.1f GiB) %s",
+                        budget, need, "; pinned not used on Windows" if sys.platform == "win32" else "", out_gib,
+                        self._vae_streamer.describe())
 
     def _vae_stream_move(self, device) -> None:
         """video VAE のデコーダブロックは常にホスト(ピン留め)に置き、残り(encoder、デコーダの入出力層、
@@ -5244,6 +5246,11 @@ class MiniMaxH3Runner:
         """H3_GROUP_STREAM_HOST の auto を搭載 RAM で解決する(キャッシュの有無は見ない)。"""
         if H3_GROUP_STREAM_HOST != "auto":
             return H3_GROUP_STREAM_HOST
+        if sys.platform == "win32":
+            # 2026-11-19: Windows(WDDM)は数 GB のページロック領域の転送が病的に遅い(RTX 3050 6GB / RAM 32GB で、
+            # デコーダ 4.5GB をピン留めして流すと 0.5GB/s 相当、受け皿 0.4GB でファイルから流すと 6GB/s 相当)。
+            # 30GB の transformer をピン留めする pinned は RAM が多くても使わない(明示指定なら従う)
+            return "file"
         return "file" if ram_gb()["total_gb"] < H3_GROUP_STREAM_FILE_BELOW_GB else "pinned"
 
     def _resolve_group_stream_host(self, name: str) -> tuple[str, list]:
