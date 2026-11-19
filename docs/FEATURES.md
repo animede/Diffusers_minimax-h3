@@ -573,6 +573,10 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   残る違いは torch のプールで、サーバはデノイズ後の reserved 3.05GB(実使用 1.18GB)を抱えたままデコードに入り、デコード中に
   さらに 2〜3 倍に膨らんで 6GB を越える。`H3_GPU_POOL_DEFRAG`(auto = Windows のみ): デコード直前に GPU の実体(VAE の非ブロック部、
   audio VAE、transformer の非ブロック部、約 1.2GB)を CPU に退避 → `empty_cache` → 戻す(`_defrag_gpu_pool`)。出力は不変。
+- 同日、さらに: プールを空にする手は効かなかった(reserved 2.84 → 2.66GB。散らばった小さな実体が区画を掴んでいる)。
+  代わりに **Windows では未指定なら VRAM の上限を自動で「カード容量 − 1.2GB」にする**(`H3_VRAM_LIMIT_GB` の自動版、
+  `H3_VRAM_AUTO_CAP_MARGIN_GB`)。割り当て器は上限に当たると未使用の区画を返して再利用するので、断片化していても膨らめず、
+  物理 VRAM を越えない。A4000 の 6GB / 8GB 上限の模擬はこの仕組みそのもので、そこでは退避も OOM も起きていない。
 - 置ける数の判定は「ドライバの空き + torch が確保済みで未使用の分(reserved − allocated)」で見る(Linux のみ)。Windows の torch は
   `expandable_segments` が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop の実機: allocated 1.46 / reserved 3.33GB、
   ドライバの空き 3.8GB → 当初 10/36 しか置けなかった)。その分は新しい確保に使い回されるので数えてよい。

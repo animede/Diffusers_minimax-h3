@@ -629,6 +629,10 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   `H3_GPU_POOL_DEFRAG` (auto = Windows only): right before the decode, the live GPU tensors (VAE non-block parts, audio VAE,
   transformer non-block parts, about 1.2 GB) are moved to the CPU, `empty_cache` releases the whole pool, and they are moved
   back (`_defrag_gpu_pool`). Output unchanged.
+- Same day, further: emptying the pool did not work (reserved 2.84 -> 2.66 GB; scattered small live tensors keep segments
+  alive). Instead, **on Windows an automatic VRAM cap of card size minus 1.2 GB is applied when `H3_VRAM_LIMIT_GB` is unset**
+  (`H3_VRAM_AUTO_CAP_MARGIN_GB`). At the cap the allocator releases unused blocks and reuses them, so a fragmented pool cannot grow
+  past physical VRAM. The A4000 emulations at 6 GB / 8 GB use exactly this mechanism and showed neither spilling nor OOM.
 - The block count is decided from "driver free + torch's reserved-but-unused memory" (Linux only). Windows torch has no
   `expandable_segments`, so a few GB stay reserved after the denoise (real RTX 4060 Laptop: allocated 1.46 / reserved 3.33 GB,
   driver free 3.8 GB, so only 10/36 blocks fit at first); that memory is reused by new allocations and may be counted.

@@ -210,6 +210,18 @@ _H3_PROFILE_INFO = _h3_profile.apply()
 # 対する比なので、GB 指定を総容量で割って渡す。指定が総容量以上なら無意味なので警告
 # だけ出して素通しする。**予約ではなく上限**なので、使わない限りメモリは消費しない。
 H3_VRAM_LIMIT_GB = os.environ.get("H3_VRAM_LIMIT_GB", "").strip()
+# 2026-11-19: Windows では未指定なら「カード容量 − H3_VRAM_AUTO_CAP_MARGIN_GB(既定 1.2GB = CUDA の固定費 + 表示)」を上限にする。
+# Windows の torch は expandable_segments が無く、断片化したプールを返せずに膨らみ続け(RTX 3050 6GB: 実使用 1.1GB に対して
+# reserved 2.7GB、デコード中はさらに 2〜3 倍)、物理 VRAM を越えて共有メモリへ退避し極端に遅くなる。上限があると割り当て器は
+# 上限に当たった時点で未使用の区画を返して再利用するので、膨らめない。上限を越える実需要なら OOM になる(退避して延々と
+# 遅いより分かりやすい)。無効にするにはカード容量以上の値を H3_VRAM_LIMIT_GB に入れる。
+H3_VRAM_AUTO_CAP_MARGIN_GB = float(os.environ.get("H3_VRAM_AUTO_CAP_MARGIN_GB", "1.2").strip() or "1.2")
+if not H3_VRAM_LIMIT_GB and sys.platform == "win32" and torch.cuda.is_available():
+    _total_gb_auto = torch.cuda.get_device_properties(DEVICE.index or 0).total_memory / 1e9
+    H3_VRAM_LIMIT_GB = f"{_total_gb_auto - H3_VRAM_AUTO_CAP_MARGIN_GB:.2f}"
+    logger.info("Windows: VRAM cap set automatically to %.2f GB (card %.2f GB minus %.1f GB margin, H3_VRAM_AUTO_CAP_MARGIN_GB) "
+                "so torch's pool cannot grow past physical VRAM and spill to shared memory", float(H3_VRAM_LIMIT_GB),
+                _total_gb_auto, H3_VRAM_AUTO_CAP_MARGIN_GB)
 if H3_VRAM_LIMIT_GB:
     _limit_gb = float(H3_VRAM_LIMIT_GB)
     if _limit_gb <= 0:
