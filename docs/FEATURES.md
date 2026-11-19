@@ -192,7 +192,7 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃(成立条件は該当節参照) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外のGPUは `default`(SDPA)必須** |
-| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは当初 LoRA 約 1.2GB が GPU 常駐で、8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB、ref2va 768² 276 秒・4.13GB。同日 15 時にホスト RAM から単位ごとに流す方式に変え(`H3_FILE_STREAM_HOST_MIN_MB`)、6GB 上限の模擬で 768² 211 秒・2.82GB、1024² 380 秒・3.48GB。実機の Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB と Windows 10 + RTX 3050 6GB / RAM 16GB で動作確認済み(生成時間は公平な条件で測り直してから載せる。重みの読み出しが律速で SSD の速さに依存)。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
+| `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL)。2026-11-17 から group でも可(`H3_GROUP_STREAM=own` + 起動時指定。`file` ストリーミングでは当初 LoRA 約 1.2GB が GPU 常駐で、8GB 級 + 8GB 上限の模擬で 768² 205 秒・4.19GB、1024² 376 秒・4.85GB、ref2va 768² 276 秒・4.13GB。同日 15 時にホスト RAM から単位ごとに流す方式に変え(`H3_FILE_STREAM_HOST_MIN_MB`)、6GB 上限の模擬で 768² 211 秒・2.82GB、1024² 380 秒・3.48GB。実機の Windows 11 + RTX 4060 Laptop 8GB / RAM 16GB と Windows 10 + RTX 3050 6GB / RAM 16GB で動作確認済み(4060 Laptop の実測、2026-11-19、NVMe: 512² 194 秒 = デノイズ 117 + デコード 16、768×512 279 秒 = 191 + 65、768² 412 秒 = 313 + 85。デノイズは重みの読み出しと GPU、デコードは GPU 計算が律速)。A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒。8GB 級の指定 + 8GB 上限の模擬で 768² 209 秒・3.08GB、1024² 376 秒・3.73GB、ref2va 768² 299 秒・3.0GB、fl2va 768² 225 秒・3.4GB。なお自作ストリーマの group モードでは ref2va が layout の device 不一致で落ちる退行があり、同日に修正) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | transformer / transformer_ref の bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得する(既定は取得せず、エラーで案内する) |
 | `H3_PIKA_RENOISE` | `0` | Pika H3 Flex の turbo LoRA 用 renoise サンプラー(実験) |
 | `H3_BLOCK_COMPILE` | `0` | `1` で turbo LoRA 適用後に transformer_ref の 50 ブロックを torch.compile(attention 本体は graph break)。RTX PRO 6000・1024×768 で 1 step 約 -13%、初回のみ +5〜14s |
@@ -546,6 +546,15 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   アーティファクトが乗る**(256px 出力との PSNR 22dB、SSIM 0.60。境界だけでなく全面)。デコーダの transformer ブロックは 256px
   タイルを前提に学習されているとみられ、タイルサイズは変えられない。コードには入れていない。RTX 4060 Laptop(26/36 常駐、
   読み待ち 0)でデコード 85.7 秒 ≒ 0.57 秒/パス × 150 パスが、この GPU での下限。
+- 2026-11-19: デコードの間は transformer / token_refiner / TE の受け皿(ピン留め、計 1.6GiB 前後)を返してホスト RAM を空け、
+  次の forward の入口で作り直す(`FileBlockStreamer.park()`)。RAM 16GB の PC では、この分でデコーダの流す側がページキャッシュに
+  残るかどうかが変わる(RTX 3050 6GB / RAM 16GB、遅い SATA 級 SSD、RAM 13/16GB 使用の実機で、512² のデコードが 772 秒と
+  768² の 569 秒より遅くなった = 流す側 3.1GB がキャッシュから押し出され毎パス SSD から読んでいた)。出力は変わらない。
+- 2026-11-19: 見積もりの数は上限として、実際に載せる間はドライバの空き VRAM(mem_get_info)を 1 単位ごとに見て、
+  「活性 + 出力 + 余裕」を下回る手前で止める(`ResidentLoader(min_driver_free_gib=…)`)。torch が抱えた領域は断片化で
+  使い回せないことがあり、見積もりだけで載せると物理 VRAM を越えて Windows が共有メモリへ退避し、極端に遅くなる
+  (RTX 3050 6GB / RAM 32GB の実機: ドライバの空き 1.9 + torch 抱え 1.8GB の見積もりで 13/36 を載せた結果、512² の
+  デコードが 824 秒、768² が 648 秒。共有 GPU メモリ 6.4GB)。
 - 置ける数の判定は「ドライバの空き + torch が確保済みで未使用の分(reserved − allocated)」で見る。Windows の torch は
   `expandable_segments` が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop の実機: allocated 1.46 / reserved 3.33GB、
   ドライバの空き 3.8GB → 当初 10/36 しか置けなかった)。その分は新しい確保に使い回されるので数えてよい。

@@ -202,7 +202,7 @@ only set these if you want to change them permanently):
 | `H3_KEEP_TRANSFORMER` | `0` | Keep the transformer resident, removing the reload fixed cost (see its section for the preconditions) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache (denoise -25%; measured ineffective on the int8+SDPA trajectory) |
 | `H3_ATTN_BACKEND` | `sage` | The sage build is sm_120-only. **Any other GPU must use `default` (SDPA)** |
-| `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use). Since 2026-11-17 also works in `group` (`H3_GROUP_STREAM=own` + the flag at startup; with `file` streaming the LoRA, about 1.2GB, first stayed on the GPU: 8GB-tier flags under an 8GB cap gave 768² 205 s / 4.19GB, 1024² 376 s / 4.85GB, ref2va 768² 276 s / 4.13GB. At 15:00 the same day it was switched to per-unit streaming from host RAM (`H3_FILE_STREAM_HOST_MIN_MB`); under a 6GB cap 768² takes 211 s at 2.82GB and 1024² 380 s at 3.48GB. Verified to work on real Windows 11 + RTX 4060 Laptop 8GB / 16GB RAM and Windows 10 + RTX 3050 6GB / 16GB RAM machines (times to be published once measured under fair conditions; weight reads are the bottleneck, so SSD speed dominates). A4000 16GB: t2va 5 s 768² in 151 s at 4 steps; with the 8GB-tier flags under an 8GB cap, 768² 209 s / 3.08GB, 1024² 376 s / 3.73GB ref2va 768² 299 s / 3.0GB and fl2va 768² 225 s / 3.4GB. Note: ref2va in group mode with the in-house streamer crashed on a layout device mismatch, fixed the same day) |
+| `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use). Since 2026-11-17 also works in `group` (`H3_GROUP_STREAM=own` + the flag at startup; with `file` streaming the LoRA, about 1.2GB, first stayed on the GPU: 8GB-tier flags under an 8GB cap gave 768² 205 s / 4.19GB, 1024² 376 s / 4.85GB, ref2va 768² 276 s / 4.13GB. At 15:00 the same day it was switched to per-unit streaming from host RAM (`H3_FILE_STREAM_HOST_MIN_MB`); under a 6GB cap 768² takes 211 s at 2.82GB and 1024² 380 s at 3.48GB. Verified to work on real Windows 11 + RTX 4060 Laptop 8GB / 16GB RAM and Windows 10 + RTX 3050 6GB / 16GB RAM machines (4060 Laptop measured 2026-11-19 on an NVMe: 512² 194 s = denoise 117 + decode 16, 768x512 279 s = 191 + 65, 768² 412 s = 313 + 85; the denoise is bound by weight reads and the GPU, the decode by GPU compute). A4000 16GB: t2va 5 s 768² in 151 s at 4 steps; with the 8GB-tier flags under an 8GB cap, 768² 209 s / 3.08GB, 1024² 376 s / 3.73GB ref2va 768² 299 s / 3.0GB and fl2va 768² 225 s / 3.4GB. Note: ref2va in group mode with the in-house streamer crashed on a layout device mismatch, fixed the same day) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | When the bf16 transformer / transformer_ref weights (~66GB each) are not cached, download them from HF only if `1` (default: no download, fail with a hint) |
 | `H3_PIKA_RENOISE` | `0` | Renoise sampler for the Pika H3 Flex turbo LoRA (experimental) |
 | `H3_BLOCK_COMPILE` | `0` | `1` torch.compiles the 50 transformer_ref blocks after the turbo LoRA is applied (attention itself is a graph break). About -13% per step at 1024×768 on an RTX PRO 6000; +5-14s on the first call only |
@@ -597,6 +597,16 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   just at seams). The decoder's transformer blocks appear to be trained for 256 px tiles, so the tile size cannot be changed. Not
   added to the code. On the RTX 4060 Laptop (26/36 resident, zero read wait) the 85.7 s decode, about 0.57 s x 150 passes, is
   the floor for that GPU.
+- 2026-11-19: during the decode the pinned staging buffers of the transformer / token_refiner / TE streamers (about 1.6 GiB in
+  total) are returned to free host RAM and re-created at the next forward (`FileBlockStreamer.park()`). On 16 GB-RAM PCs that
+  amount decides whether the streamed part of the decoder stays in the page cache (on a real RTX 3050 6GB / 16 GB RAM machine with
+  a slow SATA-class SSD and 13/16 GB RAM in use, the 512² decode took 772 s, slower than the 569 s at 768²: the 3.1 GB streamed
+  part was being evicted and re-read from the SSD every pass). Output is unchanged.
+- 2026-11-19: the estimated count is only an upper bound; while loading, the driver's free VRAM (mem_get_info) is checked
+  before every unit and loading stops before it falls under "activations + output + headroom" (`ResidentLoader(min_driver_free_gib=...)`).
+  Memory torch keeps reserved may be unusable due to fragmentation; loading on the estimate alone pushed past physical VRAM and
+  Windows spilled to shared memory, becoming extremely slow (real RTX 3050 6GB / 32 GB RAM: driver free 1.9 + torch cached 1.8 GB
+  led to 13/36 resident, then 824 s for a 512² decode and 648 s at 768², with 6.4 GB of shared GPU memory).
 - The block count is decided from "driver free + torch's reserved-but-unused memory". Windows torch has no
   `expandable_segments`, so a few GB stay reserved after the denoise (real RTX 4060 Laptop: allocated 1.46 / reserved 3.33 GB,
   driver free 3.8 GB, so only 10/36 blocks fit at first); that memory is reused by new allocations and may be counted.

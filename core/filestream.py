@@ -126,17 +126,30 @@ class ResidentLoader:
     GPU)がデコード時間の大半を占めていた(RTX 4060 Laptop で 1 パス 0.77 秒のうち 0.68 秒が読み待ち)。VRAM に
     収まるなら 1 回読んで置いたままにするほうが速く、出力は同じ。`release()` でプレースホルダに戻して GPU を空ける。"""
 
-    def __init__(self, units, device, *, names_root: torch.nn.Module, files: list[Path], label: str):
+    def __init__(self, units, device, *, names_root: torch.nn.Module, files: list[Path], label: str,
+                 min_driver_free_gib: float = 0.0):
+        """min_driver_free_gib > 0 なら、単位を載せる前にドライバが見る空き VRAM(mem_get_info)を確かめ、下回ったら
+        そこで止める(載せた単位数は `n_units_loaded`)。Windows は expandable_segments が無く、torch が抱えたままの
+        領域(reserved − allocated)が断片化で使い回せないことがあり、見積もりだけで載せると物理 VRAM を越えて
+        共有メモリへ退避して極端に遅くなる(RTX 3050 6GB / RAM 32GB で実測: 512² のデコード 824 秒)。"""
         self.device = torch.device(device)
         self.label = label
         index = safetensors_index(files)
         mod_names = {id(m): nm for nm, m in names_root.named_modules()}
         self.slots: list[tuple] = []          # (owner, attr, placeholder)
+        self.n_units_loaded = 0
+        self.stopped_free_gib: float | None = None
         reader = _Reader(sequential=False)
         total = 0
         t0 = time.time()
         try:
             for unit in units:
+                if min_driver_free_gib > 0:
+                    torch.cuda.synchronize(self.device)
+                    free = torch.cuda.mem_get_info(self.device)[0] / 2**30
+                    if free < min_driver_free_gib:
+                        self.stopped_free_gib = free
+                        break
                 prefix = mod_names[id(unit)] + "."
                 plan, pos = [], 0
                 for (owner, attr, t), name in zip(collect_slots(unit), slot_names(unit, prefix)):
@@ -161,11 +174,14 @@ class ResidentLoader:
                     _set(owner, attr, g)
                     total += r.nbytes
                 del buf
+                self.n_units_loaded += 1
         finally:
             reader.close()
         self.total_gb = total / 2**30
-        logger.info("resident (%s): %d tensors (%.2f GiB) read from %d files to the GPU in %.1fs",
-                    label, len(self.slots), self.total_gb, len(files), time.time() - t0)
+        logger.info("resident (%s): %d units, %d tensors (%.2f GiB) read from %d files to the GPU in %.1fs%s",
+                    label, self.n_units_loaded, len(self.slots), self.total_gb, len(files), time.time() - t0,
+                    "" if self.stopped_free_gib is None else
+                    f" (stopped: driver free VRAM {self.stopped_free_gib:.1f} GiB < {min_driver_free_gib:.1f} floor)")
 
     def release(self) -> float:
         for owner, attr, placeholder in self.slots:
@@ -389,19 +405,12 @@ class FileBlockStreamer:
         self.cached_reads = (self.total_gb + 1.0 + float(reserve_gb)) <= host_cache_budget_gb()
         self.reader = _Reader(sequential=not self.cached_reads)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"filestream-{label}")
-        # 受け皿は torch.empty(匿名メモリ)を cudaHostRegister でピン留めする(pin_memory() の cudaHostAlloc は
-        # cgroup に file として計上され、ページキャッシュの予算計算から漏れる、image server で実測)
         self.bufs = []
-        for _ in range(self.ring):
-            buf = torch.empty(max(self.unit_bytes, _ALIGN), dtype=torch.uint8)
-            err = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), buf.numel(), 0)
-            if int(err) != 0:
-                raise RuntimeError(f"cudaHostRegister failed ({err}): not enough lockable host memory?")
-            self.bufs.append(buf)
         self.buf_free: list[torch.cuda.Event | None] = [None] * self.ring
         self.pending: dict[int, tuple[int, Future]] = {}
         self.copy_stream = torch.cuda.Stream(self.device)
-        self.pinned_bytes = self.ring * self.unit_bytes
+        self.pinned_bytes = 0
+        self._ensure_bufs()
         self._handles = []
         for i, unit in enumerate(self.units):
             self._handles.append(unit.register_forward_pre_hook(self._make_pre(i)))
@@ -471,7 +480,39 @@ class FileBlockStreamer:
         self.buf_free[b] = ev
         compute.wait_event(ev)
 
+    def _ensure_bufs(self) -> None:
+        """受け皿(ring 本)を用意する。torch.empty(匿名メモリ)を cudaHostRegister でピン留めする(pin_memory() の
+        cudaHostAlloc は cgroup に file として計上され、ページキャッシュの予算計算から漏れる、image server で実測)。"""
+        if self.bufs:
+            return
+        for _ in range(self.ring):
+            buf = torch.empty(max(self.unit_bytes, _ALIGN), dtype=torch.uint8)
+            err = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), buf.numel(), 0)
+            if int(err) != 0:
+                raise RuntimeError(f"cudaHostRegister failed ({err}): not enough lockable host memory?")
+            self.bufs.append(buf)
+        self.buf_free = [None] * self.ring
+        self.pinned_bytes = self.ring * self.unit_bytes
+
+    def park(self) -> float:
+        """受け皿を一時的に返す(デコードの間など、この streamer を使わない区間でホスト RAM を空ける。次の forward の
+        入口で作り直す)。返した GiB を返す。2026-11-19: RAM 16GB の PC ではデコード中の空き RAM がページキャッシュの
+        成否を決めるので、transformer / token_refiner / TE の受け皿(計 1.6GiB 前後)を返して VAE デコーダの流す側を
+        キャッシュに残りやすくする。"""
+        if not self.bufs:
+            return 0.0
+        self._reset()
+        torch.cuda.synchronize(self.device)
+        cudart = torch.cuda.cudart()
+        for buf in self.bufs:
+            cudart.cudaHostUnregister(buf.data_ptr())
+        freed = self.pinned_bytes / 2**30
+        self.bufs = []
+        self.pinned_bytes = 0
+        return freed
+
     def _begin(self, _module, _args) -> None:
+        self._ensure_bufs()
         self._reset()
         for i in range(min(self.ring - 1, self.n)):
             self.prefetch(i)
@@ -501,14 +542,7 @@ class FileBlockStreamer:
         self._handles.clear()
         self.pool.shutdown(wait=True)
         self.reader.close()
-        torch.cuda.synchronize(self.device)
-        cudart = torch.cuda.cudart()
-        for buf in self.bufs:
-            cudart.cudaHostUnregister(buf.data_ptr())
-        freed = self.pinned_bytes / 2**30
-        self.bufs = []
-        self.pinned_bytes = 0
-        return freed
+        return self.park()
 
     def describe(self) -> dict:
         return {"blocks": self.n, "host": "file", "weights_gib": round(self.total_gb, 2),
