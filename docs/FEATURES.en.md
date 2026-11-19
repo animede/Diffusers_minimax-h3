@@ -623,6 +623,12 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   `expandable_segments`), which the estimate ignored. On Windows the rule now (a) does not count reserved-but-unused memory as
   usable and (b) uses a default headroom of 2.5 GiB (1.0 GiB on Linux). Inside the server on the 3050 (2.2 GB physically free)
   that means 0 resident blocks; in a fresh process about 15.
+- Same day, further: even with 0 resident blocks and the file path, the server slowed down later in the decode (5.9 GB shared).
+  The remaining difference from the probe (fresh process, empty pool) is torch's pool: the server enters the decode holding
+  3.05 GB reserved after the denoise (1.18 GB in use) and the pool then grows 2-3x during the decode, past 6 GB.
+  `H3_GPU_POOL_DEFRAG` (auto = Windows only): right before the decode, the live GPU tensors (VAE non-block parts, audio VAE,
+  transformer non-block parts, about 1.2 GB) are moved to the CPU, `empty_cache` releases the whole pool, and they are moved
+  back (`_defrag_gpu_pool`). Output unchanged.
 - The block count is decided from "driver free + torch's reserved-but-unused memory" (Linux only). Windows torch has no
   `expandable_segments`, so a few GB stay reserved after the denoise (real RTX 4060 Laptop: allocated 1.46 / reserved 3.33 GB,
   driver free 3.8 GB, so only 10/36 blocks fit at first); that memory is reused by new allocations and may be counted.

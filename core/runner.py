@@ -1597,6 +1597,13 @@ H3_GROUP_STREAM_REFINER = os.environ.get("H3_GROUP_STREAM_REFINER", "1").strip()
 H3_GROUP_STREAM_VAE = os.environ.get("H3_GROUP_STREAM_VAE", "auto").strip().lower()
 # file モードのデコードでデコーダ(4.5GiB)を GPU に置き切るか: auto(空き VRAM が足りれば)/ 1(常に)/ 0(しない)。
 # 余裕は H3_VAE_DECODER_RESIDENT_MARGIN_GB(既定 1.0GiB。Windows は表示用の分が別に要るので mem_get_info の空きから見る)
+# デコードの直前に GPU のプールを空にする(auto = Windows のみ / 1 / 0)。GPU に残っている実体(VAE の非ブロック部、audio VAE、
+# transformer の非ブロック部、計 1.2GB 前後)を CPU に退避 → empty_cache → 戻す。Windows の torch は expandable_segments が
+# 無く、デノイズ後に reserved 3GB(実使用 1.2GB)を抱えたままデコードに入り、デコード中にさらに 2〜3 倍に膨らんで
+# 6GB を越えて退避する(RTX 3050 6GB で実測。新しいプロセスで同じデコードを回すと 0.96 秒/パス、サーバ内では 4 秒以上)。
+H3_GPU_POOL_DEFRAG = os.environ.get("H3_GPU_POOL_DEFRAG", "auto").strip().lower()
+if H3_GPU_POOL_DEFRAG not in ("auto", "1", "0"):
+    raise ValueError(f"H3_GPU_POOL_DEFRAG must be 'auto', '1' or '0', got {H3_GPU_POOL_DEFRAG!r}")
 H3_VAE_DECODER_RESIDENT = os.environ.get("H3_VAE_DECODER_RESIDENT", "auto").strip().lower()
 if H3_VAE_DECODER_RESIDENT not in ("auto", "1", "0"):
     raise ValueError(f"H3_VAE_DECODER_RESIDENT must be 'auto', '1' or '0', got {H3_VAE_DECODER_RESIDENT!r}")
@@ -4777,6 +4784,65 @@ class MiniMaxH3Runner:
                         "on" if decided else "off", free_gb, "<" if decided else ">=", H3_GROUP_STREAM_VAE_FREE_GB)
         return decided
 
+    def _defrag_gpu_pool(self) -> None:
+        """GPU に残っている実体を CPU に退避して torch のプールを全部返し、戻す(H3_GPU_POOL_DEFRAG の module コメント参照)。
+        対象: video VAE(デコーダブロックはプレースホルダ)、audio VAE、transformer / token_refiner の非ブロック部。
+        流す側の重み(ブロック)は GPU に無い。往復は 1.2GB 前後で 0.5 秒程度。出力は変わらない。"""
+        from core import blockstream
+
+        before = torch.cuda.memory_reserved(DEVICE) / 2**30
+        moved: list = []
+        vae = self._pipe.vae
+        for name, child in list(vae.named_children()) + list(vae.decoder.named_children()):
+            if name in ("decoder", "transformer_blocks"):
+                continue
+            if any(p.is_cuda for p in child.parameters()) or any(b.is_cuda for b in child.buffers()):
+                child.to(CPU)
+                moved.append(child)
+        for module in (vae, vae.decoder):
+            for p in module.parameters(recurse=False):
+                if p.is_cuda:
+                    p.data = p.data.to(CPU)
+                    moved.append(p)
+            for bname, b in list(module.named_buffers(recurse=False)):
+                if b.is_cuda:
+                    setattr(module, bname, b.to(CPU))
+                    moved.append((module, bname))
+        audio = getattr(self._pipe, "audio_vae", None)
+        if audio is not None and any(p.is_cuda for p in audio.parameters()):
+            audio.to(CPU)
+            moved.append(audio)
+        tr_moves = []
+        for tr_name in ("transformer", "transformer_ref"):
+            pipe = self._pipe if tr_name == "transformer" else getattr(self, "_pipe_ref", None)
+            tr = getattr(pipe, tr_name, None) if pipe is not None else None
+            if tr is None or not any(p.is_cuda for n, p in tr.named_parameters() if not n.startswith("transformer_blocks.")):
+                continue
+            skip = {"transformer_blocks", "token_refiner"}
+            blockstream.move_non_block_children(tr, skip, CPU)
+            refiner = getattr(tr, "token_refiner", None)
+            if refiner is not None:
+                blockstream.move_non_block_children(refiner, "refiner_blocks", CPU)
+            tr_moves.append((tr, refiner, skip))
+        torch.cuda.synchronize(DEVICE)
+        torch.cuda.empty_cache()
+        mid = torch.cuda.memory_reserved(DEVICE) / 2**30
+        for item in moved:
+            if isinstance(item, tuple):
+                module, bname = item
+                setattr(module, bname, getattr(module, bname).to(DEVICE))
+            elif isinstance(item, torch.nn.Parameter) or isinstance(item, torch.Tensor):
+                item.data = item.data.to(DEVICE)
+            else:
+                item.to(DEVICE)
+        for tr, refiner, skip in tr_moves:
+            blockstream.move_non_block_children(tr, skip, DEVICE)
+            if refiner is not None:
+                blockstream.move_non_block_children(refiner, "refiner_blocks", DEVICE)
+        torch.cuda.synchronize(DEVICE)
+        logger.info("gpu pool defragmented before the decode: reserved %.2f -> %.2f -> %.2f GiB (allocated %.2f GiB)",
+                    before, mid, torch.cuda.memory_reserved(DEVICE) / 2**30, torch.cuda.memory_allocated(DEVICE) / 2**30)
+
     def _vae_ensure_file_streamer(self, z) -> None:
         """file モードのデコード入口(vae.decode)で、デコーダブロックの置き場所を決める。空き RAM が
         「重み 4.5GiB + 余裕 2GiB + 出力フレーム(fp32 と変換用の写しで 2 倍)」以上ならキャッシュからピン留めに読んで
@@ -4787,6 +4853,11 @@ class MiniMaxH3Runner:
         from core import filestream
 
         vae = self._pipe.vae
+        if H3_GPU_POOL_DEFRAG == "1" or (H3_GPU_POOL_DEFRAG == "auto" and sys.platform == "win32"):
+            try:
+                self._defrag_gpu_pool()
+            except Exception:  # noqa: BLE001  失敗しても致命的ではない(従来どおり進む)
+                logger.exception("gpu pool defrag failed; continuing without it")
         # デコードの間は transformer / token_refiner / TE の受け皿(ピン留め)を返してホスト RAM を空ける(次の forward の
         # 入口で作り直される)。RAM 16GB の PC では、この分(1.6GiB 前後)でデコーダの流す側がページキャッシュに
         # 残るかどうかが変わる(2026-11-19、RTX 3050 6GB / RAM 16GB で 512² のデコードが 768² より遅くなった件)。

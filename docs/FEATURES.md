@@ -569,6 +569,10 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   見積もりはこれを見込んでいなかった。Windows では (a) 抱えた未使用分(reserved − allocated)を「使える」と数えない、
   (b) 余裕の既定を 2.5GiB(Linux は 1.0GiB)にする。サーバ内の 3050(物理の空き 2.2GB)では常駐 0 になり、
   新しいプロセスでは 15 個前後になる計算。
+- 同日、さらに: 常駐 0 + ファイル経路にしてもサーバ内では後半で遅くなった(共有 5.9GB)。プローブ(新しいプロセス、プール空)との
+  残る違いは torch のプールで、サーバはデノイズ後の reserved 3.05GB(実使用 1.18GB)を抱えたままデコードに入り、デコード中に
+  さらに 2〜3 倍に膨らんで 6GB を越える。`H3_GPU_POOL_DEFRAG`(auto = Windows のみ): デコード直前に GPU の実体(VAE の非ブロック部、
+  audio VAE、transformer の非ブロック部、約 1.2GB)を CPU に退避 → `empty_cache` → 戻す(`_defrag_gpu_pool`)。出力は不変。
 - 置ける数の判定は「ドライバの空き + torch が確保済みで未使用の分(reserved − allocated)」で見る(Linux のみ)。Windows の torch は
   `expandable_segments` が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop の実機: allocated 1.46 / reserved 3.33GB、
   ドライバの空き 3.8GB → 当初 10/36 しか置けなかった)。その分は新しい確保に使い回されるので数えてよい。
