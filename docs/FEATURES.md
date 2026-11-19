@@ -560,7 +560,13 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   512² のデコード 708 秒 = 1 パス 4.5 秒以上の退避状態)。`nvidia-smi --query-gpu=memory.used,memory.total`(全プロセス込みの
   実使用、タスクマネージャの専用 GPU メモリと同じ)を UUID で突き合わせて取り、判定と下限の両方で「ドライバの空き」と
   「物理の空き」の小さいほうを使う(`filestream.physical_free_gib`)。nvidia-smi が無ければ従来どおり。
-- 置ける数の判定は「ドライバの空き + torch が確保済みで未使用の分(reserved − allocated)」で見る。Windows の torch は
+- 同日、決着: デコーダだけを新しいプロセスで回す切り分け用のプローブ(使い捨て、リポジトリには残していない)で RTX 3050 6GB を測ると、常駐なしで
+  1 パス 0.96 秒・512² 全体 52.6 秒(A4000 の 0.75 秒とほぼ同等)。遅さは計算ではなく載せすぎによる退避だけだった。
+  原因は Windows の torch のプールの膨らみ: テンソル 0.88GB に対して reserved 2.60GB(`expandable_segments` が無い)。
+  見積もりはこれを見込んでいなかった。Windows では (a) 抱えた未使用分(reserved − allocated)を「使える」と数えない、
+  (b) 余裕の既定を 2.5GiB(Linux は 1.0GiB)にする。サーバ内の 3050(物理の空き 2.2GB)では常駐 0 になり、
+  新しいプロセスでは 15 個前後になる計算。
+- 置ける数の判定は「ドライバの空き + torch が確保済みで未使用の分(reserved − allocated)」で見る(Linux のみ)。Windows の torch は
   `expandable_segments` が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop の実機: allocated 1.46 / reserved 3.33GB、
   ドライバの空き 3.8GB → 当初 10/36 しか置けなかった)。その分は新しい確保に使い回されるので数えてよい。
 - 量子化キャッシュは `scripts/prepare_lowvram.py` で先に作る(bf16 シャードを 1 つずつ落として量子化して消す。RAM 16GB で可)。

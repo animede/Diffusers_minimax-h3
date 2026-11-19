@@ -109,6 +109,7 @@ import itertools
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import weakref
@@ -1599,7 +1600,10 @@ H3_GROUP_STREAM_VAE = os.environ.get("H3_GROUP_STREAM_VAE", "auto").strip().lowe
 H3_VAE_DECODER_RESIDENT = os.environ.get("H3_VAE_DECODER_RESIDENT", "auto").strip().lower()
 if H3_VAE_DECODER_RESIDENT not in ("auto", "1", "0"):
     raise ValueError(f"H3_VAE_DECODER_RESIDENT must be 'auto', '1' or '0', got {H3_VAE_DECODER_RESIDENT!r}")
-H3_VAE_DECODER_RESIDENT_MARGIN_GB = float(os.environ.get("H3_VAE_DECODER_RESIDENT_MARGIN_GB", "1.0").strip() or "1.0")
+# 余裕の既定: Linux 1.0GiB、Windows 2.5GiB。Windows の torch は expandable_segments が無く、テンソル 0.9GB に対して
+# プールが 2.6GB まで膨らむ(RTX 3050 6GB の実測)ので、その膨らみ(約 1.7GB)を見込まないと物理 VRAM を越えて退避する。
+H3_VAE_DECODER_RESIDENT_MARGIN_GB = float(os.environ.get("H3_VAE_DECODER_RESIDENT_MARGIN_GB", "").strip()
+                                          or ("2.5" if sys.platform == "win32" else "1.0"))
 if H3_GROUP_STREAM_VAE not in ("auto", "1", "0"):
     raise ValueError(f"H3_GROUP_STREAM_VAE must be 'auto', '1' or '0', got {H3_GROUP_STREAM_VAE!r}")
 H3_GROUP_STREAM_VAE_FREE_GB = float(os.environ.get("H3_GROUP_STREAM_VAE_FREE_GB", "8").strip() or "8")
@@ -4816,6 +4820,9 @@ class MiniMaxH3Runner:
             if phys is not None and phys < free_drv:
                 free_drv = phys
             cached = max(0.0, (torch.cuda.memory_reserved(DEVICE) - torch.cuda.memory_allocated(DEVICE)) / 2**30)
+            if sys.platform == "win32":
+                # Windows: 抱えた分は断片化で使い回せないことが多く、数えると載せすぎて退避する(3050 6GB で実測)
+                cached = 0.0
             free_gib = free_drv + cached
             if H3_VRAM_LIMIT_GB:
                 free_gib = min(free_gib, float(H3_VRAM_LIMIT_GB) * 1e9 / 2**30 - torch.cuda.memory_allocated(DEVICE) / 2**30)

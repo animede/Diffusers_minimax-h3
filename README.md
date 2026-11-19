@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-19 15:48 JST** — Windows の 6GB カードで VAE デコーダの常駐判定が物理 VRAM を越えて退避していた問題を修正(nvidia-smi の実使用量で判定)/ RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-19 16:49 JST** — Windows の 6GB カードで VAE デコーダを載せすぎて退避していた問題を修正(torch のプールの膨らみを見込む。RTX 3050 6GB で切り分け)/ RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -405,7 +405,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | ref2va の transformer_ref を AdaLN-pruned 版で読む(`H3_TRANSFORMER_QUANT=int8` 併用必須)と、その量子化方式 |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外の GPU は `default`(SDPA)必須** |
-| `H3_VAE_DECODER_RESIDENT` | `auto` | file ストリーミングのデコードで、空き VRAM に入るぶんだけ VAE デコーダ(36 ブロック、4.5GB)をデコードの間 GPU に置き、残りをファイルから流す(置いた分だけ毎パスの転送が減る。出力は同じ)。A4000 の模擬: 8GB 上限で 30/36 ブロック常駐、768² のデコード 86 → 34 秒(ピーク 6.2GB)、6GB 上限で 15/36、デコード 51 秒(ピーク 4.2GB)。`1` で全部強制、`0` で無効。余裕は `H3_VAE_DECODER_RESIDENT_MARGIN_GB`(既定 1.0) |
+| `H3_VAE_DECODER_RESIDENT` | `auto` | file ストリーミングのデコードで、空き VRAM に入るぶんだけ VAE デコーダ(36 ブロック、4.5GB)をデコードの間 GPU に置き、残りをファイルから流す(置いた分だけ毎パスの転送が減る。出力は同じ)。A4000 の模擬: 8GB 上限で 30/36 ブロック常駐、768² のデコード 86 → 34 秒(ピーク 6.2GB)、6GB 上限で 15/36、デコード 51 秒(ピーク 4.2GB)。`1` で全部強制、`0` で無効。余裕は `H3_VAE_DECODER_RESIDENT_MARGIN_GB`(既定 Linux 1.0、Windows 2.5。Windows の torch はプールが膨らむため) |
 | `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。`file` ストリーミングでは LoRA 約 1.2GB をホスト RAM からブロックごとに流す。`H3_FILE_STREAM_HOST_MIN_MB`(既定 1)以上のファイルに無いテンソルが対象) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得 |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使う外部 LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |

@@ -613,7 +613,13 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   `nvidia-smi --query-gpu=memory.used,memory.total` (all processes, the same number Task Manager shows as dedicated GPU memory),
   matched by UUID, is now used alongside the driver's figure, taking the smaller of the two for both the estimate and the floor
   (`filestream.physical_free_gib`). Without nvidia-smi the previous behaviour applies.
-- The block count is decided from "driver free + torch's reserved-but-unused memory". Windows torch has no
+- Same day, settled: a throwaway probe that runs the decoder alone in a fresh process (not kept in the repo) on the RTX 3050 6GB gives 0.96 s per
+  pass with nothing resident, 52.6 s for a whole 512² decode (about the A4000's 0.75 s). The slowness was never compute, only
+  spilling from keeping too many blocks. The cause is Windows torch's pool growth: 0.88 GB of tensors but 2.60 GB reserved (no
+  `expandable_segments`), which the estimate ignored. On Windows the rule now (a) does not count reserved-but-unused memory as
+  usable and (b) uses a default headroom of 2.5 GiB (1.0 GiB on Linux). Inside the server on the 3050 (2.2 GB physically free)
+  that means 0 resident blocks; in a fresh process about 15.
+- The block count is decided from "driver free + torch's reserved-but-unused memory" (Linux only). Windows torch has no
   `expandable_segments`, so a few GB stay reserved after the denoise (real RTX 4060 Laptop: allocated 1.46 / reserved 3.33 GB,
   driver free 3.8 GB, so only 10/36 blocks fit at first); that memory is reused by new allocations and may be counted.
 - The quantized cache is built beforehand with `scripts/prepare_lowvram.py` (fetches the bf16 shards one at a time,

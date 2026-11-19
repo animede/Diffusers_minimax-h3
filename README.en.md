@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-19 15:48 JST** — fixed the VAE decoder residency overshooting physical VRAM on 6GB Windows cards (decision now uses nvidia-smi's real usage) / real RTX 4060 Laptop 8GB figures added. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-19 16:49 JST** — fixed VAE decoder residency overshooting on 6GB Windows cards (accounts for torch's pool growth; traced on an RTX 3050 6GB) / real RTX 4060 Laptop 8GB figures added. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -405,7 +405,7 @@ Defaults shown. Most **can also be toggled from the UI**, so set them only to ch
 | `H3_PRUNED` / `H3_PRUNED_QUANT` | `0` / `int8wo` | Load the AdaLN-pruned transformer_ref for ref2va (requires `H3_TRANSFORMER_QUANT=int8`) and its quantization scheme |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache (denoise -25%; measured ineffective on the int8+SDPA trajectory) |
 | `H3_ATTN_BACKEND` | `sage` | The sage build is sm_120-only. **Any other GPU must use `default` (SDPA)** |
-| `H3_VAE_DECODER_RESIDENT` | `auto` | In file-streaming decodes, keeps as many VAE decoder blocks (36, 4.5GB) on the GPU as free VRAM allows for the decode and streams the rest from file (every resident block removes its share of the per-pass transfer; same output). A4000 emulation: 30/36 resident under an 8GB cap, 768² decode 86 to 34 s (peak 6.2GB); 15/36 under a 6GB cap, decode 51 s (peak 4.2GB). `1` forces all, `0` disables. Headroom via `H3_VAE_DECODER_RESIDENT_MARGIN_GB` (default 1.0) |
+| `H3_VAE_DECODER_RESIDENT` | `auto` | In file-streaming decodes, keeps as many VAE decoder blocks (36, 4.5GB) on the GPU as free VRAM allows for the decode and streams the rest from file (every resident block removes its share of the per-pass transfer; same output). A4000 emulation: 30/36 resident under an 8GB cap, 768² decode 86 to 34 s (peak 6.2GB); 15/36 under a 6GB cap, decode 51 s (peak 4.2GB). `1` forces all, `0` disables. Headroom via `H3_VAE_DECODER_RESIDENT_MARGIN_GB` (default 1.0 on Linux, 2.5 on Windows, whose torch pool grows more) |
 | `H3_TURBO_LORA` | `0` | lightx2v 4 / 8-step distilled LoRA (downloads about 780MB on first use). Works in `group` too (needs the in-house streamer `H3_GROUP_STREAM=own` and the flag at startup; with `file` streaming the LoRA, about 1.2GB, is streamed from host RAM block by block; tensors missing from the files and at least `H3_FILE_STREAM_HOST_MIN_MB` (default 1) large are handled this way) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | Download the bf16 weights (~66GB each) from HF only when `1` if they are not cached |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / none | External LLM for prompt enhancement and its API key (the key is also read from the git-ignored `config.local.env`) |
