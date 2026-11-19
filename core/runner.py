@@ -4812,6 +4812,9 @@ class MiniMaxH3Runner:
             # expandable_segments が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop: allocated 1.46 /
             # reserved 3.33GB で、ドライバの空きは 3.8GB だった)。その分は新しい確保に使い回されるので数えてよい。
             free_drv = torch.cuda.mem_get_info(DEVICE)[0] / 2**30
+            phys = filestream.physical_free_gib(DEVICE)       # nvidia-smi の「総量 − 全プロセスの使用量」(Windows の退避対策)
+            if phys is not None and phys < free_drv:
+                free_drv = phys
             cached = max(0.0, (torch.cuda.memory_reserved(DEVICE) - torch.cuda.memory_allocated(DEVICE)) / 2**30)
             free_gib = free_drv + cached
             if H3_VRAM_LIMIT_GB:

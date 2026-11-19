@@ -119,6 +119,40 @@ def slot_names(unit: torch.nn.Module, prefix: str) -> list[str | None]:
     return names
 
 
+def physical_free_gib(device) -> float | None:
+    """GPU の物理的な空き VRAM(GiB)を nvidia-smi で見る(総量 − 全プロセスの使用量)。None なら取れなかった。
+
+    Windows(WDDM)では `torch.cuda.mem_get_info` の空きに他プロセスの退避可能な分が含まれることがあり、それを信じて
+    載せると物理 VRAM を越えて共有メモリへ退避し、極端に遅くなる(RTX 3050 6GB: ドライバの空き 2.2GB と出ていたのに
+    タスクマネージャは専用 5.8 / 6.0GB、デコード 708 秒)。nvidia-smi の memory.used はタスクマネージャの専用 GPU メモリと
+    同じ、全プロセス込みの実使用量。CUDA の番号と nvidia-smi の並びは違いうるので UUID で突き合わせる。"""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("nvidia-smi")
+    if exe is None and sys.platform == "win32":
+        for cand in (r"C:\Windows\System32\nvidia-smi.exe", r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"):
+            if os.path.exists(cand):
+                exe = cand
+                break
+    if exe is None:
+        return None
+    try:
+        dev = torch.device(device)
+        uuid = str(getattr(torch.cuda.get_device_properties(dev), "uuid", "")).lower()
+        out = subprocess.run([exe, "--query-gpu=uuid,memory.used,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=5).stdout
+        rows = [[c.strip() for c in line.split(",")] for line in out.strip().splitlines() if line.strip()]
+        for u, used, total in rows:
+            if uuid and uuid in u.lower():
+                return (float(total) - float(used)) / 1024
+        if len(rows) == 1:
+            return (float(rows[0][2]) - float(rows[0][1])) / 1024
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 class ResidentLoader:
     """`FileBlockStreamer` と同じ名前解決でファイルの重みを読み、**全単位を GPU に載せたまま**にする(フック無し)。
     VAE デコーダ(4.5GB)のデコード中の置き場所として使う(2026-11-18): タイルごとに 36 ブロックを流す方式だと
@@ -147,6 +181,9 @@ class ResidentLoader:
                 if min_driver_free_gib > 0:
                     torch.cuda.synchronize(self.device)
                     free = torch.cuda.mem_get_info(self.device)[0] / 2**30
+                    phys = physical_free_gib(self.device)
+                    if phys is not None:
+                        free = min(free, phys)      # 物理の空き(全プロセス込み)のほうが小さければそちらを信じる
                     if free < min_driver_free_gib:
                         self.stopped_free_gib = free
                         break

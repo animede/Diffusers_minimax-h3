@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-19 13:58 JST** — RTX 4060 Laptop 8GB / RAM 16GB の実測(512² 194 秒、768×512 279 秒、768² 412 秒)を追記 / VAE デコーダを空き VRAM に入るぶんだけ GPU に置いてデコード。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-19 14:55 JST** — Windows の 6GB カードで VAE デコーダの常駐判定が物理 VRAM を越えて退避していた問題を修正(nvidia-smi の実使用量で判定)/ RTX 4060 Laptop 8GB の実測を追記。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。

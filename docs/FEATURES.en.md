@@ -607,6 +607,12 @@ streaming source is not pinned either (the fp16 copy is used as is). The int8 we
   Memory torch keeps reserved may be unusable due to fragmentation; loading on the estimate alone pushed past physical VRAM and
   Windows spilled to shared memory, becoming extremely slow (real RTX 3050 6GB / 32 GB RAM: driver free 1.9 + torch cached 1.8 GB
   led to 13/36 resident, then 824 s for a 512² decode and 648 s at 768², with 6.4 GB of shared GPU memory).
+- Same day, further: on Windows (WDDM) the `mem_get_info` free figure can include other processes' evictable memory, so the
+  floor passed while physical VRAM was already exceeded (RTX 3050 6GB / 32 GB RAM: driver free 2.2 GB, 15/36 loaded, Task Manager
+  at 5.8 / 6.0 GB dedicated, a 512² decode of 708 s = over 4.5 s per pass in the spilled state). The physical figure from
+  `nvidia-smi --query-gpu=memory.used,memory.total` (all processes, the same number Task Manager shows as dedicated GPU memory),
+  matched by UUID, is now used alongside the driver's figure, taking the smaller of the two for both the estimate and the floor
+  (`filestream.physical_free_gib`). Without nvidia-smi the previous behaviour applies.
 - The block count is decided from "driver free + torch's reserved-but-unused memory". Windows torch has no
   `expandable_segments`, so a few GB stay reserved after the denoise (real RTX 4060 Laptop: allocated 1.46 / reserved 3.33 GB,
   driver free 3.8 GB, so only 10/36 blocks fit at first); that memory is reused by new allocations and may be counted.

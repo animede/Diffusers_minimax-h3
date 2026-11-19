@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-19 13:58 JST** — real RTX 4060 Laptop 8GB / 16GB RAM figures added (512² 194 s, 768x512 279 s, 768² 412 s) / VAE decoder kept on the GPU as far as VRAM allows during decode. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-19 14:55 JST** — fixed the VAE decoder residency overshooting physical VRAM on 6GB Windows cards (decision now uses nvidia-smi's real usage) / real RTX 4060 Laptop 8GB figures added. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).

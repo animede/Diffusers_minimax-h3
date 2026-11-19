@@ -555,6 +555,11 @@ file のときは VAE デコーダの流し元もピン留めしない(fp16 の�
   使い回せないことがあり、見積もりだけで載せると物理 VRAM を越えて Windows が共有メモリへ退避し、極端に遅くなる
   (RTX 3050 6GB / RAM 32GB の実機: ドライバの空き 1.9 + torch 抱え 1.8GB の見積もりで 13/36 を載せた結果、512² の
   デコードが 824 秒、768² が 648 秒。共有 GPU メモリ 6.4GB)。
+- 同日、さらに: Windows(WDDM)では `mem_get_info` の空きに他プロセスの退避可能な分が含まれることがあり、下限の判定を通っても
+  物理 VRAM を越えていた(RTX 3050 6GB / RAM 32GB: ドライバの空き 2.2GB で 15/36 を載せ、タスクマネージャは専用 5.8 / 6.0GB、
+  512² のデコード 708 秒 = 1 パス 4.5 秒以上の退避状態)。`nvidia-smi --query-gpu=memory.used,memory.total`(全プロセス込みの
+  実使用、タスクマネージャの専用 GPU メモリと同じ)を UUID で突き合わせて取り、判定と下限の両方で「ドライバの空き」と
+  「物理の空き」の小さいほうを使う(`filestream.physical_free_gib`)。nvidia-smi が無ければ従来どおり。
 - 置ける数の判定は「ドライバの空き + torch が確保済みで未使用の分(reserved − allocated)」で見る。Windows の torch は
   `expandable_segments` が無く、デノイズ後に数 GB が reserved のまま残る(RTX 4060 Laptop の実機: allocated 1.46 / reserved 3.33GB、
   ドライバの空き 3.8GB → 当初 10/36 しか置けなかった)。その分は新しい確保に使い回されるので数えてよい。
