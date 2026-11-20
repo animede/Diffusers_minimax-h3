@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-19 19:31 JST** — 入門機(i3-10105 / DDR4-2400 / SATA 級 SSD)での実測を追記: RTX 3050 6GB で 512² 321 秒、RTX 3060 12GB で 768² 324 秒(デノイズはディスク読み律速、NVMe なら 100 秒強の見込み)/ ホスト RAM の目安を「16GB で動く、24GB 以上を推奨」に / Windows の VRAM 自動上限ほか。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-20 11:13 JST** — Vocal Lock(音声参照でリップシンク、`vocal_lock=true` / `H3_VOCAL_LOCK=1`)が低 VRAM 構成でも動くことを確認し README に追記 / 入門機(RTX 3050 6GB、RTX 3060 12GB)の実測 / Windows の VRAM 自動上限ほか。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
@@ -334,7 +334,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 **モードごとの入力**
 
 - FL2VA: 先頭フレーム / 末尾フレーム画像をドラッグ&ドロップ(どちらか一方でも可。両方指定すると先頭 → 末尾の間を生成)。
-- Ref2VA / Ref2I: 参照ファイルを複数追加(画像最大 9・動画最大 3・音声最大 3、計 12 まで)。**追加した順序がそのまま参照順**になり、プロンプト内では `<Picture 1>` のようにタイルに表示されるラベルで参照できる。音声参照 1 本だけなら秒数は空欄でよく、音声の長さが尺になる。Ref2I はフレーム数(22 / 5)を選んで中央フレームを PNG にする。
+- Ref2VA / Ref2I: 音声参照つきで API の `vocal_lock=true` を付けると、その音声をそのまま出力音声にして口の動きを合わせる(Vocal Lock。UI にスイッチは無い)。参照ファイルを複数追加(画像最大 9・動画最大 3・音声最大 3、計 12 まで)。**追加した順序がそのまま参照順**になり、プロンプト内では `<Picture 1>` のようにタイルに表示されるラベルで参照できる。音声参照 1 本だけなら秒数は空欄でよく、音声の長さが尺になる。Ref2I はフレーム数(22 / 5)を選んで中央フレームを PNG にする。
 - T2I: フレーム数(22 = 品質検証済みの既定、5 = 実験的)。
 - バッチ連続生成(T2I / Ref2I / Ref2VA): チェックを入れるとプロンプト欄が「1 行 = 1 場面」(最大 24 場面)になり、参照・seed・解像度・ステップは全場面で共通。モデルのロードや参照エンコードを場面間で共有するので、低 VRAM モードや参照付きで特に効く。Ref2VA のバッチは秒数が必須。
 
@@ -374,7 +374,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 |---|---|
 | `POST /api/t2va` | テキスト→動画+音声。`prompt`, `resolution`(`768x768` / `768x1344` / `1344x768`), `seconds`(5〜15), `num_inference_steps`, `seed` |
 | `POST /api/fl2va` | 上記に加え `image` / `last_image`(どちらか一方以上) |
-| `POST /api/ref2va` | 参照付き生成。`references`(画像最大 9・動画最大 3・音声最大 3、順序が意味を持つ)。音声 1 本だけの参照なら `seconds=0` で音声長に合わせる。`still=1` + `frames` で参照付き静止画(ref2i) |
+| `POST /api/ref2va` | 参照付き生成。`references`(画像最大 9・動画最大 3・音声最大 3、順序が意味を持つ)。音声 1 本だけの参照なら `seconds=0` で音声長に合わせる。`still=1` + `frames` で参照付き静止画(ref2i)。`vocal_lock=true`(または起動時 `H3_VOCAL_LOCK=1`)で **Vocal Lock**: 参照の音声をそのまま出力音声として固定し、口の動きをその音声に合わせる(リップシンク。低 VRAM 構成でも動作、8GB 上限の模擬でエンコード段のピーク 3.9GB)。UI にスイッチは無く API / 環境変数のみ |
 | `POST /api/t2i` | 静止画。`seconds` の代わりに `frames`(既定 22 / 5)。超短尺 mp4 と中央フレーム PNG を保存 |
 | `POST /api/t2i_batch` / `POST /api/ref2i_batch` / `POST /api/ref2va_batch` | バッチ生成。`prompts` を場面数ぶん繰り返す(最大 24)。参照系は共通 `references`、`ref2va_batch` は共通 `seconds` が必須 |
 | `POST /api/prompt/enhance` | LLM プロンプト強化。`{text, mode, seconds, task, lang}` |
@@ -409,6 +409,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 | `H3_VRAM_LIMIT_GB` | (なし) | このプロセスが確保できる VRAM の上限(GB)。**Windows では未指定なら自動で「カード容量 − 1.2GB」**(`H3_VRAM_AUTO_CAP_MARGIN_GB`)。Windows の torch はプールが膨らんだまま返せず、6GB のカードでは物理 VRAM を越えて退避し極端に遅くなるため、上限で膨らみを止める(上限に当たると未使用の区画を返して再利用する)。6GB のカード(上限 4.8GB)でも 1024²・5 秒まで収まる(A4000 の模擬でピーク 3.5GB)。上限を越える要求は退避で延々と遅くなる代わりに OOM になる。無効にするにはカード容量以上の値(例 `99`)を指定 |
 | `H3_GPU_POOL_DEFRAG` | `auto` | デコードの直前に GPU に残っている実体(約 1.2GB)を CPU へ退避 → torch のプールを全部返す → 戻す(`auto` = Windows のみ。Windows の torch はプールが膨らんだまま返せず、6GB のカードでデコード中に退避して極端に遅くなるため)。`1` / `0` |
 | `H3_VAE_DECODER_RESIDENT` | `auto` | file ストリーミングのデコードで、空き VRAM に入るぶんだけ VAE デコーダ(36 ブロック、4.5GB)をデコードの間 GPU に置き、残りをファイルから流す(置いた分だけ毎パスの転送が減る。出力は同じ)。A4000 の模擬: 8GB 上限で 30/36 ブロック常駐、768² のデコード 86 → 34 秒(ピーク 6.2GB)、6GB 上限で 15/36、デコード 51 秒(ピーク 4.2GB)。`1` で全部強制、`0` で無効。余裕は `H3_VAE_DECODER_RESIDENT_MARGIN_GB`(既定 Linux 1.0、Windows 2.5。Windows の torch はプールが膨らむため) |
+| `H3_VOCAL_LOCK` | `0` | Ref2VA の Vocal Lock を既定で ON にする(参照の音声を出力音声として固定し、口の動きを合わせる)。リクエストの `vocal_lock` が優先 |
 | `H3_TURBO_LORA` | `0` | lightx2v の 4 / 8 ステップ蒸留 LoRA(初回に約 780MB を DL)。`group` でも使える(自作ストリーマ `H3_GROUP_STREAM=own` + 起動時指定が条件。`file` ストリーミングでは LoRA 約 1.2GB をホスト RAM からブロックごとに流す。`H3_FILE_STREAM_HOST_MIN_MB`(既定 1)以上のファイルに無いテンソルが対象) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | bf16 重み(各 ~66GB)がキャッシュに無いとき、`1` のときだけ HF から取得 |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / なし | プロンプト強化に使う外部 LLM と API キー(キーは git 管理外の `config.local.env` からも読む) |

@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-19 19:31 JST** — entry-level desktop figures added (i3-10105 / DDR4-2400 / SATA-class SSD): RTX 3050 6GB 512² in 321 s, RTX 3060 12GB 768² in 324 s (denoise disk-bound; a bit over 100 s expected with an NVMe) / host RAM guidance now "runs with 16GB, 24GB+ recommended" / automatic Windows VRAM cap and more. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-20 11:13 JST** — Vocal Lock (lip sync from an audio reference, `vocal_lock=true` / `H3_VOCAL_LOCK=1`) verified in the low-VRAM configuration and documented / entry-level desktop figures (RTX 3050 6GB, RTX 3060 12GB) / automatic Windows VRAM cap and more. Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -334,7 +334,7 @@ A single-page browser UI: inputs and settings on the left, results and the galle
 **Inputs per mode**
 
 - FL2VA: drag and drop the first / last frame image (either one is enough; with both, the clip is generated between them).
-- Ref2VA / Ref2I: add multiple reference files (up to 9 images, 3 videos, 3 audio clips, 12 in total). **The order you add them is the reference order**, and each can be referred to in the prompt by the label shown on its tile, such as `<Picture 1>`. With exactly one audio reference the duration can be left blank and follows the audio. Ref2I picks a frame count (22 / 5) and saves the center frame as a PNG.
+- Ref2VA / Ref2I: with an audio reference, the API's `vocal_lock=true` keeps that audio as the output audio and makes the mouth follow it (Vocal Lock; no UI switch). Add multiple reference files (up to 9 images, 3 videos, 3 audio clips, 12 in total). **The order you add them is the reference order**, and each can be referred to in the prompt by the label shown on its tile, such as `<Picture 1>`. With exactly one audio reference the duration can be left blank and follows the audio. Ref2I picks a frame count (22 / 5) and saves the center frame as a PNG.
 - T2I: frame count (22 = the quality-verified default, 5 = experimental).
 - Batch generation (T2I / Ref2I / Ref2VA): ticking it turns the prompt field into "one line = one scene" (up to 24 scenes); references, seed, resolution and steps are shared across scenes. Model loading and reference encoding are shared between scenes, which pays off especially in low-VRAM mode and with references. Ref2VA batches require the duration.
 
@@ -374,7 +374,7 @@ A single-page browser UI: inputs and settings on the left, results and the galle
 |---|---|
 | `POST /api/t2va` | Text to video + audio. `prompt`, `resolution` (`768x768` / `768x1344` / `1344x768`), `seconds` (5-15), `num_inference_steps`, `seed` |
 | `POST /api/fl2va` | The above plus `image` / `last_image` (at least one) |
-| `POST /api/ref2va` | Reference-conditioned generation. `references` (up to 9 images, 3 videos, 3 audio clips; order matters). With exactly one audio reference, `seconds=0` uses the audio length. `still=1` + `frames` gives a reference-conditioned still (ref2i) |
+| `POST /api/ref2va` | Reference-conditioned generation. `references` (up to 9 images, 3 videos, 3 audio clips; order matters). With exactly one audio reference, `seconds=0` uses the audio length. `still=1` + `frames` gives a reference-conditioned still (ref2i). `vocal_lock=true` (or `H3_VOCAL_LOCK=1` at startup) enables **Vocal Lock**: the audio reference is kept as the output audio and the mouth follows it (lip sync; works in the low-VRAM configuration too, encode-phase peak 3.9GB under an 8GB cap). API / env only, no UI switch |
 | `POST /api/t2i` | Still image. `frames` (default 22, or 5) instead of `seconds`. Saves an ultra-short mp4 and the center-frame PNG |
 | `POST /api/t2i_batch` / `POST /api/ref2i_batch` / `POST /api/ref2va_batch` | Batch generation. Repeat `prompts` per scene (up to 24). The reference variants share `references`; `ref2va_batch` requires a common `seconds` |
 | `POST /api/prompt/enhance` | LLM prompt enhancement. `{text, mode, seconds, task, lang}` |
@@ -409,6 +409,7 @@ Defaults shown. Most **can also be toggled from the UI**, so set them only to ch
 | `H3_VRAM_LIMIT_GB` | (unset) | Cap on the VRAM this process may allocate (GB). **On Windows, unset means an automatic cap of card size minus 1.2GB** (`H3_VRAM_AUTO_CAP_MARGIN_GB`): Windows torch cannot shrink its grown pool, so 6GB cards spill past physical VRAM and crawl; the cap stops the growth (at the cap the allocator releases unused blocks and reuses them). Even a 6GB card (cap 4.8GB) fits 1024², 5 s (peak 3.5GB in the A4000 emulation); requests beyond the cap fail with an OOM instead of crawling in the spilled state. To disable, set a value at or above the card size (e.g. `99`) |
 | `H3_GPU_POOL_DEFRAG` | `auto` | Right before the decode, move the live GPU tensors (about 1.2GB) to the CPU, release torch's whole pool, and move them back (`auto` = Windows only: Windows torch cannot shrink its grown pool, so 6GB cards spill during the decode and crawl). `1` / `0` |
 | `H3_VAE_DECODER_RESIDENT` | `auto` | In file-streaming decodes, keeps as many VAE decoder blocks (36, 4.5GB) on the GPU as free VRAM allows for the decode and streams the rest from file (every resident block removes its share of the per-pass transfer; same output). A4000 emulation: 30/36 resident under an 8GB cap, 768² decode 86 to 34 s (peak 6.2GB); 15/36 under a 6GB cap, decode 51 s (peak 4.2GB). `1` forces all, `0` disables. Headroom via `H3_VAE_DECODER_RESIDENT_MARGIN_GB` (default 1.0 on Linux, 2.5 on Windows, whose torch pool grows more) |
+| `H3_VOCAL_LOCK` | `0` | Enables Ref2VA Vocal Lock by default (the audio reference is kept as the output audio and the mouth follows it). The request's `vocal_lock` takes precedence |
 | `H3_TURBO_LORA` | `0` | lightx2v 4 / 8-step distilled LoRA (downloads about 780MB on first use). Works in `group` too (needs the in-house streamer `H3_GROUP_STREAM=own` and the flag at startup; with `file` streaming the LoRA, about 1.2GB, is streamed from host RAM block by block; tensors missing from the files and at least `H3_FILE_STREAM_HOST_MIN_MB` (default 1) large are handled this way) |
 | `H3_ALLOW_WEIGHT_DOWNLOAD` | `0` | Download the bf16 weights (~66GB each) from HF only when `1` if they are not cached |
 | `H3_LLM_URL` / `H3_LLM_API_KEY` | `http://127.0.0.1:64660` / none | External LLM for prompt enhancement and its API key (the key is also read from the git-ignored `config.local.env`) |
