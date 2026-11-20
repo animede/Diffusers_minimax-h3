@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-20 16:57 JST** — README tidied: real-machine figures consolidated into one "Real Windows machines" table, stale numbers and duplicates removed, GPU / RAM requirements updated (6GB runs 1024², 16GB RAM works, 24GB+ recommended). Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-20 17:25 JST** — README tidied: real-machine figures consolidated into one "Real Windows machines" table, stale numbers and duplicates removed, GPU / RAM requirements updated (6GB runs 1024², 16GB RAM works, 24GB+ recommended). Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).
@@ -31,7 +31,7 @@ cd Diffusers_minimax-h3
 - Reopen PowerShell after the winget installs. ffmpeg is used for the gallery's length / resolution display and for video concatenation (generation works without it; the log then shows a hint). `install.bat` creates the venv and installs the dependencies (a few minutes).
 - `prepare_lowvram.py` prepares the model. It does not fetch 144GB: it downloads the 66GB of weights one shard at a time, quantizes each and deletes it, so **about 60GB of disk** and 16GB of RAM are enough. The time is dominated by your connection (hours). If it stops, rerun it and it continues. Add `--ref` if you also want Ref2VA / Ref2I (video from reference material; +32GB).
 - `run.bat` starts the server; open `http://127.0.0.1:8611` in a browser. The first start takes a few minutes to build the projected text encoder's quantized cache. The settings for your GPU size (low-VRAM mode, 4-step turbo) are applied automatically.
-- Expectations (4-step turbo, 5 s): RTX 3050 6GB + NVMe 512² in 237 s, RTX 3060 12GB + NVMe 512² in 132 s / 768² in 338 s, RTX 4060 Laptop 8GB 512² in 194 s / 768² in 412 s. Peak VRAM is about 2.8GB at 768² and 3.5GB at 1024² (a 6GB card runs 1024², but 512² to 768x512 is the practical range). Low-VRAM configurations read 30GB of weights from disk on every step, so on a SATA-class SSD the denoise waits on the disk; an NVMe is recommended. Details under [Real Windows machines](#real-windows-machines).
+- Expectations (4-step turbo, 5 s): RTX 3050 6GB + NVMe 512² in 237 s, RTX 3060 12GB + NVMe 512² in 132 s / 768² in 338 s, RTX 4060 Laptop 8GB 512² in 194 s / 768² in 412 s. Peak VRAM is about 2.8GB at 768² and 3.5GB at 1024². The model's native resolution is a 768 short edge (768², 1344x768); a 3060 12GB is practical at that native size, while a 3050 6GB is realistically used at 512² to 768x512 (below native) to keep the time down. Low-VRAM configurations read 30GB of weights from disk on every step, so on a SATA-class SSD the denoise waits on the disk; an NVMe is recommended. Details under [Real Windows machines](#real-windows-machines).
 - Low-VRAM speed is set by two numbers: host-to-GPU transfer speed and SSD read speed. If it feels slow, measure both with `.\venv\Scripts\python.exe scripts\check_bandwidth.py` (expect about 10GB/s pinned transfers on PCIe 4.0 x8, about 5GB/s on x4; under 1GB/s points at the link or BIOS settings).
 - If something fails, see the troubleshooting notes in the [Windows](#windows) section and the [Issues](https://github.com/animede/Diffusers_minimax-h3/issues).
 
@@ -80,7 +80,7 @@ t2va, 4-step turbo, 5 s (124 frames). In parentheses: denoise + decode (seconds)
 | RTX 4060 Laptop 8GB / 16GB RAM (gaming laptop, Windows 11) | NVMe | — | 194 (117 + 16) | 279 (191 + 65) | 412 (313 + 85) | — |
 
 - On a SATA-class SSD the denoise is flat at about 240 s up to 768²: that is the time to read 30GB of weights per step, and a faster GPU does not change it. On an NVMe the denoise is set by the GPU (768² takes 444 s on the 3050, 241 s on the 3060).
-- The practical range on the 3050 6GB is 512² to 768x512; the 3060 12GB does 768² in a little under 6 minutes.
+- The model's native resolution is a 768 short edge (768², 1344x768; the turbo LoRA is trained at 768p). The 3060 12GB is practical at the native 768² in a little under 6 minutes; the 3050 6GB is realistically dropped to 512² to 768x512 (below native) to keep the time down.
 - Shared GPU memory stays around 1.5GB during a run (the pinned staging buffers).
 
 ## Installation
@@ -89,7 +89,7 @@ t2va, 4-step turbo, 5 s (124 frames). In parentheses: denoise + decode (seconds)
 
 | | Requirement |
 |---|---|
-| GPU | Minimum: a **single 6GB card** (runs up to 1024²; 512² to 768x512 is practical) / **single 8GB or 12GB** (768² practical) / **single 16GB** (all features). **48GB tier** recommended for comfortable use |
+| GPU | Minimum: a **single 6GB card** (runs up to 1024², but 512² to 768x512 is realistic for time) / **single 8GB or 12GB** (the native 768² is practical) / **single 16GB** (all features). **48GB tier** recommended for comfortable use. The model's native resolution is a 768 short edge (768², 1344x768) |
 | Host RAM | **Runs with 16GB (NVMe assumed), 24GB or more recommended, 48GB or more also speeds up the denoise.** Below 48GB the weights are streamed straight from the quantized cache files (`H3_GROUP_STREAM_HOST=file`; 30GB is read from disk every step, so the denoise is bound by SSD speed). With 16GB the 4.5GB VAE decoder does not stay in the page cache, so the decode also re-reads from disk every pass; 24GB and up behaves like 32GB. 48GB and up (Linux) pins the ~34GB of int8 weights and the disk reads disappear |
 | Disk | About 145GB (T2VA / FL2VA only) / about 207GB (if Ref2VA is also used). The low-VRAM / low-RAM preparation path (`scripts/prepare_lowvram.py`) keeps only the quantized caches, about 60GB (+32GB with `--ref` for Ref2VA) |
 | CUDA | 12.8 series (to match torch 2.9.0+cu128). If building SageAttention, `nvcc` must be the same series |
