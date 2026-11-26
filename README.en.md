@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-**Latest: 2026-11-20 17:25 JST** — README tidied: real-machine figures consolidated into one "Real Windows machines" table, stale numbers and duplicates removed, GPU / RAM requirements updated (6GB runs 1024², 16GB RAM works, 24GB+ recommended). Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
+**Latest: 2026-11-26 JST** — `prepare_lowvram.py`: after everything is built, bf16 shards left in the HF cache (ones the per-shard delete could not remove on Windows, about 4.6GB each) are removed once more. Before that (11/20): README tidied: real-machine figures consolidated into one "Real Windows machines" table, stale numbers and duplicates removed, GPU / RAM requirements updated (6GB runs 1024², 16GB RAM works, 24GB+ recommended). Change history in [docs/HISTORY.en.md](docs/HISTORY.en.md).
 
 **MiniMax H3 (Hailuo 3.0) — running the 33B omnimodal model that generates video + stereo audio in a single denoise pass, on consumer-tier GPUs.**
 From text, an image reference or an audio reference it produces **video + stereo audio**, and it can also emit still images only (T2I / Ref2I).

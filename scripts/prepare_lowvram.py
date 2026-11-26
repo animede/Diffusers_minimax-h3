@@ -65,30 +65,58 @@ SMALL_PATTERNS = ["*.json", "vae/*", "audio_vae/*", "scheduler/*", "audio_schedu
                   "text_encoder/*.json", "transformer/config.json", "transformer/*.index.json"]
 
 
-def _release(path: Path) -> float:
+def _release(path: Path, attempts: int = 6) -> float:
     """HF キャッシュのシャード(symlink + blob)を消して空けた GB を返す。
 
     Windows では safetensors の mmap がまだ生きている(読んだテンソルの参照が GC されていない)と、
     削除が `PermissionError: [WinError 5] アクセスが拒否されました` になる(RTX 3050 機で実測)。
     GC してから少し待って数回やり直し、それでも消せなければ警告だけ出して続ける(ディスクが
-    シャード 1 つ分 4.7GB 増えるだけで、キャッシュ作成は完走する)。
+    シャード 1 つ分 4.7GB 増えるだけで、キャッシュ作成は完走する。残った分は最後に sweep_sources がもう一度消す)。
     """
     real = Path(os.path.realpath(path))
     size = real.stat().st_size if real.exists() else 0
     for q in (path, real):
-        for attempt in range(6):
+        for attempt in range(attempts):
             try:
                 q.unlink()
                 break
             except FileNotFoundError:
                 break
             except PermissionError:
-                if attempt == 5:
+                if attempt == attempts - 1:
                     logger.warning("原本を削除できません(他プロセスが開いているか mmap が残っています)。残したまま続けます: %s", q)
                     return 0.0
                 gc.collect()
                 time.sleep(1.0 + attempt)
     return size / 1e9
+
+
+def sweep_sources(subfolders: list[str]) -> None:
+    """全部終わってから、HF キャッシュに残った bf16 のシャードをもう一度消す。
+
+    シャードごとの削除は、Windows では Defender の検査や検索のインデックスがファイルを掴んでいて失敗することがあり、
+    警告を出して残したまま続けている(2026-11-26、Windows 10 の実機: 1 回の準備で数本、約 4.6GB ずつ残った)。
+    終わった時点では誰も開いていないので、ここで長めに待ちながら消す。int8 キャッシュが完成した subfolder だけを渡すこと。
+    """
+    from huggingface_hub import try_to_load_from_cache
+
+    freed, left = 0.0, []
+    for sub in subfolders:
+        idx = try_to_load_from_cache(MODEL_ID, f"{sub}/diffusion_pytorch_model.safetensors.index.json")
+        if not isinstance(idx, str):
+            continue
+        for shard in sorted(set(json.loads(Path(idx).read_text())["weight_map"].values())):
+            p = try_to_load_from_cache(MODEL_ID, f"{sub}/{shard}")
+            if isinstance(p, str) and Path(p).exists():
+                got = _release(Path(p), attempts=10)
+                if got:
+                    freed += got
+                else:
+                    left.append(p)
+    if freed:
+        logger.info("残っていた bf16 の原本 %.1fGB を削除しました", freed)
+    for p in left:
+        logger.warning("原本がまだ残っています。エンジンもスタジオも止めてから手で消してください(int8 キャッシュがあれば不要です): %s", p)
 
 
 def fetch_small() -> Path:
@@ -328,6 +356,9 @@ def main() -> None:
     if args.ref:
         build_transformer_int8(PREQUANT_DIR / "transformer_ref_int8", args.device, only, args.keep_source,
                                subfolder="transformer_ref")
+    if not args.keep_source and only is None:
+        # ここまで来たら、作った(または既にあった)int8 キャッシュは完成している。シャードごとに消せなかった原本を片づける
+        sweep_sources(([] if args.skip_transformer else ["transformer"]) + (["transformer_ref"] if args.ref else []))
     if not args.skip_vae:
         build_vae_fp16(PREQUANT_DIR / "vae_decoder_fp16")
     if not args.skip_te:
