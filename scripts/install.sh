@@ -39,9 +39,22 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -x venv/bin/python ]; then
-  echo "==> venv を作成: $PYTHON -m venv venv"
-  "$PYTHON" -m venv venv
+if [ ! -x venv/bin/python ] || [ ! -x venv/bin/pip ]; then
+  if [ -d venv ] && [ ! -x venv/bin/pip ]; then
+    echo "==> pip の無い不完全な venv を作り直します"
+    rm -rf venv
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    echo "==> venv を作成: uv venv --python $PYTHON --seed venv"
+    uv venv --python "$PYTHON" --seed venv
+  else
+    echo "==> venv を作成: $PYTHON -m venv venv"
+    "$PYTHON" -m venv venv
+    if [ ! -x venv/bin/pip ]; then
+      echo "error: venv/bin/pip が作成されませんでした (python3.12-venv を入れるか、uv をインストールして再実行してください)" >&2
+      exit 1
+    fi
+  fi
 fi
 venv/bin/pip install --upgrade pip wheel setuptools
 
