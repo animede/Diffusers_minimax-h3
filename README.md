@@ -2,7 +2,7 @@
 
 **日本語** | [English](README.en.md)
 
-**最新版: 2026-11-26 JST** — `prepare_lowvram.py`: 全部終わってから、HF キャッシュに残った bf16 の原本(Windows でシャードごとの削除に失敗して残った分、1 本 約 4.6GB)をもう一度消す。それより前(11/20): README を整理: 実機の実測を「Windows 実機の実測」表 1 か所にまとめ、古い数値と重複を削除。GPU / RAM の要件を現状(6GB で 1024² まで、16GB RAM で動く、24GB 以上推奨)に更新。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
+**最新版: 2026-11-27 JST** — `scripts/install.sh`(Linux / Mac): Python 3.12 はあっても `python3.12-venv`(ensurepip)が入っていない環境(Google Colab の Ubuntu 24.04 など)で、pip の無い不完全な venv ができて止まる問題を修正。pip の無い venv は作り直し、uv があれば `uv venv --seed` で pip 入りの venv を作る(コントリビュータの PR #2)。それより前(11/26): `prepare_lowvram.py` が最後に、HF キャッシュに残った bf16 の原本をもう一度消す。変更の履歴は [docs/HISTORY.md](docs/HISTORY.md)。
 
 **MiniMax H3 (Hailuo 3.0) — 動画+ステレオ音声を1回のデノイズで同時生成する 33B オムニモーダルモデルを、普及帯 GPU で動かす検証アプリ。**
 テキスト / 画像参照 / 音声参照から **動画+ステレオ音声** を生成し、静止画のみ(T2I / Ref2I)も出せる。
